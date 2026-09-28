@@ -70,9 +70,12 @@ export const DOMAIN_TERMS = [
  * Per-file exceptions, by identity id or domain term. Keep this short: every entry is a
  * place the firm's identity is allowed to appear on purpose.
  * - LICENSE names the copyright holder, who is the author.
+ * - README.md credits the author and links the author's site, in its Author section only
+ *   (checked by its own test below).
  */
 const ALLOW: Record<string, string[]> = {
   LICENSE: ['owner-surname'],
+  'README.md': ['owner-surname', 'firm-domain'],
 };
 
 const SKIP_DIRS = new Set(['.git', 'node_modules', 'coverage', '.temp', '.branches']);
@@ -148,5 +151,12 @@ describe('zero firm strings', () => {
       if (bad.length) offenders.push(`${rel}: ${bad.join(', ')}`);
     }
     expect(offenders).toEqual([]);
+  });
+
+  it('the README names the author only inside its Author section', () => {
+    const readme = readFileSync(path.join(ROOT, 'README.md'), 'utf8').replace(/\r\n/g, '\n');
+    const author = readme.match(/^## Author\n[\s\S]*?(?=^## )/m)?.[0] ?? '';
+    expect(author).not.toBe('');
+    expect(findFirmStrings(readme.replace(author, ''))).toEqual([]);
   });
 });
