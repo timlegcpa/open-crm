@@ -1,0 +1,149 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Theme tokens: bare HSL channels (tailwind.config.js supplies the hsl() wrapper).
+   Phase 2b replaces this block with generated output from the theme source. */
+:root {
+  --background: 0 0% 100%;
+  --foreground: 0 0% 3.9%;
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 3.9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 3.9%;
+  --primary: 0 0% 3.9%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 0 0% 92.5%;
+  --secondary-foreground: 0 0% 3.9%;
+  --muted: 0 0% 94.5%;
+  --muted-foreground: 0 0% 32.2%;
+  --accent: 0 0% 92.5%;
+  --accent-foreground: 0 0% 3.9%;
+  --destructive: 355.8 75.7% 48.4%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 0 0% 89.8%;
+  --input: 0 0% 89.8%;
+  --ring: 206.2 86.9% 44.9%;
+  --link: 206.2 86.9% 44.9%;
+  --chart-1: 203.9 88.3% 53.1%;
+  --chart-2: 159.8 100% 36.1%;
+  --chart-3: 42 92.8% 56.3%;
+  --chart-4: 147.1 78.5% 42%;
+  --chart-5: 341.5 75.2% 51%;
+  --sidebar: 0 0% 98%;
+  --sidebar-background: 0 0% 98%;
+  --sidebar-foreground: 0 0% 3.9%;
+  --sidebar-primary: 0 0% 3.9%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 0 0% 92.5%;
+  --sidebar-accent-foreground: 0 0% 3.9%;
+  --sidebar-border: 0 0% 93.7%;
+  --lane: 0 0% 95.7%;
+  --lane-card: 0 0% 100%;
+  --sidebar-ring: 206.2 86.9% 44.9%;
+  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --radius: 0.5rem;
+  --chart-6: 265 62% 45%;
+  --chart-7: 22 62% 45%;
+  --chart-8: 188 62% 45%;
+  --chart-9: 320 62% 45%;
+  --chart-10: 95 62% 45%;
+  --chart-11: 240 62% 45%;
+  --chart-12: 55 62% 45%;
+  --chart-13: 150 62% 45%;
+  --chart-14: 285 62% 45%;
+  --chart-15: 350 62% 45%;
+  --chart-16: 121 62% 45%;
+  --chart-17: 75 62% 45%;
+  --success: 159.4 82.6% 33.7%;
+  --success-light: 159.4 60% 94%;
+  --success-dark: 159.4 82.6% 24%;
+  --warning: 35.5 71% 42%;
+  --warning-light: 37 91% 93%;
+  --warning-dark: 30 90% 26%;
+  --destructive-light: 355.8 90% 96%;
+  --destructive-dark: 355.8 70% 38%;
+  --review: 265 62% 45%;
+  --review-light: 265 62% 95%;
+  --review-dark: 265 70% 42%;
+  --caution: 47 95% 46%;
+  --caution-light: 50 96% 90%;
+  --caution-dark: 42 90% 24%;
+}
+
+/* Dark twin, applied by a .dark class on <html>. */
+.dark {
+  --background: 0 0% 0%;
+  --foreground: 0 0% 96.1%;
+  --card: 0 0% 3.9%;
+  --card-foreground: 0 0% 96.1%;
+  --popover: 0 0% 3.9%;
+  --popover-foreground: 0 0% 96.1%;
+  --primary: 0 0% 96.1%;
+  --primary-foreground: 0 0% 3.9%;
+  --secondary: 0 0% 10.2%;
+  --secondary-foreground: 0 0% 96.1%;
+  --muted: 0 0% 10.2%;
+  --muted-foreground: 0 0% 63.9%;
+  --accent: 0 0% 10.2%;
+  --accent-foreground: 0 0% 96.1%;
+  --destructive: 356.3 90.5% 54.3%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 0 0% 14.9%;
+  --input: 0 0% 14.9%;
+  --ring: 204.2 87.4% 52.7%;
+  --link: 204.2 87.4% 52.7%;
+  --chart-1: 203.9 88.3% 53.1%;
+  --chart-2: 159.8 100% 36.1%;
+  --chart-3: 42 92.8% 56.3%;
+  --chart-4: 147.1 78.5% 42%;
+  --chart-5: 341.5 75.2% 51%;
+  --sidebar: 0 0% 0%;
+  --sidebar-background: 0 0% 0%;
+  --sidebar-foreground: 0 0% 96.1%;
+  --sidebar-primary: 0 0% 96.1%;
+  --sidebar-primary-foreground: 0 0% 3.9%;
+  --sidebar-accent: 0 0% 10.2%;
+  --sidebar-accent-foreground: 0 0% 96.1%;
+  --sidebar-border: 0 0% 10.2%;
+  --lane: 0 0% 3.9%;
+  --lane-card: 0 0% 8.6%;
+  --sidebar-ring: 204.2 87.4% 52.7%;
+  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --radius: 0.5rem;
+  --chart-6: 265 58% 62%;
+  --chart-7: 22 58% 62%;
+  --chart-8: 188 58% 62%;
+  --chart-9: 320 58% 62%;
+  --chart-10: 95 58% 62%;
+  --chart-11: 240 58% 62%;
+  --chart-12: 55 58% 62%;
+  --chart-13: 150 58% 62%;
+  --chart-14: 285 58% 62%;
+  --chart-15: 350 58% 62%;
+  --chart-16: 121 58% 62%;
+  --chart-17: 75 58% 62%;
+  --success: 160 100% 36.5%;
+  --success-light: 160 40% 12%;
+  --success-dark: 160 70% 68%;
+  --warning: 37 91% 55%;
+  --warning-light: 37 50% 13%;
+  --warning-dark: 37 85% 70%;
+  --destructive-light: 356.3 45% 15%;
+  --destructive-dark: 356.3 85% 72%;
+  --review: 265 58% 62%;
+  --review-light: 265 40% 17%;
+  --review-dark: 265 70% 74%;
+  --caution: 48 95% 55%;
+  --caution-light: 48 50% 13%;
+  --caution-dark: 48 90% 68%;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}
