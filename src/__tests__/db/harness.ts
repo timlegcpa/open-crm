@@ -47,6 +47,16 @@ CREATE FUNCTION auth.jwt() RETURNS jsonb LANGUAGE sql STABLE AS $$
   )::jsonb
 $$;
 GRANT EXECUTE ON FUNCTION auth.uid(), auth.jwt() TO anon, authenticated, service_role;
+
+-- Supabase grants everything created in public to all three API roles by default, so a
+-- migration that forgets a REVOKE is open on a real project. Reproduce that here, so the
+-- same omission fails a test instead of passing one.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO anon, authenticated, service_role;
+
+-- Present on every Supabase project; migrations add their realtime tables to it.
+CREATE PUBLICATION supabase_realtime;
 `;
 
 export interface Principal {
@@ -113,6 +123,28 @@ export async function as<T = Record<string, unknown>>(
   params: unknown[] = [],
 ): Promise<T[]> {
   return session(db, who, async (tx) => (await tx.query<T>(sql, params)).rows);
+}
+
+/** Rows of `table` that `who` can see, optionally narrowed by a WHERE clause. */
+export async function count(db: PGlite, who: Principal, table: string, where = 'true'): Promise<number> {
+  const rows = await as<{ n: number }>(db, who, `SELECT count(*)::int AS n FROM public.${table} WHERE ${where}`);
+  return rows[0].n;
+}
+
+/**
+ * Inside a `session`: run one statement under a savepoint and resolve to its error
+ * message, or null when it succeeded. A failure does not abort the rest of the session.
+ */
+export async function tryIn(tx: Tx, sql: string, params: unknown[] = []): Promise<string | null> {
+  await tx.exec('SAVEPOINT try_in');
+  try {
+    await tx.query(sql, params);
+    await tx.exec('RELEASE SAVEPOINT try_in');
+    return null;
+  } catch (err) {
+    await tx.exec('ROLLBACK TO SAVEPOINT try_in');
+    return (err as Error).message;
+  }
 }
 
 /** Like `as`, but resolves to the Postgres error message, or null when it succeeded. */

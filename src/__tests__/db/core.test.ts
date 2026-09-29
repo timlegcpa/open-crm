@@ -1,7 +1,7 @@
 // @vitest-environment node
 import type { PGlite } from '@electric-sql/pglite';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { anon, as, createDb, errorOf, service, session, user } from './harness';
+import { anon, as, count as countRows, createDb, errorOf, service, session, user } from './harness';
 
 const OWNER = '00000000-0000-4000-8000-000000000001';
 const SYSTEM = '00000000-0000-4000-8000-000000000002';
@@ -33,10 +33,7 @@ beforeAll(async () => {
   `);
 }, 60_000);
 
-const count = async (who: Parameters<typeof as>[1], table: string) => {
-  const rows = await as<{ n: number }>(db, who, `SELECT count(*)::int AS n FROM public.${table}`);
-  return rows[0].n;
-};
+const count = (who: Parameters<typeof as>[1], table: string) => countRows(db, who, table);
 
 describe('principals', () => {
   it('is_owner is true only for the owner row, never for a role claim', async () => {

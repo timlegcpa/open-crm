@@ -4,8 +4,9 @@ A self-hosted CRM and client-workflow suite for a single business, built on Reac
 Supabase. One owner runs it; clients get a secure portal.
 
 > **Status: early.** This repository is being extracted, piece by piece, from a CRM that has
-> run a real client practice in production. The core database layer is here and tested. The
-> application surfaces below are being ported in phases and are not in the repository yet.
+> run a real client practice in production. The core and contacts database layers are here
+> and tested. The application surfaces below are being ported in phases and are not in the
+> repository yet.
 
 ## What it is for
 
@@ -26,7 +27,8 @@ Supabase. One owner runs it; clients get a secure portal.
 | --- | --- |
 | Project setup (Vite, React, TypeScript, Tailwind, shadcn/ui) | Done |
 | Core database schema: owner and system principals, MFA session gating and backup codes, rate limits, append-only audit log, settings, background jobs, dev outbox | Done, tested |
-| CRM, portal, documents, messages, requests, e-sign, board, MCP | Being ported |
+| Contacts database schema: contacts, the businesses they own, emails, notes, relationships, follow-ups, quotes, portal accounts and invitations, portal tasks and activity, editable pick-lists, a safe contact-delete protocol | Done, tested |
+| CRM screens, portal, documents, messages, requests, e-sign, board, MCP | Being ported |
 
 ## Security model
 
@@ -35,7 +37,13 @@ Supabase. One owner runs it; clients get a secure portal.
   a token grants nothing on its own.
 - An owner with MFA enrolled is only the owner at the second factor, and only on a token
   issued after any recovery lockout.
-- Rate limits fail closed. The audit log cannot be updated, deleted or truncated.
+- A client is a portal account bound to one contact. It reads its own record through narrow
+  functions and can change only what the portal lets it (completing a task, for instance);
+  everything else is the owner's.
+- Every table also carries a second, independent MFA check, so a policy that forgets one
+  still cannot be reached from a session that has not passed its second factor.
+- Rate limits fail closed. The audit log cannot be updated, deleted or truncated. The
+  anonymous role can reach no table at all.
 
 ## Running the tests
 

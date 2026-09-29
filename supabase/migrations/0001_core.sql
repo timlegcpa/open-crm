@@ -9,8 +9,9 @@
 --   client       a portal user bound to a contact (defined with contacts, in 0002).
 --   service_role the server key used by edge functions; bypasses RLS.
 --
--- Conventions: RLS on every table; access is REVOKEd from anon and authenticated and
--- then GRANTed per table, never inherited from default privileges; every function pins
+-- Conventions: RLS on every table; access is REVOKEd from every API role (anon,
+-- authenticated and service_role) and then GRANTed per table, never inherited from
+-- Supabase's default privileges; every function pins
 -- `search_path = ''` and schema-qualifies what it touches; EXECUTE is revoked from
 -- PUBLIC and granted per function.
 
@@ -200,9 +201,22 @@ CREATE TRIGGER trg_org_profile_guard_principals
   BEFORE UPDATE ON public.org_profile
   FOR EACH ROW EXECUTE FUNCTION public.org_profile_guard_principals();
 
--- Blocks a non-owner, non-bypass caller from changing the listed columns. Column list
--- is the trigger's arguments and must include `id`. The bypass test is positive
--- (rolsuper or rolbypassrls), so an unknown role fails closed.
+-- True for the owner and for the server. The server test is positive (rolsuper or
+-- rolbypassrls: service_role and postgres), so an unknown role fails closed. Triggers
+-- that bound what a client may write use this to let those two through.
+CREATE FUNCTION public.is_owner_or_server()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = ''
+AS $$
+  SELECT COALESCE((SELECT r.rolsuper OR r.rolbypassrls
+                     FROM pg_catalog.pg_roles r WHERE r.rolname = current_user), false)
+         OR public.is_owner();
+$$;
+
+-- Blocks a caller other than the owner or the server from changing the listed columns.
+-- The column list is the trigger's arguments and must include `id`.
 CREATE FUNCTION public.enforce_client_column_guard()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -225,12 +239,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  IF (SELECT r.rolsuper OR r.rolbypassrls
-        FROM pg_catalog.pg_roles r WHERE r.rolname = current_user) THEN
-    RETURN NEW;
-  END IF;
-
-  IF public.is_owner() THEN
+  IF public.is_owner_or_server() THEN
     RETURN NEW;
   END IF;
 
@@ -1002,17 +1011,36 @@ ALTER TABLE public.csp_violation_reports ENABLE ROW LEVEL SECURITY;
 CREATE POLICY csp_reports_owner_select ON public.csp_violation_reports
   FOR SELECT TO authenticated USING ((SELECT public.is_owner()));
 
+-- A second, independent MFA gate on every table: whatever a permissive policy above
+-- says, a session that fails mfa_session_ok() reads and writes nothing.
+DO $$
+DECLARE
+  t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY[
+    'org_profile', 'mfa_recovery_lockouts', 'mfa_backup_code_generations', 'mfa_backup_codes',
+    'audit_logs', 'auth_rate_limits', 'app_settings', 'jobs', 'dev_outbox', 'csp_violation_reports'
+  ] LOOP
+    EXECUTE format(
+      'CREATE POLICY %I ON public.%I AS RESTRICTIVE FOR ALL TO authenticated '
+      'USING ((SELECT public.mfa_session_ok())) WITH CHECK ((SELECT public.mfa_session_ok()))',
+      t || '_mfa_gate', t);
+  END LOOP;
+END;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Privileges
 -- ---------------------------------------------------------------------------
 
--- Tables: nothing inherited. service_role gets full access (audit_logs without
--- TRUNCATE); user sessions get only what a policy above can use.
+-- Tables: nothing inherited, service_role included (Supabase's default privileges grant
+-- it ALL, TRUNCATE on audit_logs among them). service_role gets full access (audit_logs
+-- without TRUNCATE); user sessions get only what a policy above can use.
 REVOKE ALL ON
   public.org_profile, public.mfa_recovery_lockouts, public.mfa_backup_code_generations,
   public.mfa_backup_codes, public.audit_logs, public.auth_rate_limits, public.app_settings,
   public.jobs, public.dev_outbox, public.csp_violation_reports
-FROM PUBLIC, anon, authenticated;
+FROM PUBLIC, anon, authenticated, service_role;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.audit_logs TO service_role;
 GRANT ALL ON
@@ -1029,7 +1057,7 @@ GRANT SELECT ON public.jobs TO authenticated;
 GRANT SELECT ON public.dev_outbox TO authenticated;
 GRANT SELECT ON public.csp_violation_reports TO authenticated;
 
-REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC, anon, authenticated, service_role;
 GRANT USAGE, SELECT, UPDATE ON SEQUENCE public.mfa_backup_code_generation_seq TO service_role;
 
 -- Functions: revoke from everyone, then grant per function.
@@ -1054,7 +1082,7 @@ GRANT EXECUTE ON FUNCTION public.is_owner() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.mfa_session_ok() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.user_has_verified_mfa() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.audit_actor() TO authenticated;
-GRANT EXECUTE ON FUNCTION public.enforce_client_column_guard() TO authenticated;
+GRANT EXECUTE ON FUNCTION public.is_owner_or_server() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.org_profile_guard_principals() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.set_updated_at() TO authenticated;
 -- Owner actions (each checks is_owner itself).
