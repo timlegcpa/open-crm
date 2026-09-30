@@ -28,6 +28,7 @@ Supabase. One owner runs it; clients get a secure portal.
 | Project setup (Vite, React, TypeScript, Tailwind, shadcn/ui) | Done |
 | Core database schema: owner and system principals, MFA session gating and backup codes, rate limits, append-only audit log, settings, background jobs, dev outbox | Done, tested |
 | Contacts database schema: contacts, the businesses they own, emails, notes, relationships, follow-ups, quotes, portal accounts and invitations, portal tasks and activity, editable pick-lists, a safe contact-delete protocol | Done, tested |
+| Local setup script and owner sign-in (password, plus the authenticator code when one is set up) | Done, tested |
 | CRM screens, portal, documents, messages, requests, e-sign, board, MCP | Being ported |
 
 ## Security model
@@ -44,6 +45,29 @@ Supabase. One owner runs it; clients get a secure portal.
   still cannot be reached from a session that has not passed its second factor.
 - Rate limits fail closed. The audit log cannot be updated, deleted or truncated. The
   anonymous role can reach no table at all.
+
+## Running it
+
+You need Node 22 and a Supabase project; the free plan is enough, and nothing runs in Docker.
+Create the project at [supabase.com](https://supabase.com), then from a fresh clone:
+
+```bash
+npm ci
+npx supabase login
+npx supabase link --project-ref <your-project-ref>
+npx supabase db push
+npx supabase config push
+npm run dev:bootstrap
+npm run dev
+```
+
+`db push` creates the tables. `config push` applies the sign-in settings in
+`supabase/config.toml`: public sign-up off, the password rules, authenticator apps on, and the
+site URL `http://127.0.0.1:5173`. `dev:bootstrap` asks for the project URL and the anon and
+service role keys (Project Settings > API), your organization's name, and the owner's email and
+password. It writes `.env.local` and the edge-function secrets, creates the owner account, and
+is safe to run again; the service role key is used for that run only and never saved. Then
+open http://localhost:5173 and sign in as the owner.
 
 ## Running the tests
 
