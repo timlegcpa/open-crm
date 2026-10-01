@@ -18,6 +18,8 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - run: npm test
+      - run: npm run deno:check
+      - run: npm run deno:lint
   secrets:
     runs-on: ubuntu-latest
     steps:

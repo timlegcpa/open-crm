@@ -932,6 +932,15 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  -- Deleting a contact destroys its accounts' sign-ins, so an account must never point
+  -- at the owner's or the system actor's own: one delete would lock the firm out.
+  IF NEW.user_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.org_profile
+    WHERE NEW.user_id IN (owner_user_id, system_user_id)
+  ) THEN
+    RAISE EXCEPTION 'portal_account_staff_user';
+  END IF;
+
   PERFORM 1 FROM public.contacts WHERE id = NEW.contact_id FOR SHARE;
   IF public.contact_delete_claim_live(NEW.contact_id) THEN
     RAISE EXCEPTION 'contact_delete_in_progress';
@@ -1071,8 +1080,6 @@ CREATE POLICY client_portal_accounts_owner_insert ON public.client_portal_accoun
 CREATE POLICY client_portal_accounts_owner_update ON public.client_portal_accounts
   FOR UPDATE TO authenticated
   USING ((SELECT public.is_owner())) WITH CHECK ((SELECT public.is_owner()));
-CREATE POLICY client_portal_accounts_owner_delete ON public.client_portal_accounts
-  FOR DELETE TO authenticated USING ((SELECT public.is_owner()));
 
 -- Activity: the owner reads everything. A client records only actions it performs
 -- itself (lifecycle events come from the server) and reads its history through
@@ -1163,7 +1170,11 @@ GRANT UPDATE (label, colour, sort_order, is_active) ON public.lead_sources, publ
 GRANT UPDATE (label, colour, sort_order, is_active, revenue_family, default_cadence)
   ON public.service_types TO authenticated;
 
-GRANT SELECT, DELETE ON public.contacts TO authenticated;
+-- No DELETE on contacts or portal accounts for a signed-in session: a contact's portal
+-- accounts hold Auth sign-in users that only the server can destroy, so every delete goes
+-- through the delete-contact edge function and the claim protocol below. A direct delete
+-- would cascade the accounts away and leave their sign-ins alive.
+GRANT SELECT ON public.contacts TO authenticated;
 GRANT
   INSERT (submitted_at, first_name, last_name, email, phone, business_name, spouse_first_name,
           spouse_last_name, spouse_email, spouse_phone, date_of_birth, spouse_date_of_birth,
@@ -1175,7 +1186,7 @@ GRANT
           portal_sidebar_config)
 ON public.contacts TO authenticated;
 
-GRANT SELECT, DELETE ON public.client_portal_accounts TO authenticated;
+GRANT SELECT ON public.client_portal_accounts TO authenticated;
 GRANT
   INSERT (contact_id, user_id, role, status, invited_email, invited_at, invited_by, activated_at),
   UPDATE (user_id, role, status, invited_email, invited_at, invited_by, activated_at)

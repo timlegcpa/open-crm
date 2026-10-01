@@ -1,4 +1,8 @@
 import '@testing-library/jest-dom';
+import { queryClient } from '@/lib/queryClient';
+
+// Tests assert error states directly; a retry backoff would only delay them.
+queryClient.setDefaultOptions({ queries: { retry: false, refetchOnWindowFocus: false }, mutations: { retry: false } });
 
 // jsdom does not implement window.matchMedia — mock it so hooks using
 // matchMedia (e.g. useIsMobile in src/hooks/use-mobile.tsx, used by the
@@ -18,4 +22,18 @@ if (typeof window !== 'undefined') {
       dispatchEvent: () => false,
     }),
   });
+
+  // jsdom lacks the pointer-capture and scrolling APIs Radix Select calls while it opens,
+  // and the ResizeObserver Radix's popper measures with.
+  const proto = window.HTMLElement.prototype as HTMLElement & Record<string, unknown>;
+  proto.hasPointerCapture ??= () => false;
+  proto.releasePointerCapture ??= () => {};
+  proto.scrollIntoView ??= () => {};
+  if (!('ResizeObserver' in window)) {
+    (window as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+  }
 }

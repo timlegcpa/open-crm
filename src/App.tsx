@@ -4,6 +4,8 @@ import { getSupabase, supabaseConfigured } from '@/lib/supabase';
 import { SignInForm } from '@/components/auth/SignInForm';
 import { MfaChallenge } from '@/components/auth/MfaChallenge';
 import { Button } from '@/components/ui/button';
+import { queryClient } from '@/lib/queryClient';
+import { OwnerApp } from '@/OwnerApp';
 
 function Centered({ children }: { children: ReactNode }) {
   return <main className="flex min-h-screen items-center justify-center p-4">{children}</main>;
@@ -34,6 +36,13 @@ function Gate() {
   const { session, isLoadingAuth, mfaGate, ownerState, logout } = useAuth();
   const orgName = useOrgName();
 
+  // Nothing cached for one owner session may outlive it: clear on sign-out, on a
+  // change of user, and whenever the database stops saying "owner".
+  const userId = session?.user?.id ?? null;
+  useEffect(() => {
+    if (ownerState !== 'owner') queryClient.clear();
+  }, [ownerState, userId]);
+
   if (isLoadingAuth) return <Centered><p className="text-muted-foreground">Loading...</p></Centered>;
   if (!session) return <Centered><SignInForm orgName={orgName} /></Centered>;
   // Fail closed: nothing protected renders until both checks have an answer.
@@ -47,7 +56,7 @@ function Gate() {
         <div className="flex max-w-sm flex-col items-center gap-4 text-center">
           <p>
             {ownerState === 'error'
-              ? 'Could not confirm your account. Check that the local stack is running.'
+              ? 'Could not confirm your account. Check that your Supabase project is reachable.'
               : 'This account is not the owner of this CRM.'}
           </p>
           <Button variant="outline" onClick={() => void logout()}>Sign out</Button>
@@ -56,15 +65,8 @@ function Gate() {
     );
   }
 
-  return (
-    <Centered>
-      <div className="flex flex-col items-center gap-4 text-center">
-        <h1 className="text-2xl font-semibold">{orgName ?? 'Open CRM'}</h1>
-        <p className="text-muted-foreground">Signed in as {session.user.email}.</p>
-        <Button variant="outline" onClick={() => void logout()}>Sign out</Button>
-      </div>
-    </Centered>
-  );
+  // Signing out ends the owner state, and the effect above clears the cache.
+  return <OwnerApp orgName={orgName} email={session.user.email ?? ''} onSignOut={() => void logout()} />;
 }
 
 export function App() {

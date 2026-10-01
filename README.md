@@ -58,6 +58,8 @@ npx supabase link --project-ref <your-project-ref>
 npx supabase db push
 npx supabase config push
 npm run dev:bootstrap
+npx supabase secrets set --env-file supabase/functions/.env
+npx supabase functions deploy --use-api
 npm run dev
 ```
 
@@ -66,8 +68,14 @@ npm run dev
 site URL `http://127.0.0.1:5173`. `dev:bootstrap` asks for the project URL and the anon and
 service role keys (Project Settings > API), your organization's name, and the owner's email and
 password. It writes `.env.local` and the edge-function secrets, creates the owner account, and
-is safe to run again; the service role key is used for that run only and never saved. Then
-open http://localhost:5173 and sign in as the owner.
+is safe to run again; the service role key is used for that run only and never saved.
+`secrets set` hands the generated secrets to your project's edge functions, and
+`functions deploy --use-api` deploys them (bundled by Supabase, so no Docker). Then open
+http://localhost:5173 and sign in as the owner.
+
+The edge functions accept browser requests from http://localhost:5173 while `ENVIRONMENT` is
+unset. When you serve the app from a real address, set `SITE_URL` to it and `ENVIRONMENT`
+to `production` with `npx supabase secrets set`, and redeploy.
 
 ## Running the tests
 

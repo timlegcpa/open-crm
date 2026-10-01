@@ -237,10 +237,27 @@ describe('who can write what', () => {
     expect(await errorOf(db, service, 'TRUNCATE public.contacts CASCADE')).toMatch(/permission denied/);
   });
 
+  it('the owner sees a contact but cannot delete it, or a portal account, directly', async () => {
+    expect(await count(owner, 'contacts', `id = '${CONTACT_A}'`)).toBe(1);
+    expect(await errorOf(db, owner, `DELETE FROM public.contacts WHERE id = '${CONTACT_A}'`)).toMatch(/permission denied/);
+    expect(await errorOf(db, owner, `DELETE FROM public.client_portal_accounts WHERE contact_id = '${CONTACT_A}'`)).toMatch(/permission denied/);
+    // Only the server's claim protocol deletes; the owner cannot even call it.
+    expect(await errorOf(db, owner, `SELECT * FROM public.admin_contact_delete_begin('${CONTACT_A}')`)).toMatch(/permission denied/);
+  });
+
   it('the owner cannot write the delete-claim columns', async () => {
     expect(await errorOf(db, owner, `UPDATE public.contacts SET delete_claim = NULL`)).toMatch(/permission denied/);
     expect(await errorOf(db, owner, `UPDATE public.client_portal_accounts SET delete_claim = NULL`)).toMatch(/permission denied/);
     expect(await errorOf(db, owner, `UPDATE public.client_portal_accounts SET status_before_claim = 'active'`)).toMatch(/permission denied/);
+  });
+
+  it('a portal account can never hold the owner’s or the system actor’s sign-in', async () => {
+    for (const staff of [OWNER, SYSTEM]) {
+      expect(await errorOf(db, owner, `UPDATE public.client_portal_accounts SET user_id = '${staff}' WHERE contact_id = '${CONTACT_C}'`))
+        .toMatch(/portal_account_staff_user/);
+      expect(await errorOf(db, owner, `INSERT INTO public.client_portal_accounts (contact_id, user_id, status) VALUES ('${CONTACT_C}', '${staff}', 'invited')`))
+        .toMatch(/portal_account_staff_user/);
+    }
   });
 });
 
