@@ -8,6 +8,8 @@ import {
   authorizeClient,
   authorizeOwner,
   jwtSessionId,
+  MAX_TOKEN_LENGTH,
+  sessionUserId,
   supabaseClients,
   type AuthDeps,
 } from '../../../supabase/functions/_shared/auth';
@@ -151,6 +153,28 @@ describe('jwtSessionId', () => {
     expect(jwtSessionId(tokenFor({ session_id: "x' OR 1=1" }))).toBeNull();
     expect(jwtSessionId('not-a-jwt')).toBeNull();
     expect(jwtSessionId('a.%%%.c')).toBeNull();
+  });
+});
+
+describe('sessionUserId: a live session, nothing more', () => {
+  it('answers the user id of a live session and asks only Auth', async () => {
+    const { deps, calls } = fakes({});
+    expect(await sessionUserId(deps, TOKEN)).toBe(USER);
+    expect(calls.map((c) => `${c.via}.${c.fn}`)).toEqual(['service.auth.getUser']);
+  });
+
+  it('is null for a dead session', async () => {
+    for (const f of [fakes({ getUserError: { status: 401 } }), fakes({ user: null })]) {
+      expect(await sessionUserId(f.deps, TOKEN)).toBeNull();
+    }
+  });
+
+  it('refuses a missing or over-long token without asking Auth', async () => {
+    const { deps, calls } = fakes({});
+    expect(await sessionUserId(deps, null)).toBeNull();
+    expect(await sessionUserId(deps, '')).toBeNull();
+    expect(await sessionUserId(deps, 't'.repeat(MAX_TOKEN_LENGTH + 1))).toBeNull();
+    expect(calls).toEqual([]);
   });
 });
 

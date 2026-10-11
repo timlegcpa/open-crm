@@ -12,7 +12,9 @@
 //        client    bearer token, authorizeClient
 //        cron      x-cron-secret against CRON_SHARED_SECRET, constant time
 //        internal  a named header against a named secret, constant time
-//        public    nobody; the function must declare a rate limit
+//        public    no Supabase principal. The function proves the caller itself inside
+//                  handle (a signed link, a webhook signature, an API key, an OAuth
+//                  token) and must declare a rate limit, which runs before that proof.
 //      Modes combine (cron + owner, internal + owner, owner + client). A secret header,
 //      when present, decides on its own; otherwise the bearer is tried as owner, then as
 //      client. No credential or a dead session: 401. A live session of the wrong kind:
@@ -21,7 +23,8 @@
 //   6. Rate limit, when declared: before the body is read, so an abuser cannot make the
 //      function buffer and parse without spending a bucket entry. 'limited' is 429,
 //      'unavailable' (the limiter could not answer) is 503, and so is a throw.
-//   7. The body, capped while streaming: 413 over the cap, 400 for malformed JSON.
+//   7. The body, capped while streaming: 413 over the cap, 400 for a malformed JSON
+//      body or form.
 //   8. handle(ctx). Its Response is returned with the CORS and security headers and
 //      Vary: Origin merged in; an HttpError becomes its own status and public message;
 //      anything else thrown becomes a generic 500. No internal message ever reaches a
@@ -29,8 +32,8 @@
 //
 // Every response, errors included, carries Vary: Origin and the security headers.
 
-import { BodyError, bearerToken, originRefused, readBodyBytes, readJsonBody, responseHeaders } from './http.ts';
-import type { AuthOutcome, ClientPrincipal, OwnerPrincipal } from './auth.ts';
+import { BodyError, bearerToken, originRefused, readBodyBytes, readFormBody, readJsonBody, responseHeaders } from './http.ts';
+import { MAX_TOKEN_LENGTH, type AuthOutcome, type ClientPrincipal, type OwnerPrincipal } from './auth.ts';
 import { CRON_SECRET_HEADER, verifyCronSecret, verifyInternalSecret } from './secrets.ts';
 import { getClientIp, type RateLimitOutcome } from './rate-limit.ts';
 import { createLogger, type Logger, type LogSink } from './log.ts';
@@ -68,9 +71,18 @@ type Union<A extends AuthModes> =
 /** The principals a handler with these modes can see. */
 export type PrincipalFor<A extends AuthModes> = [Union<A>] extends [never] ? Principal : Union<A>;
 
-/** json: required, capped. optional_json: empty body is undefined. bytes: capped raw bytes. none: never read. */
-export type BodyKind = 'json' | 'optional_json' | 'bytes' | 'none';
-export type BodyFor<K extends BodyKind> = K extends 'bytes' ? Uint8Array : K extends 'none' ? undefined : unknown;
+/**
+ * json: required, capped. optional_json: empty body is undefined. form: multipart or
+ * urlencoded, capped, then parsed. bytes: capped raw bytes. none: never read.
+ */
+export type BodyKind = 'json' | 'optional_json' | 'form' | 'bytes' | 'none';
+export type BodyFor<K extends BodyKind> = K extends 'bytes'
+  ? Uint8Array
+  : K extends 'form'
+    ? FormData
+    : K extends 'none'
+      ? undefined
+      : unknown;
 
 export interface RequestContext<P extends Principal = Principal> {
   req: Request;
@@ -151,7 +163,6 @@ export function refuseImpersonation(principal: Principal): void {
   }
 }
 
-const MAX_TOKEN_LENGTH = 8192;
 const DEFAULT_MAX_BODY = 16_384;
 
 type Authenticated = { principal: Principal; token: string | null };
@@ -283,6 +294,7 @@ async function readBody(req: Request, kind: BodyKind, maxBytes: number): Promise
   if (kind === 'none') return undefined;
   if (kind === 'bytes') return readBodyBytes(req, maxBytes);
   if (kind === 'json') return readJsonBody(req, maxBytes);
+  if (kind === 'form') return readFormBody(req, maxBytes);
   const bytes = await readBodyBytes(req, maxBytes);
   if (bytes.byteLength === 0) return undefined;
   try {

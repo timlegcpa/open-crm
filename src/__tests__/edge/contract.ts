@@ -99,6 +99,8 @@ export function edgeRequest(init: EdgeRequestInit = {}): Request {
   if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && init.body !== undefined && init.body !== null) {
     if (typeof init.body === 'string') body = init.body;
     else if (init.body instanceof Uint8Array) body = new Uint8Array(init.body);
+    // Sent as the browser sends them: multipart with a boundary, or urlencoded.
+    else if (init.body instanceof FormData || init.body instanceof URLSearchParams) body = init.body;
     else {
       body = JSON.stringify(init.body);
       headers.set('Content-Type', 'application/json');
@@ -124,6 +126,7 @@ async function expectRefusal(res: Response, refusal: { status: number; error: st
 
 export type ContractBody =
   | { kind: 'json'; valid: unknown; maxBytes: number }
+  | { kind: 'form'; valid: FormData | URLSearchParams; maxBytes: number }
   | { kind: 'bytes'; valid: Uint8Array; maxBytes: number }
   | { kind: 'optional_json' | 'none' };
 
@@ -157,7 +160,7 @@ function invalidVariants(credentials: Record<string, string>): Record<string, st
 export function describeEdgeContract(t: EdgeContractTarget): void {
   const method = t.method ?? 'POST';
   const otherMethod = method === 'PUT' ? 'PATCH' : 'PUT';
-  const validBody = t.body.kind === 'json' || t.body.kind === 'bytes' ? t.body.valid : undefined;
+  const validBody = t.body.kind === 'json' || t.body.kind === 'form' || t.body.kind === 'bytes' ? t.body.valid : undefined;
   const call = (init: EdgeRequestInit, handler = t.handler) => handler(edgeRequest({ method, body: validBody, ...init }));
 
   describe(`${t.name}: edge contract`, () => {
@@ -231,12 +234,14 @@ export function describeEdgeContract(t: EdgeContractTarget): void {
       });
     }
 
-    if (t.body.kind === 'json' || t.body.kind === 'bytes') {
+    if (t.body.kind === 'json' || t.body.kind === 'form' || t.body.kind === 'bytes') {
       const cap = t.body.maxBytes;
+      // A form is only read under a form content type, so the oversized one carries it.
+      const typed: Record<string, string> = t.body.kind === 'form' ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {};
       it('refuses a body over the cap with 413, whatever Content-Length claims', async () => {
-        const over = 'x'.repeat(cap + 1);
+        const over = t.body.kind === 'form' ? `a=${'x'.repeat(cap)}` : 'x'.repeat(cap + 1);
         for (const init of [{ body: over }, { body: over, contentLength: '2' }]) {
-          const res = await call({ headers: t.credentials ?? {}, ...init });
+          const res = await call({ headers: { ...(t.credentials ?? {}), ...typed }, ...init });
           expectEdgeHeaders(res);
           await expectRefusal(res, REFUSALS.tooLarge);
         }
@@ -248,6 +253,20 @@ export function describeEdgeContract(t: EdgeContractTarget): void {
         const res = await call({ headers: t.credentials ?? {}, body: '{not json' });
         expectEdgeHeaders(res);
         await expectRefusal(res, REFUSALS.badRequest);
+      });
+    }
+
+    if (t.body.kind === 'form') {
+      it('refuses a body that is not a form, or a form that does not parse, with 400', async () => {
+        const cases = [
+          { headers: { 'Content-Type': 'application/json' }, body: '{"a":1}' },
+          { headers: { 'Content-Type': 'multipart/form-data; boundary=contract' }, body: 'not a multipart body' },
+        ];
+        for (const { headers, body } of cases) {
+          const res = await call({ headers: { ...(t.credentials ?? {}), ...headers }, body });
+          expectEdgeHeaders(res);
+          await expectRefusal(res, REFUSALS.badRequest);
+        }
       });
     }
 

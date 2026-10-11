@@ -59,15 +59,25 @@ export interface AuthDeps {
 
 const log = createLogger('auth');
 
-/** The verified user's id, or null when the token is not a live session. */
-async function liveUserId(deps: AuthDeps, token: string): Promise<string | null> {
+/** Longer than any real access token; refused without asking Auth. */
+export const MAX_TOKEN_LENGTH = 8192;
+
+/**
+ * The user id of a live session, or null. Auth answers alone: this says nothing about
+ * the owner, a portal account or MFA. Every owner and client function goes through
+ * authorizeOwner / authorizeClient instead. This is for the one door that must open
+ * below the MFA bar (recovering a lost authenticator with a backup code), which runs
+ * as a public function with a rate limit and calls this inside handle.
+ */
+export async function sessionUserId(deps: Pick<AuthDeps, 'service'>, token: string | null): Promise<string | null> {
+  if (!token || token.length > MAX_TOKEN_LENGTH) return null;
   const { data, error } = await deps.service.auth.getUser(token);
   const id = data?.user?.id;
   return error || typeof id !== 'string' || !id ? null : id;
 }
 
 export async function authorizeOwner(deps: AuthDeps, token: string): Promise<AuthOutcome<OwnerPrincipal>> {
-  const userId = await liveUserId(deps, token);
+  const userId = await sessionUserId(deps, token);
   if (!userId) return { ok: false, status: 401 };
   const { data, error } = await deps.asCaller(token).rpc('is_owner');
   if (error) throw error;
@@ -76,7 +86,7 @@ export async function authorizeOwner(deps: AuthDeps, token: string): Promise<Aut
 }
 
 export async function authorizeClient(deps: AuthDeps, token: string): Promise<AuthOutcome<ClientPrincipal>> {
-  const userId = await liveUserId(deps, token);
+  const userId = await sessionUserId(deps, token);
   if (!userId) return { ok: false, status: 401 };
   const { data: contactId, error } = await deps.asCaller(token).rpc('get_client_contact_id');
   if (error) throw error;

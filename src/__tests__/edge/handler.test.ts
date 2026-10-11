@@ -94,6 +94,27 @@ describeEdgeContract({
   body: { kind: 'json', valid: { a: 1 }, maxBytes: 256 },
 });
 
+const uploadForm = () => {
+  const form = new FormData();
+  form.set('folder', 'inbox');
+  form.set('file', new Blob([new Uint8Array([0x25, 0x50, 0x44, 0x46])], { type: 'application/pdf' }), 'statement.pdf');
+  return form;
+};
+describeEdgeContract({
+  name: 'form upload function',
+  handler: sample({ auth: { owner: fakeOwnerAuth(), client: fakeClientAuth() }, clientWrites: true, body: 'form', maxBodyBytes: 512 }),
+  failingHandler: sample({
+    auth: { owner: fakeOwnerAuth(), client: fakeClientAuth() },
+    clientWrites: true,
+    body: 'form',
+    maxBodyBytes: 512,
+    handle: throwInternal,
+  }),
+  credentials: CREDENTIALS.client,
+  clientWrites: true,
+  body: { kind: 'form', valid: uploadForm(), maxBytes: 512 },
+});
+
 async function bodyOf(res: Response): Promise<unknown> {
   return res.json();
 }
@@ -230,6 +251,47 @@ describe('createHandler: body kinds', () => {
     const res = await fn(edgeRequest({ headers: CREDENTIALS.owner, body: new Uint8Array([0, 255, 37, 80]) }));
     expect(await res.json()).toEqual({ bytes: [0, 255, 37, 80] });
     expect((await fn(edgeRequest({ headers: CREDENTIALS.owner, body: new Uint8Array(257) }))).status).toBe(413);
+  });
+
+  it("'form' hands over the fields and file parts of a multipart upload", async () => {
+    const fn = sample({
+      auth: { owner: fakeOwnerAuth() },
+      body: 'form',
+      maxBodyBytes: 512,
+      handle: async (ctx) => {
+        const file = ctx.body.get('file') as File;
+        const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+        return ctx.json(200, { folder: ctx.body.get('folder'), name: file.name, type: file.type, bytes });
+      },
+    });
+    const res = await fn(edgeRequest({ headers: CREDENTIALS.owner, body: uploadForm() }));
+    expect(await res.json()).toEqual({ folder: 'inbox', name: 'statement.pdf', type: 'application/pdf', bytes: [0x25, 0x50, 0x44, 0x46] });
+  });
+
+  it("'form' reads a urlencoded body too (a one-click unsubscribe, an OAuth token request)", async () => {
+    const fn = sample({
+      auth: { public: true },
+      rateLimit: async () => 'allowed',
+      body: 'form',
+      handle: async (ctx) => ctx.json(200, { value: ctx.body.get('List-Unsubscribe') }),
+    });
+    const res = await fn(edgeRequest({ origin: null, body: new URLSearchParams({ 'List-Unsubscribe': 'One-Click' }) }));
+    expect(await res.json()).toEqual({ value: 'One-Click' });
+  });
+
+  it("'form' stops an upload over the cap with 413, and refuses a body with no form type", async () => {
+    const handle = vi.fn(ok);
+    const fn = sample({ auth: { owner: fakeOwnerAuth() }, body: 'form', maxBodyBytes: 512, handle });
+    const big = new FormData();
+    big.set('file', new Blob([new Uint8Array(600)]), 'big.bin');
+    // Serialized first: Node's own FormData body stream throws when the cap cancels it
+    // mid-write (a test-runtime quirk; a Deno request body is a network stream).
+    const serialized = new Request('http://edge.test/fn', { method: 'POST', body: big });
+    const type = serialized.headers.get('Content-Type') ?? '';
+    const bytes = new Uint8Array(await serialized.arrayBuffer());
+    expect((await fn(edgeRequest({ headers: { ...CREDENTIALS.owner, 'Content-Type': type }, body: bytes }))).status).toBe(413);
+    expect((await fn(edgeRequest({ headers: CREDENTIALS.owner, body: 'folder=inbox' }))).status).toBe(400);
+    expect(handle).not.toHaveBeenCalled();
   });
 
   it('a GET function with body none answers and advertises GET', async () => {

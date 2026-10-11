@@ -56,7 +56,7 @@ export function originRefused(req: Request, allowedOrigins: string[]): boolean {
 
 export class BodyError extends Error {
   constructor(readonly status: 400 | 413) {
-    super(status === 413 ? 'Request body too large' : 'Request body is not valid JSON');
+    super(status === 413 ? 'Request body too large' : 'Request body is malformed');
   }
 }
 
@@ -65,7 +65,7 @@ export class BodyError extends Error {
  * the stream past the cap: Content-Length is a claim, not a limit, and a chunked
  * request leaves it out. No body reads as an empty array.
  */
-export async function readBodyBytes(req: Request, maxBytes: number): Promise<Uint8Array> {
+export async function readBodyBytes(req: Request, maxBytes: number): Promise<Uint8Array<ArrayBuffer>> {
   const declared = Number(req.headers.get('Content-Length') ?? '0');
   if (declared > maxBytes) throw new BodyError(413);
   if (!req.body) return new Uint8Array(0);
@@ -97,6 +97,25 @@ export async function readJsonBody(req: Request, maxBytes: number): Promise<unkn
   if (bytes.byteLength === 0) throw new BodyError(400);
   try {
     return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new BodyError(400);
+  }
+}
+
+const FORM_TYPE = /^(multipart\/form-data|application\/x-www-form-urlencoded)\s*(;|$)/i;
+
+/**
+ * Read a multipart or urlencoded form of at most `maxBytes`: an upload, an OAuth token
+ * request, a one-click unsubscribe. The cap applies while the bytes stream in and the
+ * form is parsed only after; req.formData() would buffer the whole body first, cap or no
+ * cap. Any other content type, or a form that does not parse, is a bad request.
+ */
+export async function readFormBody(req: Request, maxBytes: number): Promise<FormData> {
+  const type = req.headers.get('Content-Type') ?? '';
+  if (!FORM_TYPE.test(type)) throw new BodyError(400);
+  const bytes = await readBodyBytes(req, maxBytes);
+  try {
+    return await new Response(bytes, { headers: { 'Content-Type': type } }).formData();
   } catch {
     throw new BodyError(400);
   }

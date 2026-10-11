@@ -6,6 +6,7 @@ import {
   json,
   originRefused,
   readBodyBytes,
+  readFormBody,
   readJsonBody,
   responseHeaders,
   SECURITY_HEADERS,
@@ -128,6 +129,41 @@ describe('readJsonBody', () => {
     expect(await caught(readJsonBody(post(''), 100))).toBe(400);
     expect(await caught(readJsonBody(post('{"a":'), 100))).toBe(400);
     expect(await caught(readJsonBody(post(JSON.stringify({ a: 'x'.repeat(200) })), 100))).toBe(413);
+  });
+});
+
+describe('readFormBody', () => {
+  it('parses a multipart upload and a urlencoded form within the cap', async () => {
+    const form = new FormData();
+    form.set('note', 'hello');
+    form.set('file', new Blob([Uint8Array.of(1, 2, 3)], { type: 'application/pdf' }), 'a.pdf');
+    const parsed = await readFormBody(new Request('http://edge.test/fn', { method: 'POST', body: form }), 1000);
+    expect(parsed.get('note')).toBe('hello');
+    expect(Array.from(new Uint8Array(await (parsed.get('file') as File).arrayBuffer()))).toEqual([1, 2, 3]);
+    const encoded = new Request('http://edge.test/fn', { method: 'POST', body: new URLSearchParams({ a: '1' }) });
+    expect((await readFormBody(encoded, 100)).get('a')).toBe('1');
+  });
+
+  it('refuses any other content type, or none, before reading a byte', async () => {
+    for (const type of ['text/plain', 'application/json', 'multipart/form-datax', null]) {
+      const { req, state } = streamed([new TextEncoder().encode('a=1')]);
+      if (type) req.headers.set('Content-Type', type);
+      else req.headers.delete('Content-Type');
+      expect([type, await caught(readFormBody(req, 100)), state.pulled]).toEqual([type, 400, 0]);
+    }
+  });
+
+  it('caps the bytes while they stream, before any parse', async () => {
+    const { req, state } = streamed([new Uint8Array(60), new Uint8Array(60), new Uint8Array(60)]);
+    req.headers.set('Content-Type', 'multipart/form-data; boundary=x');
+    expect(await caught(readFormBody(req, 100))).toBe(413);
+    expect(state.cancelled).toBe(true);
+  });
+
+  it('answers 400 to a multipart body that does not parse', async () => {
+    const headers = { 'Content-Type': 'multipart/form-data; boundary=x' };
+    const req = new Request('http://edge.test/fn', { method: 'POST', body: 'not multipart', headers });
+    expect(await caught(readFormBody(req, 100))).toBe(400);
   });
 });
 
