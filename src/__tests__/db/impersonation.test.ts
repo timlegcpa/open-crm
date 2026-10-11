@@ -106,6 +106,25 @@ describe('a bound View-as-client session', () => {
     expect(rows.map((r) => r.id)).toEqual([taskId]);
   });
 
+  it('cannot write through a SECURITY DEFINER function either', async () => {
+    // The role setting still names the caller inside a definer function, so the trigger
+    // refuses the write wherever it comes from.
+    const viaFunction = (who: Principal) =>
+      session(db, asServer, async (tx) => {
+        await insertRow(tx, bound);
+        await becomeSuperuser(tx);
+        await tx.exec(`
+          CREATE FUNCTION public.test_add_task() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = '' AS $$
+            INSERT INTO public.client_tasks (contact_id, title) VALUES (public.get_client_contact_id(), 'Added by a function');
+          $$;
+          GRANT EXECUTE ON FUNCTION public.test_add_task() TO authenticated;`);
+        await become(tx, who);
+        return (await tx.query('SELECT public.test_add_task()')).rows.length;
+      });
+    await expectReadOnly(viaFunction(minted()));
+    expect(await viaFunction(asClient(clientId, { sessionId: OWN_DEVICE }))).toBe(1);
+  });
+
   it('stays read-only after its row is closed, since the token outlives the row', async () => {
     await expectReadOnly(complete({ sessionId: MINTED, startedAgo: '3 hours', endedAgo: '2 hours' }, minted()));
   });
