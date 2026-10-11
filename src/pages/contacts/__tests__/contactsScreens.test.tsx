@@ -31,8 +31,6 @@ function contact(id: string, first: string, last: string, extra: Record<string, 
     spouse_name: null,
     spouse_email: null,
     spouse_phone: null,
-    date_of_birth: null,
-    spouse_date_of_birth: null,
     mailing_street: null,
     mailing_city: null,
     mailing_state: null,
@@ -45,8 +43,8 @@ function contact(id: string, first: string, last: string, extra: Record<string, 
 function seed() {
   fake.state.session = OWNER;
   fake.state.tables.contact_statuses = [
-    { key: 'new_lead', label: 'New lead', colour: '#2563eb', sort_order: 10 },
-    { key: 'client', label: 'Client', colour: null, sort_order: 50 },
+    { key: 'new_lead', label: 'New', colour: '#2563eb', sort_order: 10 },
+    { key: 'client', label: 'Client', colour: null, sort_order: 60 },
   ];
   fake.state.tables.lead_sources = [
     { key: 'other', label: 'Other', colour: null, sort_order: 10, is_active: true },
@@ -90,7 +88,7 @@ describe('contacts list', () => {
     expect(screen.getByText('Bo Sample')).toBeInTheDocument();
     expect(screen.getByText('Cy Test')).toBeInTheDocument();
     const ada = screen.getByText('Ada Example').closest('tr')!;
-    expect(within(ada).getByText('New lead')).toBeInTheDocument();
+    expect(within(ada).getByText('New')).toBeInTheDocument();
     expect(within(ada).getByText('Referral')).toBeInTheDocument();
     expect(within(ada).getByText('Example Studio')).toBeInTheDocument();
   });
@@ -102,7 +100,7 @@ describe('contacts list', () => {
     const ada = (await screen.findByText('Ada Example')).closest('tr')!;
     expect(within(ada).getByText('Fresh enquiry')).toBeInTheDocument();
     expect(within(ada).getByText('Word of mouth')).toBeInTheDocument();
-    expect(screen.queryByText('New lead')).toBeNull();
+    expect(screen.queryByText('New')).toBeNull();
   });
 
   it('searches name, email, business and phone digits', async () => {
@@ -222,7 +220,7 @@ describe('intake', () => {
     renderAt('/contacts/new');
     await screen.findByRole('button', { name: 'Save contact' });
     // The defaults come from the tables once they load.
-    await waitFor(() => expect(screen.getByLabelText('Status')).toHaveTextContent('New lead'));
+    await waitFor(() => expect(screen.getByLabelText('Status')).toHaveTextContent('New'));
     expect(screen.getByLabelText('Source')).toHaveTextContent('Other');
     expect(screen.queryByText('Retired ad')).toBeNull();
     fireEvent.change(screen.getByLabelText('First name'), { target: { value: 'Di' } });

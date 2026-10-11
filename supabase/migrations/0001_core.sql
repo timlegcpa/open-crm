@@ -1034,18 +1034,18 @@ $$;
 -- ---------------------------------------------------------------------------
 
 -- Tables: nothing inherited, service_role included (Supabase's default privileges grant
--- it ALL, TRUNCATE on audit_logs among them). service_role gets full access (audit_logs
--- without TRUNCATE); user sessions get only what a policy above can use.
+-- it ALL). service_role gets row access only: no TRUNCATE (it skips RLS and row
+-- triggers), and no REFERENCES, TRIGGER or MAINTAIN, which no request path needs. User
+-- sessions get only what a policy above can use.
 REVOKE ALL ON
   public.org_profile, public.mfa_recovery_lockouts, public.mfa_backup_code_generations,
   public.mfa_backup_codes, public.audit_logs, public.auth_rate_limits, public.app_settings,
   public.jobs, public.dev_outbox, public.csp_violation_reports
 FROM PUBLIC, anon, authenticated, service_role;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.audit_logs TO service_role;
-GRANT ALL ON
+GRANT SELECT, INSERT, UPDATE, DELETE ON
   public.org_profile, public.mfa_recovery_lockouts, public.mfa_backup_code_generations,
-  public.mfa_backup_codes, public.auth_rate_limits, public.app_settings,
+  public.mfa_backup_codes, public.audit_logs, public.auth_rate_limits, public.app_settings,
   public.jobs, public.dev_outbox, public.csp_violation_reports
 TO service_role;
 

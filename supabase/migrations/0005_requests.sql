@@ -1,0 +1,41 @@
+-- 0005_requests: requests a client answers in the portal.
+--
+-- Belongs here: the request lists, their items, answers and uploaded item documents,
+-- the request taxonomy (request_categories, request_tags) and templates, the start-link
+-- path for a contact with no portal account yet (pending_signup_requests), the draft
+-- functions (needs_replace_draft, needs_delete_draft), and the request lists in the
+-- supabase_realtime publication.
+--
+-- Depends on: 0003_documents (an uploaded answer is a client document), 0002_contacts.
+--
+-- Rules, as for every migration in this schema. src/__tests__/db/invariants.test.ts reads
+-- the migrated catalog and fails the build when a table or function here breaks one:
+--   * RLS on every table, and a RESTRICTIVE policy named <table>_mfa_gate, FOR ALL TO
+--     authenticated, USING ((SELECT public.mfa_session_ok())) and WITH CHECK the same.
+--   * Privileges stated, never inherited: REVOKE ALL ON <table> FROM PUBLIC, anon,
+--     authenticated, service_role; then GRANT per role. Row access only (SELECT, INSERT,
+--     UPDATE, DELETE, by column where a column must not move); anon gets nothing.
+--     Supabase grants everything in public by default, so a missing REVOKE is an open
+--     table.
+--   * Functions likewise: REVOKE ALL ON FUNCTION ... FROM PUBLIC, anon, authenticated,
+--     service_role; then GRANT EXECUTE per role. Every function pins SET search_path = ''
+--     and schema-qualifies what it touches; SECURITY DEFINER only where it must be.
+--   * A FOR ALL policy states both USING and WITH CHECK.
+--   * The principals are public.is_owner(), public.get_client_contact_id() and the
+--     service role; a role claim in a token grants nothing.
+--   * Columns a client must not change: a BEFORE UPDATE trigger running
+--     public.enforce_client_column_guard('id', ...the columns...).
+--   * Every table a client session can write (a write policy that names
+--     get_client_contact_id() or auth.uid(), or does not require is_owner()) carries
+--       CREATE TRIGGER trg_impersonation_read_only
+--         BEFORE INSERT OR UPDATE OR DELETE ON public.<table>
+--         FOR EACH STATEMENT EXECUTE FUNCTION public.enforce_impersonation_read_only();
+--   * Storage: each bucket gets its own policies on storage.objects, and every clause of
+--     each requires bucket_id = '<that bucket>' at its top level (AND, never OR).
+--   * A pick-list is a table guarded by public.guard_pick_list(), with the columns key,
+--     label, colour, sort_order, is_active and is_system.
+--   * A view is created WITH (security_invoker = true).
+--   * No cron schedules in a migration: scheduled work is a row in public.jobs run by the
+--     job-runner, or a schedule the adopter sets up outside the migrations.
+--
+-- Allocated empty; the domain's tables arrive with its build.
