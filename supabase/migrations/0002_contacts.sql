@@ -9,7 +9,8 @@
 --   server  service_role (edge functions). It bypasses RLS but not triggers.
 -- A role claim in a token grants nothing. anon has no access to anything in this file.
 -- The owner's View-as-client session is a client session that may only read: every
--- table a client can write carries the trg_impersonation_read_only statement trigger.
+-- table a client can write carries the trg_impersonation_read_only statement trigger,
+-- and storage.objects refuses its writes for every bucket.
 
 -- ---------------------------------------------------------------------------
 -- Pick-lists. Labels, colours and order are the owner's to edit; keys never change.
@@ -22,7 +23,7 @@
 -- cold (parked, and so out of the active pipeline). It becomes a client (recurring work)
 -- or one_time, or ends as lost (never signed); a client who leaves is former_client.
 -- esign_signer is a system status: the e-signature flow gives it to a contact created
--- only to sign, and no person picks it.
+-- only to sign. It is not a pipeline stage the owner moves a contact through.
 CREATE TABLE public.contact_statuses (
   key text PRIMARY KEY,
   label text NOT NULL CHECK (char_length(label) BETWEEN 1 AND 60),
@@ -790,6 +791,21 @@ AS $$
          AND (s.ended_at IS NULL OR s.started_at > now() - interval '1 hour'));
 $$;
 
+-- The same question about the caller's own session: the user and session_id of the token
+-- in hand. It says nothing about anyone else, so signed-in sessions may ask it. The write
+-- trigger and the storage policies below ask it; the portal can, to show it is read-only.
+CREATE FUNCTION public.is_view_as_client()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+  SELECT public.is_impersonation_session(
+    auth.uid(),
+    NULLIF((SELECT auth.jwt()) ->> 'session_id', '')::uuid);
+$$;
+
 -- Refuses every write a View-as-client session makes. Statement level, so one lookup per
 -- statement. Only the authenticated API role is checked: the server (service role) runs
 -- its own guard, and the owner's own token is never a View-as-client session. Attached as
@@ -801,11 +817,7 @@ SECURITY DEFINER
 SET search_path = ''
 AS $$
 BEGIN
-  IF current_setting('role', true) = 'authenticated'
-     AND public.is_impersonation_session(
-           auth.uid(),
-           NULLIF((SELECT auth.jwt()) ->> 'session_id', '')::uuid)
-  THEN
+  IF current_setting('role', true) = 'authenticated' AND public.is_view_as_client() THEN
     RAISE EXCEPTION 'impersonation_read_only'
       USING ERRCODE = '42501',
             HINT = 'View as client is read-only.';
@@ -820,6 +832,17 @@ CREATE TRIGGER trg_impersonation_read_only
 CREATE TRIGGER trg_impersonation_read_only
   BEFORE INSERT OR UPDATE OR DELETE ON public.client_tasks
   FOR EACH STATEMENT EXECUTE FUNCTION public.enforce_impersonation_read_only();
+
+-- Files. storage.objects is the storage service's table: a migration gives it policies,
+-- never triggers. These refuse the same writes for every bucket, whatever a bucket's own
+-- policies allow: an upload is refused, and an update or delete finds nothing to change.
+CREATE POLICY objects_view_as_client_insert ON storage.objects AS RESTRICTIVE FOR INSERT TO authenticated
+  WITH CHECK (NOT (SELECT public.is_view_as_client()));
+CREATE POLICY objects_view_as_client_update ON storage.objects AS RESTRICTIVE FOR UPDATE TO authenticated
+  USING (NOT (SELECT public.is_view_as_client()))
+  WITH CHECK (NOT (SELECT public.is_view_as_client()));
+CREATE POLICY objects_view_as_client_delete ON storage.objects AS RESTRICTIVE FOR DELETE TO authenticated
+  USING (NOT (SELECT public.is_view_as_client()));
 
 -- Server only: revoke the minted session of one row by deleting its auth.sessions row,
 -- which kills its refresh token. A bound row names its session. An unbound row cannot,
@@ -1362,6 +1385,7 @@ REVOKE ALL ON FUNCTION
   public.stamp_client_activity_insert(),
   public.increment_invitation_attempt(uuid, integer),
   public.is_impersonation_session(uuid, uuid),
+  public.is_view_as_client(),
   public.enforce_impersonation_read_only(),
   public.revoke_impersonation_auth_session(uuid),
   public.auto_end_stale_impersonation_sessions(),
@@ -1385,10 +1409,12 @@ GRANT EXECUTE ON FUNCTION
   public.admin_delete_contact(uuid, uuid)
 TO service_role;
 
--- Signed-in sessions: the client principal (policies call it), the portal's own-contact
--- and own-activity reads, and the owner's default-address switch.
+-- Signed-in sessions: the client principal and the caller's own View-as-client state
+-- (policies call both), the portal's own-contact and own-activity reads, and the owner's
+-- default-address switch.
 GRANT EXECUTE ON FUNCTION
   public.get_client_contact_id(),
+  public.is_view_as_client(),
   public.get_my_contact(),
   public.get_my_activity(integer),
   public.contact_emails_set_default(uuid, uuid, text)

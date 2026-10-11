@@ -46,7 +46,7 @@ const AUTHENTICATED_CALLABLE = [
   'is_owner()', 'mfa_session_ok()', 'user_has_verified_mfa()', 'audit_actor()', 'is_owner_or_server()',
   'org_profile_guard_principals()', 'set_updated_at()', 'retry_job(uuid)', 'get_job_status_counts()',
   'get_org_branding()',
-  'get_client_contact_id()', 'get_my_contact()', 'get_my_activity(integer)',
+  'get_client_contact_id()', 'is_view_as_client()', 'get_my_contact()', 'get_my_activity(integer)',
   'contact_emails_set_default(uuid,uuid,text)',
 ];
 const ANON_CALLABLE = ['get_org_branding()'];

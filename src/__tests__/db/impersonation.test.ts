@@ -163,6 +163,79 @@ describe('is_impersonation_session', () => {
     await expectDenied(as(db, asOwner, call));
     await expectDenied(as(db, asAnon, call));
   });
+
+  it('is_view_as_client() asks it about the caller alone, and anon may not ask', async () => {
+    const ask = (who: Principal) =>
+      session(db, asServer, async (tx) => {
+        await insertRow(tx, { sessionId: MINTED });
+        await become(tx, who);
+        return (await tx.query<{ v: boolean }>('SELECT public.is_view_as_client() AS v')).rows[0].v;
+      });
+    expect(await ask(asClient(clientId, { sessionId: MINTED }))).toBe(true);
+    expect(await ask(asClient(clientId, { sessionId: OWN_DEVICE }))).toBe(false);
+    expect(await ask(asClient(otherClientId))).toBe(false);
+    expect(await ask(asOwner)).toBe(false);
+    await expectDenied(ask(asAnon));
+  });
+});
+
+/**
+ * A bucket a client may write, as a documents bucket does, holding one file in the
+ * client's folder. Made as the superuser inside the session, so it is rolled back with it.
+ */
+async function addClientBucket(tx: Tx): Promise<void> {
+  await becomeSuperuser(tx);
+  const mine = `bucket_id = 'files' AND ((SELECT public.is_owner()) OR (storage.foldername(name))[1] = (SELECT public.get_client_contact_id())::text)`;
+  await tx.exec(`
+    INSERT INTO storage.buckets (id, name) VALUES ('files', 'files');
+    CREATE POLICY files_select ON storage.objects FOR SELECT TO authenticated USING (${mine});
+    CREATE POLICY files_insert ON storage.objects FOR INSERT TO authenticated WITH CHECK (${mine});
+    CREATE POLICY files_update ON storage.objects FOR UPDATE TO authenticated USING (${mine}) WITH CHECK (${mine});
+    CREATE POLICY files_delete ON storage.objects FOR DELETE TO authenticated USING (${mine});
+    INSERT INTO storage.objects (bucket_id, name) VALUES ('files', '${contactId}/kept.pdf');
+  `);
+}
+
+/** With `row` and the bucket in place (rolled back afterwards), run one storage statement as `who`. */
+function onFiles(row: Row | null, who: Principal, sql: string): Promise<{ affected: number; names: string[] }> {
+  return session(db, asServer, async (tx) => {
+    if (row) await insertRow(tx, row);
+    await addClientBucket(tx);
+    await become(tx, who);
+    const r = await tx.query<{ name: string }>(sql);
+    return { affected: r.affectedRows ?? 0, names: r.rows.map((x) => x.name) };
+  });
+}
+
+describe('files, in every bucket', () => {
+  const bound: Row = { sessionId: MINTED };
+  const minted = () => asClient(clientId, { sessionId: MINTED });
+  const own = () => asClient(clientId, { sessionId: OWN_DEVICE });
+  const upload = () => `INSERT INTO storage.objects (bucket_id, name) VALUES ('files', '${contactId}/new.pdf')`;
+  const RENAME = `UPDATE storage.objects SET name = name || '.old' WHERE bucket_id = 'files'`;
+  const REMOVE = `DELETE FROM storage.objects WHERE bucket_id = 'files'`;
+  const LIST = `SELECT name FROM storage.objects WHERE bucket_id = 'files'`;
+
+  it('a View-as-client session cannot upload, rename or remove a file, and still sees them', async () => {
+    const err = await expectDenied(onFiles(bound, minted(), upload()));
+    expect(err.message).toMatch(/objects_view_as_client_insert/);
+    expect((await onFiles(bound, minted(), RENAME)).affected).toBe(0);
+    expect((await onFiles(bound, minted(), REMOVE)).affected).toBe(0);
+    expect((await onFiles(bound, minted(), LIST)).names).toEqual([`${contactId}/kept.pdf`]);
+  });
+
+  it("leaves the client's own device, the owner and the server alone", async () => {
+    expect((await onFiles(bound, own(), upload())).affected).toBe(1);
+    expect((await onFiles(bound, own(), RENAME)).affected).toBe(1);
+    expect((await onFiles(bound, own(), REMOVE)).affected).toBe(1);
+    expect((await onFiles(bound, asOwner, upload())).affected).toBe(1);
+    expect((await onFiles(bound, asServer, REMOVE)).affected).toBe(1);
+  });
+
+  it('an unbound row holds every session of the client to reading', async () => {
+    await expectDenied(onFiles({ sessionId: null }, own(), upload()));
+    expect((await onFiles({ sessionId: null }, own(), REMOVE)).affected).toBe(0);
+  });
 });
 
 /** An auth.sessions row for `userId`, created `createdAgo` ago, signed in by `method`. */

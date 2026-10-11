@@ -33,6 +33,8 @@
 --         FOR EACH STATEMENT EXECUTE FUNCTION public.enforce_impersonation_read_only();
 --   * Storage: each bucket gets its own policies on storage.objects, and every clause of
 --     each requires bucket_id = '<that bucket>' at its top level (AND, never OR).
+--     storage.objects already carries the MFA gate (0001) and refuses every write from
+--     View as client (0002), for all buckets: never add another gate or change those.
 --   * A pick-list is a table guarded by public.guard_pick_list(), with the columns key,
 --     label, colour, sort_order, is_active and is_system.
 --   * A view is created WITH (security_invoker = true).

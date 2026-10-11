@@ -9,10 +9,10 @@
 --   client       a portal user bound to a contact (defined with contacts, in 0002).
 --   service_role the server key used by edge functions; bypasses RLS.
 --
--- Conventions: RLS on every table; access is REVOKEd from every API role (anon,
--- authenticated and service_role) and then GRANTed per table, never inherited from
--- Supabase's default privileges; every function pins
--- `search_path = ''` and schema-qualifies what it touches; EXECUTE is revoked from
+-- Conventions: RLS on every table, and an MFA gate on every table and on storage.objects;
+-- access is REVOKEd from every API role (anon, authenticated and service_role) and then
+-- GRANTed per table, never inherited from Supabase's default privileges; every function
+-- pins `search_path = ''` and schema-qualifies what it touches; EXECUTE is revoked from
 -- PUBLIC and granted per function.
 
 -- ---------------------------------------------------------------------------
@@ -1028,6 +1028,12 @@ BEGIN
   END LOOP;
 END;
 $$;
+
+-- The same gate on storage.objects, where every bucket's policies live: whatever a
+-- bucket's own policies allow, a session that fails mfa_session_ok() reads and writes no
+-- file. It holds for every bucket a later migration creates, so none adds its own.
+CREATE POLICY objects_mfa_gate ON storage.objects AS RESTRICTIVE FOR ALL TO authenticated
+  USING ((SELECT public.mfa_session_ok())) WITH CHECK ((SELECT public.mfa_session_ok()));
 
 -- ---------------------------------------------------------------------------
 -- Privileges

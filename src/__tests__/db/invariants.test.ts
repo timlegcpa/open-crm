@@ -13,7 +13,7 @@
  * Exceptions live in the allowlists next to the checks, each with its reason.
  */
 import type { PGlite } from '@electric-sql/pglite';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createDb } from './harness';
@@ -101,6 +101,8 @@ const isCall = (fn: string) => (term: string | null) =>
   term !== null && new RegExp(`^(SELECT )?public\\.${fn}\\(\\)( AS ${fn})?$`).test(unwrap(term));
 const isMfaCall = isCall('mfa_session_ok');
 const isOwnerCall = isCall('is_owner');
+const isNotViewAsClient = (expr: string | null) =>
+  expr !== null && unwrap(expr).startsWith('NOT ') && isCall('is_view_as_client')(unwrap(expr).slice(4));
 const ownerGated = (expr: string) => conjuncts(expr).some(isOwnerCall);
 const CLIENT_REFERENCE = /\bpublic\.get_client_contact_id\(\)|\bauth\.uid\(\)/;
 const bucketOf = (term: string) => /^bucket_id = '((?:[^']|'')*)'::text$/.exec(term)?.[1] ?? null;
@@ -126,23 +128,29 @@ const CHECKS: Record<string, Check> = {
     return found.map((r) => `${r.t}: row-level security is off`);
   },
 
-  /** 2. Every table carries <table>_mfa_gate: RESTRICTIVE, FOR ALL, TO authenticated, both clauses mfa_session_ok(). */
+  /**
+   * 2. Every table in public, and storage.objects (every bucket's files), carries
+   * <table>_mfa_gate: RESTRICTIVE, FOR ALL, TO authenticated, both clauses mfa_session_ok().
+   */
   async 'the restrictive MFA gate on every table'(tx) {
     const found = await rows<{
-      t: string; name: string | null; permissive: boolean; cmd: string; roles: string[]; qual: string | null; chk: string | null;
+      t: string; gate: string; name: string | null; permissive: boolean; cmd: string; roles: string[]; qual: string | null; chk: string | null;
     }>(tx, `
-      SELECT c.relname AS t, p.polname AS name, p.polpermissive AS permissive, p.polcmd AS cmd,
+      SELECT CASE WHEN c.relnamespace = 'public'::regnamespace THEN c.relname ELSE c.oid::regclass::text END AS t,
+             left(c.relname || '_mfa_gate', 63) AS gate,
+             p.polname AS name, p.polpermissive AS permissive, p.polcmd AS cmd,
              ARRAY(SELECT CASE WHEN r = 0 THEN 'PUBLIC' ELSE r::regrole::text END FROM unnest(p.polroles) r) AS roles,
              pg_get_expr(p.polqual, p.polrelid) AS qual, pg_get_expr(p.polwithcheck, p.polrelid) AS chk
       FROM pg_class c
       LEFT JOIN pg_policy p ON p.polrelid = c.oid AND p.polname = left(c.relname || '_mfa_gate', 63)
-      WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p')
+      WHERE (c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p'))
+         OR c.oid = 'storage.objects'::regclass
       ORDER BY 1`);
     const out: string[] = [];
     for (const r of found) {
-      const gate = `${r.t}: ${r.t}_mfa_gate`;
+      const gate = `${r.t}: ${r.gate}`;
       if (!r.name) {
-        out.push(`${r.t}: no ${r.t}_mfa_gate policy`);
+        out.push(`${r.t}: no ${r.gate} policy`);
         continue;
       }
       if (r.permissive) out.push(`${gate} is PERMISSIVE, not RESTRICTIVE`);
@@ -312,7 +320,30 @@ const CHECKS: Record<string, Check> = {
   },
 
   /**
-   * 11. Views run with the caller's rights (security_invoker), so RLS applies through
+   * 11. View as client cannot write files either. storage.objects takes no trigger, so for
+   * each of INSERT, UPDATE and DELETE it carries a RESTRICTIVE policy TO authenticated
+   * whose clauses are NOT public.is_view_as_client(). Restrictive, so it holds for every
+   * bucket whatever the bucket's own policies allow.
+   */
+  async 'View as client cannot write files'(tx) {
+    const found = await rows<{ cmd: string; roles: string[]; qual: string | null; chk: string | null }>(tx, `
+      SELECT p.polcmd AS cmd,
+             ARRAY(SELECT CASE WHEN r = 0 THEN 'PUBLIC' ELSE r::regrole::text END FROM unnest(p.polroles) r) AS roles,
+             pg_get_expr(p.polqual, p.polrelid) AS qual, pg_get_expr(p.polwithcheck, p.polrelid) AS chk
+      FROM pg_policy p
+      WHERE p.polrelid = 'storage.objects'::regclass AND NOT p.polpermissive AND p.polcmd IN ('a', 'w', 'd')`);
+    const refuses = (r: (typeof found)[number]) =>
+      r.roles.join(',') === 'authenticated' &&
+      (r.cmd === 'a' ? isNotViewAsClient(r.chk)
+        : r.cmd === 'w' ? isNotViewAsClient(r.qual) && (r.chk === null || isNotViewAsClient(r.chk))
+          : isNotViewAsClient(r.qual));
+    return (['a', 'w', 'd'] as const)
+      .filter((cmd) => !found.some((r) => r.cmd === cmd && refuses(r)))
+      .map((cmd) => `storage.objects: no restrictive ${{ a: 'INSERT', w: 'UPDATE', d: 'DELETE' }[cmd]} policy TO authenticated refusing NOT public.is_view_as_client()`);
+  },
+
+  /**
+   * 12. Views run with the caller's rights (security_invoker), so RLS applies through
    * them; a materialized view cannot, so no user session may read one.
    */
   async 'views keep row-level security'(tx) {
@@ -396,6 +427,11 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
     regate(`AS RESTRICTIVE FOR ALL TO public USING ${GATE} WITH CHECK ${GATE}`), /contacts_mfa_gate applies to PUBLIC/],
   ['the restrictive MFA gate on every table', 'a gate under the wrong name',
     `ALTER POLICY contacts_mfa_gate ON public.contacts RENAME TO contacts_gate;`, /^contacts: no contacts_mfa_gate policy$/],
+  ['the restrictive MFA gate on every table', 'the storage gate dropped',
+    'DROP POLICY objects_mfa_gate ON storage.objects;', /^storage\.objects: no objects_mfa_gate policy$/],
+  ['the restrictive MFA gate on every table', 'a permissive storage gate',
+    `DROP POLICY objects_mfa_gate ON storage.objects; CREATE POLICY objects_mfa_gate ON storage.objects AS PERMISSIVE FOR ALL TO authenticated USING ${GATE} WITH CHECK ${GATE};`,
+    /^storage\.objects: objects_mfa_gate is PERMISSIVE/],
 
   ['anon holds no privilege in public', 'a table grant to anon',
     'GRANT SELECT ON public.contacts TO anon;', /^contacts: anon holds SELECT$/],
@@ -471,6 +507,22 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
     `CREATE POLICY mut_files ON storage.objects FOR UPDATE TO authenticated USING (bucket_id = 'a') WITH CHECK (bucket_id = 'b');`, /^storage\.objects\.mut_files: names more than one bucket \(a, b\)$/],
   ['storage policies name their bucket', 'an insert whose WITH CHECK names no bucket',
     `CREATE POLICY mut_files ON storage.objects FOR INSERT TO authenticated WITH CHECK ((SELECT public.is_owner()));`, /^storage\.objects\.mut_files: a clause does not require bucket_id/],
+
+  ['View as client cannot write files', 'the upload refusal dropped',
+    'DROP POLICY objects_view_as_client_insert ON storage.objects;', /^storage\.objects: no restrictive INSERT policy/],
+  ['View as client cannot write files', 'an upload refusal with a way around it',
+    'ALTER POLICY objects_view_as_client_insert ON storage.objects WITH CHECK (NOT (SELECT public.is_view_as_client()) OR true);',
+    /^storage\.objects: no restrictive INSERT policy/],
+  ['View as client cannot write files', 'the upload refusal made permissive',
+    `DROP POLICY objects_view_as_client_insert ON storage.objects;
+     CREATE POLICY objects_view_as_client_insert ON storage.objects FOR INSERT TO authenticated WITH CHECK (NOT (SELECT public.is_view_as_client()));`,
+    /^storage\.objects: no restrictive INSERT policy/],
+  ['View as client cannot write files', 'an update refusal whose WITH CHECK lets the row through',
+    'ALTER POLICY objects_view_as_client_update ON storage.objects WITH CHECK (true);', /^storage\.objects: no restrictive UPDATE policy/],
+  ['View as client cannot write files', 'the delete refusal reduced to true',
+    'ALTER POLICY objects_view_as_client_delete ON storage.objects USING (true);', /^storage\.objects: no restrictive DELETE policy/],
+  ['View as client cannot write files', 'the delete refusal moved to another role',
+    'ALTER POLICY objects_view_as_client_delete ON storage.objects TO anon;', /^storage\.objects: no restrictive DELETE policy/],
 
   ['views keep row-level security', 'a view without security_invoker',
     'CREATE VIEW public.mut_view AS SELECT id FROM public.contacts;', /^mut_view: view without security_invoker/],
@@ -574,6 +626,18 @@ describe('migration files', () => {
     const names = readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
     expect(names.length).toBeGreaterThanOrEqual(11);
     expect(migrationNameProblems(names)).toEqual([]);
+  });
+
+  it('a file of comments alone is valid for `supabase db push`', async () => {
+    // The CLI runs each statement it splits from a file as a prepared statement (the
+    // extended protocol). PGlite's query() takes that path too, which is why it refuses two
+    // commands at once. A file with no statement reaches Postgres as one empty statement.
+    await expect(db.query('SELECT 1; SELECT 2')).rejects.toThrow(/multiple commands/);
+    for (const name of readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort()) {
+      const sql = readFileSync(path.join(MIGRATIONS, name), 'utf8');
+      if (sql.split('\n').some((line) => line.trim() !== '' && !line.trim().startsWith('--'))) continue;
+      await expect(db.query(sql), name).resolves.toBeDefined();
+    }
   });
 
   it('a duplicate version or a name the CLI would skip is reported', () => {
