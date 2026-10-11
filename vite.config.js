@@ -2,9 +2,15 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 import path from 'path'
+import { pdfjsAssets } from './scripts/pdfjs-assets.mjs'
+
+// A public page's module lives under src/features/<domain>/public/. Its chunk is named
+// `public-*` so src/__tests__/bundleBoundary.test.ts can prove, after a build, that no
+// public page loads supabase-js.
+const PUBLIC_PAGE = /[\\/]src[\\/]features[\\/][^\\/]+[\\/]public[\\/]/
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), pdfjsAssets()],
   resolve: {
     alias: {
       '@': path.resolve(import.meta.dirname, './src'),
@@ -17,6 +23,10 @@ export default defineConfig({
     sourcemap: false,
     rollupOptions: {
       output: {
+        chunkFileNames: (chunk) =>
+          chunk.facadeModuleId && PUBLIC_PAGE.test(chunk.facadeModuleId)
+            ? 'assets/public-[name]-[hash].js'
+            : 'assets/[name]-[hash].js',
         // Rolldown merges small unmatched shared modules into the largest chunk,
         // which is the Supabase client. Pinning the known strays keeps the client
         // out of chunks that never use it.
@@ -27,6 +37,8 @@ export default defineConfig({
             { name: 'vendor-react', test: /node_modules\/(?:react|react-dom|scheduler|react-router|react-router-dom|@remix-run)\// },
             { name: 'vendor-supabase', test: /node_modules\/@supabase\// },
             { name: 'vendor-query', test: /node_modules\/@tanstack\// },
+            // pdf.js is large and only the document and e-sign screens load it.
+            { name: 'vendor-pdfjs', test: /node_modules\/pdfjs-dist\// },
           ],
         },
       },

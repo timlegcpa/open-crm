@@ -5,7 +5,8 @@ module.exports = {
   theme: {
   	extend: {
   		fontFamily: {
-  			sans: ['-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'Roboto', 'sans-serif'],
+  			// One definition: --font-sans in src/index.css (Inter, then the system stack).
+  			sans: ['var(--font-sans)'],
   		},
   		borderRadius: {
   			lg: 'var(--radius)',
@@ -55,6 +56,23 @@ module.exports = {
   				light: 'hsl(var(--warning-light))',
   				dark: 'hsl(var(--warning-dark))'
   			},
+  			// Status-only colours beyond the green/amber/red trio: the tone pairs ToneBadge
+  			// and the board stages draw (deep text on a pale fill, both themes).
+  			caution: {
+  				DEFAULT: 'hsl(var(--caution))',
+  				light: 'hsl(var(--caution-light))',
+  				dark: 'hsl(var(--caution-dark))'
+  			},
+  			attention: {
+  				DEFAULT: 'hsl(var(--attention))',
+  				light: 'hsl(var(--attention-light))',
+  				dark: 'hsl(var(--attention-dark))'
+  			},
+  			review: {
+  				DEFAULT: 'hsl(var(--review))',
+  				light: 'hsl(var(--review-light))',
+  				dark: 'hsl(var(--review-dark))'
+  			},
   			link: 'hsl(var(--link))',
   			lane: {
   				DEFAULT: 'hsl(var(--lane))',
@@ -89,11 +107,17 @@ module.exports = {
   			'accordion-up': {
   				from: { height: 'var(--radix-accordion-content-height)' },
   				to: { height: '0' }
+  			},
+  			// The fake caret in InputOTP's active slot.
+  			'caret-blink': {
+  				'0%,70%,100%': { opacity: '1' },
+  				'20%,50%': { opacity: '0' }
   			}
   		},
   		animation: {
   			'accordion-down': 'accordion-down 0.2s ease-out',
-  			'accordion-up': 'accordion-up 0.2s ease-out'
+  			'accordion-up': 'accordion-up 0.2s ease-out',
+  			'caret-blink': 'caret-blink 1.25s ease-out infinite'
   		}
   	}
   },

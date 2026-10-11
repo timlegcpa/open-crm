@@ -53,6 +53,8 @@ const fake = vi.hoisted(() => {
       state.rpcCalls.push(name);
       if (name === 'get_org_branding') return { data: { display_name: 'Example Firm' }, error: null };
       if (name === 'is_owner') return state.isOwnerPending ? new Promise(() => {}) : state.isOwner;
+      // Asked only after is_owner() says no: this account is not a portal client either.
+      if (name === 'get_client_contact_id') return { data: null, error: null };
       throw new Error(`unexpected rpc ${name}`);
     },
     from: (table: string) => ({
@@ -103,10 +105,10 @@ beforeEach(() => {
 });
 
 describe('owner sign-in', () => {
-  it('tells an unconfigured clone to run the bootstrap', () => {
+  it('tells an unconfigured clone to run the bootstrap', async () => {
     fake.state.configured = false;
     render(<App />);
-    expect(screen.getByText(/dev:bootstrap/)).toBeInTheDocument();
+    expect(await screen.findByText(/dev:bootstrap/)).toBeInTheDocument();
   });
 
   it('shows one generic message for a failed sign-in', async () => {

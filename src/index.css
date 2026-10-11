@@ -2,8 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Theme tokens: bare HSL channels (tailwind.config.js supplies the hsl() wrapper).
-   Phase 2b replaces this block with generated output from the theme source. */
+/* Theme tokens: bare HSL channels (tailwind.config.js supplies the hsl() wrapper), so a
+   class reads them as colours and an inline style writes hsl(var(--token)). The palette is
+   monochrome: --primary is the inverted button colour, --link is the one blue (links,
+   focus, selection), and the status pairs (success, warning, destructive, caution,
+   attention, review) are the only other hues, used for state and never for decoration.
+   A fork rebrands by editing these two blocks. */
 :root {
   --background: 0 0% 100%;
   --foreground: 0 0% 3.9%;
@@ -41,7 +45,7 @@
   --lane: 0 0% 95.7%;
   --lane-card: 0 0% 100%;
   --sidebar-ring: 206.2 86.9% 44.9%;
-  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-sans: "Inter Variable", Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
   --radius: 0.5rem;
   --chart-6: 265 62% 45%;
   --chart-7: 22 62% 45%;
@@ -66,12 +70,15 @@
   --review: 265 62% 45%;
   --review-light: 265 62% 95%;
   --review-dark: 265 70% 42%;
-  --caution: 47 95% 46%;
-  --caution-light: 50 96% 90%;
-  --caution-dark: 42 90% 24%;
+  --caution: 54 100% 47%;
+  --caution-light: 55 100% 88%;
+  --caution-dark: 50 85% 22%;
+  --attention: 24 90% 50%;
+  --attention-light: 24 95% 93%;
+  --attention-dark: 20 85% 32%;
 }
 
-/* Dark twin, applied by a .dark class on <html>. */
+/* Dark twin, applied by a .dark class on <html> (useTheme sets it for the owner app). */
 .dark {
   --background: 0 0% 0%;
   --foreground: 0 0% 96.1%;
@@ -109,7 +116,7 @@
   --lane: 0 0% 3.9%;
   --lane-card: 0 0% 8.6%;
   --sidebar-ring: 204.2 87.4% 52.7%;
-  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-sans: "Inter Variable", Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
   --radius: 0.5rem;
   --chart-6: 265 58% 62%;
   --chart-7: 22 58% 62%;
@@ -134,16 +141,56 @@
   --review: 265 58% 62%;
   --review-light: 265 40% 17%;
   --review-dark: 265 70% 74%;
-  --caution: 48 95% 55%;
-  --caution-light: 48 50% 13%;
-  --caution-dark: 48 90% 68%;
+  --caution: 56 95% 58%;
+  --caution-light: 56 60% 13%;
+  --caution-dark: 56 90% 70%;
+  --attention: 24 95% 58%;
+  --attention-light: 24 55% 14%;
+  --attention-dark: 24 90% 72%;
 }
 
 @layer base {
   * {
     @apply border-border;
   }
+  /* No -webkit-font-smoothing here, on purpose: `antialiased` turns off subpixel text
+     rendering, and at the 11-14px sizes this app is built from it reads as blur. */
   body {
-    @apply bg-background text-foreground antialiased;
+    @apply bg-background font-sans text-foreground;
+  }
+}
+
+/* Flat surfaces. shadcn puts `shadow` / `shadow-sm` on buttons, inputs, cards and selects;
+   this clears just the shadow part, so a focus ring (drawn with box-shadow too) still
+   shows. Real layers (popovers, dialogs, menus) use shadow-md / shadow-lg, which stay. */
+.shadow,
+.shadow-sm {
+  --tw-shadow: 0 0 #0000 !important;
+  --tw-shadow-colored: 0 0 #0000 !important;
+}
+
+/* Native scrollers (a Select list, a Command list, a textarea, the page itself) look like
+   ScrollArea: 10px, transparent track, rounded thumb in the border colour. A pane that
+   scrolls uses <ScrollArea>; these rules cover the scrollers a primitive owns. Chromium and
+   Safari read the ::-webkit rules; Firefox, which has no such selector, gets the standard
+   properties (it has no width setting finer than `thin`). */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: hsl(var(--border));
+  background-clip: padding-box;
+  border: 1px solid transparent;
+  border-radius: 9999px;
+}
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
   }
 }

@@ -16,10 +16,11 @@ export default [
     files: [
       "src/components/**/*.{js,mjs,cjs,jsx,ts,tsx}",
       "src/pages/**/*.{js,mjs,cjs,jsx,ts,tsx}",
+      "src/features/**/*.{js,mjs,cjs,jsx,ts,tsx}",
       "src/api/**/*.{js,ts}",
       "src/schemas/**/*.{js,ts}",
       "src/hooks/**/*.{js,ts,jsx,tsx}",
-      "src/Layout.{jsx,tsx}",
+      "src/*.{jsx,tsx}",
     ],
     ignores: ["src/lib/**/*", "src/components/ui/**/*", "tests/**/*"],
     ...pluginJs.configs.recommended,
