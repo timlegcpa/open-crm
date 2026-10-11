@@ -1,16 +1,25 @@
 // Request and response handling shared by every edge function: the origin allowlist,
-// CORS, security headers, generic JSON errors and a capped body read. Pure TypeScript
+// CORS, security headers, generic JSON errors and capped body reads. Pure TypeScript
 // over the web Request/Response types, so vitest runs it as-is.
 
 export const SECURITY_HEADERS: Record<string, string> = {
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
   'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'no-referrer',
   'Cache-Control': 'no-store',
   'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
 };
 
-/** Headers for a response to `req`. An origin not on the list gets no CORS grant. */
-export function responseHeaders(req: Request, allowedOrigins: string[]): Record<string, string> {
+/**
+ * Headers for a response to `req`. An origin not on the list gets no CORS grant.
+ * `methods` are the ones the function accepts; OPTIONS is always added.
+ */
+export function responseHeaders(
+  req: Request,
+  allowedOrigins: string[],
+  methods: readonly string[] = ['POST'],
+): Record<string, string> {
   const origin = req.headers.get('Origin');
   const headers: Record<string, string> = {
     ...SECURITY_HEADERS,
@@ -20,13 +29,19 @@ export function responseHeaders(req: Request, allowedOrigins: string[]): Record<
   if (origin && allowedOrigins.includes(origin)) {
     headers['Access-Control-Allow-Origin'] = origin;
     headers['Access-Control-Allow-Headers'] = 'authorization, x-client-info, apikey, content-type';
-    headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS';
+    headers['Access-Control-Allow-Methods'] = [...methods.filter((m) => m !== 'OPTIONS'), 'OPTIONS'].join(', ');
   }
   return headers;
 }
 
-export function json(req: Request, allowedOrigins: string[], status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), { status, headers: responseHeaders(req, allowedOrigins) });
+export function json(
+  req: Request,
+  allowedOrigins: string[],
+  status: number,
+  body: unknown,
+  methods?: readonly string[],
+): Response {
+  return new Response(JSON.stringify(body), { status, headers: responseHeaders(req, allowedOrigins, methods) });
 }
 
 /**
@@ -46,13 +61,14 @@ export class BodyError extends Error {
 }
 
 /**
- * Read a JSON body of at most `maxBytes`, counting the bytes as they stream in:
- * Content-Length is a claim, not a limit.
+ * Read at most `maxBytes` of the body, counting bytes as they stream in and cancelling
+ * the stream past the cap: Content-Length is a claim, not a limit, and a chunked
+ * request leaves it out. No body reads as an empty array.
  */
-export async function readJsonBody(req: Request, maxBytes: number): Promise<unknown> {
+export async function readBodyBytes(req: Request, maxBytes: number): Promise<Uint8Array> {
   const declared = Number(req.headers.get('Content-Length') ?? '0');
   if (declared > maxBytes) throw new BodyError(413);
-  if (!req.body) throw new BodyError(400);
+  if (!req.body) return new Uint8Array(0);
   const reader = req.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -72,6 +88,13 @@ export async function readJsonBody(req: Request, maxBytes: number): Promise<unkn
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  return bytes;
+}
+
+/** Read a JSON body of at most `maxBytes`. An empty body is a bad request. */
+export async function readJsonBody(req: Request, maxBytes: number): Promise<unknown> {
+  const bytes = await readBodyBytes(req, maxBytes);
+  if (bytes.byteLength === 0) throw new BodyError(400);
   try {
     return JSON.parse(new TextDecoder().decode(bytes));
   } catch {
