@@ -59,6 +59,8 @@ const REJECT = [
   '::ffff:01.2.3.4',
   '::::',
   '1::2::3',
+  // Two `::` whose groups add up to eight: only the one-`::` rule refuses it.
+  '1:2:3::4:5:6::7:8',
   '2001:db8:::1',
   'gggg::1',
   '12345::1',

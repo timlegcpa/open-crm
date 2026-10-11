@@ -301,7 +301,8 @@ describe('Twilio adapter', () => {
 describe('isValidEmail', () => {
   it('refuses header injection and non-addresses', () => {
     expect(isValidEmail('ada@example.test')).toBe(true);
-    for (const bad of ['ada@example.test\r\n', 'ada@example', 'ada example@x.test', '<ada@example.test>', `${'a'.repeat(250)}@x.test`]) {
+    // A NUL is not whitespace, so the address pattern alone would let it through.
+    for (const bad of ['ada@example.test\r\n', 'ada@example.test\0', 'ada@example', 'ada example@x.test', '<ada@example.test>', `${'a'.repeat(250)}@x.test`]) {
       expect([bad, isValidEmail(bad)]).toEqual([bad, false]);
     }
   });
