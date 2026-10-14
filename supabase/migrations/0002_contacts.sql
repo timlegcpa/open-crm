@@ -851,10 +851,10 @@ CREATE POLICY objects_view_as_client_delete ON storage.objects AS RESTRICTIVE FO
 
 -- Server only: revoke the minted session of one row by deleting its auth.sessions row,
 -- which kills its refresh token. A bound row names its session. An unbound row cannot,
--- so every session of the target that a sign-in link created (amr 'otp') within the
--- link's hour from the row's start is revoked: the minted one is among them, and leaving
--- it would hand an unrestricted session to whoever holds that browser once the row
--- closes. Returns whether any session was removed.
+-- so every session of the target that a sign-in link created (amr 'otp', or 'magiclink'
+-- on some Auth versions) within the link's hour from the row's start is revoked: the
+-- minted one is among them, and leaving it would hand an unrestricted session to
+-- whoever holds that browser once the row closes. Returns whether any session was removed.
 CREATE FUNCTION public.revoke_impersonation_auth_session(p_row uuid)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -877,7 +877,7 @@ BEGIN
        AND a.created_at >= v_row.started_at
        AND a.created_at < v_row.started_at + interval '1 hour'
        AND EXISTS (SELECT 1 FROM auth.mfa_amr_claims m
-                    WHERE m.session_id = a.id AND m.authentication_method = 'otp');
+                    WHERE m.session_id = a.id AND m.authentication_method IN ('otp', 'magiclink'));
   END IF;
   GET DIAGNOSTICS v_count = ROW_COUNT;
   RETURN v_count > 0;
@@ -1260,6 +1260,8 @@ CREATE POLICY client_portal_accounts_owner_update ON public.client_portal_accoun
 -- Activity: the owner reads everything. A client records only actions it performs
 -- itself (lifecycle events come from the server) and reads its history through
 -- get_my_activity(), which leaves out other people's addresses and the server's details.
+-- A client's row carries only its action's keys, small, so the history the owner reads
+-- holds nothing the client made up beyond them.
 CREATE POLICY client_activity_log_owner_select ON public.client_activity_log
   FOR SELECT TO authenticated USING ((SELECT public.is_owner()));
 CREATE POLICY client_activity_log_insert ON public.client_activity_log
@@ -1269,7 +1271,11 @@ CREATE POLICY client_activity_log_insert ON public.client_activity_log
     OR (
       contact_id = (SELECT public.get_client_contact_id())
       AND user_id = (SELECT auth.uid())
-      AND action IN ('document_delete', 'message_read')
+      AND pg_column_size(details) <= 1024
+      AND (
+        (action = 'document_delete' AND (details - ARRAY['document_id', 'filename', 'actor_role']) = '{}'::jsonb)
+        OR (action = 'message_read' AND (details - ARRAY['count', 'actor_role']) = '{}'::jsonb)
+      )
     )
   );
 

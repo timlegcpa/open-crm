@@ -233,7 +233,7 @@ export function createOutbound(deps: {
       log.error('dev_outbox insert failed', error);
       return { status: 'failed', channel: 'local', reason: 'outbox_error', httpStatus: null };
     }
-    log.info('message written to dev_outbox (no provider configured)', { channel: String(row.channel) });
+    log.warn('message written to dev_outbox, not sent: no provider configured and ENVIRONMENT is not production', { channel: String(row.channel) });
     return { status: 'sent', channel: 'local', id: null };
   }
 

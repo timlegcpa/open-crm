@@ -296,6 +296,8 @@ describe('revoke_impersonation_auth_session', () => {
       await becomeSuperuser(tx);
       const row = await insertRow(tx, { sessionId: null, startedAgo: '2 hours' });
       const minted = await addAuthSession(tx, clientId, '110 minutes', 'otp'); // 10 minutes after the start
+      // Auth versions record a magic link as 'otp' or as 'magiclink'; either is the link.
+      const mintedAsMagiclink = await addAuthSession(tx, clientId, '100 minutes', 'magiclink');
       const kept = [
         await addAuthSession(tx, clientId, '110 minutes', 'password'), // signed in another way
         await addAuthSession(tx, clientId, '130 minutes', 'otp'), // before the row started
@@ -305,11 +307,12 @@ describe('revoke_impersonation_auth_session', () => {
       await become(tx, asServer);
       const revoked = (await tx.query<{ v: boolean }>('SELECT public.revoke_impersonation_auth_session($1) AS v', [row])).rows[0].v;
       await becomeSuperuser(tx);
-      return { revoked, left: await sessionsLeft(tx), kept: kept.sort(), minted };
+      return { revoked, left: await sessionsLeft(tx), kept: kept.sort(), minted, mintedAsMagiclink };
     });
     expect(out.revoked).toBe(true);
     expect(out.left).toEqual(out.kept);
     expect(out.left).not.toContain(out.minted);
+    expect(out.left).not.toContain(out.mintedAsMagiclink);
   });
 
   it('says false when there was nothing to revoke', async () => {

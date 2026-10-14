@@ -20,3 +20,4 @@ export const AUTHENTICATED_CALLABLE = list((d) => d.authenticatedCallable);
 export const SERVER_RPCS = list((d) => d.serverRpcs);
 export const IMPERSONATION_EXEMPT = record((d) => d.impersonationExempt);
 export const DEFINER_WRITE_EXEMPT = record((d) => d.definerWriteExempt);
+export const PUBLIC_BUCKETS = record((d) => d.publicBuckets);

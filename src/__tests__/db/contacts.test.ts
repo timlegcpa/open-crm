@@ -329,11 +329,22 @@ describe('portal activity', () => {
       .toMatch(/row-level security/);
   });
 
-  it('activity details are bounded in size', async () => {
-    expect(await errorOf(db, clientA,
+  it('activity details are bounded in size, for every writer', async () => {
+    expect(await errorOf(db, service,
       `INSERT INTO public.client_activity_log (contact_id, user_id, action, details)
        VALUES ('${CONTACT_A}', '${USER_A}', 'message_read', jsonb_build_object('x', repeat('y', 20000)))`))
       .toMatch(/check constraint/);
+  });
+
+  it("a client's row carries only its action's keys, and little of them", async () => {
+    const insert = (action: string, details: string) =>
+      errorOf(db, clientA, `INSERT INTO public.client_activity_log (contact_id, user_id, action, details)
+        VALUES ('${CONTACT_A}', '${USER_A}', '${action}', '${details}')`);
+    expect(await insert('message_read', '{"count":2}')).toBeNull();
+    expect(await insert('document_delete', '{"document_id":"d1","filename":"a.pdf"}')).toBeNull();
+    expect(await insert('message_read', '{"count":2,"note":"the owner said yes"}')).toMatch(/row-level security/);
+    expect(await insert('document_delete', '{"count":2}')).toMatch(/row-level security/);
+    expect(await insert('document_delete', `{"filename":"${'y'.repeat(2000)}"}`)).toMatch(/row-level security/);
   });
 });
 

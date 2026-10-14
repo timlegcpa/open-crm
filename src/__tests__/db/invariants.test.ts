@@ -28,6 +28,7 @@ const DEFINER_WRITE_EXEMPT: Record<string, string> = Object.fromEntries(
   Object.entries(allowlists.DEFINER_WRITE_EXEMPT).map(([f, why]) => [`public.${f}`, why]),
 );
 const IMPERSONATION_EXEMPT = allowlists.IMPERSONATION_EXEMPT;
+const PUBLIC_BUCKETS = allowlists.PUBLIC_BUCKETS;
 
 /** SQL: whether the table `rel` carries the View-as-client statement trigger, whole. */
 const READ_ONLY_GUARDED = (rel: string) => `EXISTS (
@@ -291,31 +292,70 @@ const CHECKS: Record<string, Check> = {
   /**
    * 8b. Nor through a SECURITY DEFINER function, which runs past RLS: every table such a
    * function writes, when a signed-in session may call it, carries trg_impersonation_read_only,
-   * unless the function is allowlisted and refuses everyone but the owner first.
+   * unless the function is allowlisted and refuses everyone but the owner first. The body read
+   * includes every public function it calls (they run as its owner too). A write the check
+   * cannot read (dynamic SQL, a table outside public) is reported, and so is a write to a
+   * table whose client rules pass the owner, since inside a definer the caller looks like one.
    */
   async 'View as client cannot write through a definer'(tx) {
-    const found = await rows<{ fn: string; src: string }>(tx, `
-      SELECT p.oid::regprocedure::text AS fn, p.prosrc AS src FROM pg_proc p
-      WHERE p.pronamespace = 'public'::regnamespace AND p.prosecdef
-        AND p.prorettype <> 'trigger'::regtype
-        AND has_function_privilege('authenticated', p.oid, 'EXECUTE')
+    const all = await rows<{ fn: string; name: string; src: string; definer: boolean; callable: boolean }>(tx, `
+      SELECT p.oid::regprocedure::text AS fn, p.proname AS name, p.prosrc AS src, p.prosecdef AS definer,
+             has_function_privilege('authenticated', p.oid, 'EXECUTE') AS callable
+      FROM pg_proc p
+      WHERE p.pronamespace = 'public'::regnamespace AND p.prorettype <> 'trigger'::regtype
       ORDER BY 1`);
     const guarded = new Set((await rows<{ t: string }>(tx, `
       SELECT c.relname AS t FROM pg_class c
       WHERE c.relnamespace = 'public'::regnamespace AND ${READ_ONLY_GUARDED('c.oid')}`)).map((r) => r.t));
+    // Tables whose row triggers let the owner or the server past a client rule: inside a
+    // definer the current user is the function's owner, so those rules let everything through.
+    const ownerPassed = new Set((await rows<{ t: string }>(tx, `
+      SELECT DISTINCT c.relname AS t FROM pg_trigger tg
+      JOIN pg_class c ON c.oid = tg.tgrelid JOIN pg_proc f ON f.oid = tg.tgfoid
+      WHERE c.relnamespace = 'public'::regnamespace AND NOT tg.tgisinternal
+        AND f.prosrc ~ 'public\\.is_owner_or_server\\(\\)'`)).map((r) => r.t));
+    const byName = new Map<string, string[]>();
+    for (const r of all) byName.set(r.name, [...(byName.get(r.name) ?? []), r.src]);
+    // A definer's own body plus every public function it reaches: they all run as its owner.
+    const reach = (src: string) => {
+      const seen = new Set<string>();
+      const bodies = [src];
+      for (let i = 0; i < bodies.length; i++) {
+        for (const [, called] of bodies[i].matchAll(/\bpublic\.(\w+)\s*\(/gi)) {
+          const name = called.toLowerCase();
+          if (seen.has(name) || !byName.has(name)) continue;
+          seen.add(name);
+          bodies.push(...byName.get(name)!);
+        }
+      }
+      return bodies.join('\n');
+    };
+    const WRITE = /\b(?:INSERT\s+INTO|UPDATE(?:\s+ONLY)?|DELETE\s+FROM(?:\s+ONLY)?|MERGE\s+INTO)\s+("?\w+"?)\s*\.\s*("?\w+"?)/gi;
     const out: string[] = [];
     const writers = new Set<string>();
-    for (const r of found) {
-      const writes = [...r.src.matchAll(/\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+public\.(\w+)/gi)];
-      if (writes.length === 0) continue;
+    for (const r of all.filter((f) => f.definer && f.callable)) {
+      const body = reach(r.src);
+      const writes = [...body.matchAll(WRITE)];
+      // Dynamic SQL: what it writes cannot be read from the source.
+      const dynamic = /\bEXECUTE\s+(?!FUNCTION\b)/i.test(body);
+      if (writes.length === 0 && !dynamic) continue;
       writers.add(r.fn);
       if (r.fn in DEFINER_WRITE_EXEMPT) {
+        const firstWrite = r.src.search(WRITE);
         const refusal = r.src.search(/IF\s+NOT\s+public\.is_owner\(\)\s+THEN\s+RAISE/i);
-        if (refusal < 0 || refusal > (writes[0].index ?? 0)) out.push(`${r.fn}: allowlisted, but does not refuse non-owners before it writes`);
+        if (refusal < 0 || (firstWrite >= 0 && refusal > firstWrite)) out.push(`${r.fn}: allowlisted, but does not refuse non-owners before it writes`);
         continue;
       }
-      for (const t of new Set(writes.map((w) => w[1]))) {
+      if (dynamic) out.push(`${r.fn}: runs dynamic SQL, so what it writes cannot be checked`);
+      const targets = new Set(writes.map(([, schema, table]) => `${schema.replace(/"/g, '')}.${table.replace(/"/g, '')}`));
+      for (const target of targets) {
+        const [s, t] = target.split('.');
+        if (s.toLowerCase() !== 'public') {
+          out.push(`${r.fn}: writes ${s}.${t}, outside public, past every policy there`);
+          continue;
+        }
         if (!guarded.has(t)) out.push(`${r.fn}: writes ${t}, which has no trg_impersonation_read_only statement trigger`);
+        if (ownerPassed.has(t)) out.push(`${r.fn}: writes ${t}, whose client rules a definer passes as the owner`);
       }
     }
     for (const fn of Object.keys(DEFINER_WRITE_EXEMPT)) {
@@ -403,6 +443,24 @@ const CHECKS: Record<string, Check> = {
       .map((r) => (r.kind === 'v'
         ? `${r.v}: view without security_invoker = true runs as its owner, past RLS`
         : `${r.v}: materialized view readable by a user session (RLS cannot apply to it)`));
+  },
+
+  /**
+   * 13. Files are private: every bucket is private (a public bucket serves its objects to
+   * anyone with the URL, past every policy) unless allowlisted, and no storage.objects
+   * policy is for anon or PUBLIC.
+   */
+  async 'buckets are private'(tx) {
+    const buckets = await rows<{ id: string }>(tx, `SELECT id FROM storage.buckets WHERE public ORDER BY 1`);
+    const policies = await rows<{ name: string }>(tx, `
+      SELECT p.polname AS name FROM pg_policy p
+      WHERE p.polrelid = 'storage.objects'::regclass AND p.polroles && ARRAY['anon'::regrole::oid, 0::oid]
+      ORDER BY 1`);
+    return [
+      ...buckets.filter((b) => !(b.id in PUBLIC_BUCKETS)).map((b) => `storage.buckets.${b.id}: public, so its files bypass every policy`),
+      ...Object.keys(PUBLIC_BUCKETS).filter((id) => !buckets.some((b) => b.id === id)).map((id) => `${id}: public-bucket allowlist entry matches no public bucket; remove it`),
+      ...policies.map((p) => `storage.objects.${p.name}: a policy for anon or PUBLIC`),
+    ];
   },
 };
 
@@ -559,6 +617,29 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
     `CREATE OR REPLACE FUNCTION public.retry_job(p_job_id uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
        AS $$ BEGIN UPDATE public.jobs SET attempts = 0 WHERE id = p_job_id; END; $$;`,
     /^public\.retry_job\(uuid\): allowlisted, but does not refuse non-owners before it writes$/],
+  ['View as client cannot write through a definer', 'the write hidden in a helper the RPC calls',
+    `CREATE TABLE public.mut_notes (id int); ALTER TABLE public.mut_notes ENABLE ROW LEVEL SECURITY;
+     CREATE FUNCTION public.mut_helper() RETURNS void LANGUAGE sql SET search_path = '' AS 'UPDATE ONLY public.mut_notes SET id = 2';
+     REVOKE ALL ON FUNCTION public.mut_helper() FROM PUBLIC, anon, authenticated;
+     CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+       AS $$ BEGIN PERFORM public.mut_helper(); END; $$;
+     REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
+    /^public\.mut_rpc\(\): writes mut_notes, which has no trg_impersonation_read_only/],
+  ['View as client cannot write through a definer', 'dynamic SQL',
+    `CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+       AS $$ BEGIN EXECUTE format('DELETE FROM %I.%I', 'public', 'contacts'); END; $$;
+     REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
+    /^public\.mut_rpc\(\): runs dynamic SQL/],
+  ['View as client cannot write through a definer', 'a write outside public',
+    `CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = ''
+       AS 'DELETE FROM storage.objects WHERE false';
+     REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
+    /^public\.mut_rpc\(\): writes storage\.objects, outside public/],
+  ['View as client cannot write through a definer', 'a write past the client column rules',
+    `CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = ''
+       AS 'UPDATE public.client_tasks SET status = status WHERE false';
+     REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
+    /^public\.mut_rpc\(\): writes client_tasks, whose client rules a definer passes as the owner$/],
   ['View as client cannot write through a definer', 'an allowlist entry whose definer is gone',
     'DROP FUNCTION public.retry_job(uuid);', /^public\.retry_job\(uuid\): allowlist entry matches no definer/],
 
@@ -592,6 +673,12 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
   ['View as client cannot write files', 'the delete refusal moved to another role',
     'ALTER POLICY objects_view_as_client_delete ON storage.objects TO anon;', /^storage\.objects: no restrictive DELETE policy/],
 
+  ['buckets are private', 'a public bucket',
+    `INSERT INTO storage.buckets (id, name, public) VALUES ('mut_open', 'mut_open', true);`, /^storage\.buckets\.mut_open: public/],
+  ['buckets are private', 'a storage policy for anon',
+    `CREATE POLICY mut_files ON storage.objects FOR SELECT TO anon USING (bucket_id = 'b');`, /^storage\.objects\.mut_files: a policy for anon or PUBLIC$/],
+  ['buckets are private', 'a storage policy for PUBLIC',
+    `CREATE POLICY mut_files ON storage.objects FOR SELECT USING (bucket_id = 'b');`, /^storage\.objects\.mut_files: a policy for anon or PUBLIC$/],
   ['views keep row-level security', 'a view without security_invoker',
     'CREATE VIEW public.mut_view AS SELECT id FROM public.contacts;', /^mut_view: view without security_invoker/],
   ['views keep row-level security', 'a materialized view a user session can read',

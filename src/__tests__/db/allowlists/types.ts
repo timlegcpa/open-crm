@@ -25,4 +25,6 @@ export interface DomainAllowlist {
    * refusal (IF NOT public.is_owner() THEN RAISE) before any write.
    */
   definerWriteExempt?: Record<string, string>;
+  /** Public storage buckets, by bucket id, each with its reason (anyone with a URL reads them). */
+  publicBuckets?: Record<string, string>;
 }
