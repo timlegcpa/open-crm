@@ -225,7 +225,9 @@ export function createOutbound(deps: {
   async function writeOutbox(row: Record<string, unknown>): Promise<SendResult> {
     const { error } = await db.from('dev_outbox').insert(row);
     // A repeated idempotency key: the first write stands, as a provider would de-duplicate.
-    if ((error as { code?: unknown } | null)?.code === '23505' && row.idempotency_key) {
+    // Only that index's conflict; any other unique violation is a failed write.
+    const e = error as { code?: unknown; message?: unknown } | null;
+    if (row.idempotency_key && e?.code === '23505' && String(e.message).includes('uq_dev_outbox_idempotency_key')) {
       log.info('dev_outbox: repeated idempotency key; already written');
       return { status: 'sent', channel: 'local', id: null };
     }
@@ -235,6 +237,16 @@ export function createOutbound(deps: {
     }
     log.warn('message written to dev_outbox, not sent: no provider configured and ENVIRONMENT is not production', { channel: String(row.channel) });
     return { status: 'sent', channel: 'local', id: null };
+  }
+
+  /** EMAIL_FROM's display name, as the provider would use it; none when unset or unreadable. */
+  function localDefaultName(): string | null {
+    if (!env.emailFrom) return null;
+    try {
+      return parseFrom(env.emailFrom).name;
+    } catch {
+      return null;
+    }
   }
 
   const invalid = (channel: Channel, reason: FailureReason, what: string): SendResult => {
@@ -272,7 +284,7 @@ export function createOutbound(deps: {
         return writeOutbox({
           channel: 'email',
           recipient: m.to,
-          sender: m.fromName ? displayName(m.fromName) || null : null,
+          sender: (m.fromName ? displayName(m.fromName) : localDefaultName()) || null,
           subject,
           body_text: m.text + note,
           body_html: m.html,

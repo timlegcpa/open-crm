@@ -45,26 +45,36 @@ export interface ServiceType {
   default_cadence: 'monthly' | 'annual' | 'one_time';
 }
 
-/** Every pick-list table and its row type. Add a table here and in COLUMNS, and it gets a hook by one line. */
-export interface PickListRows {
-  contact_statuses: ContactStatus;
-  lead_sources: LeadSource;
-  organization_types: OrganizationType;
-  service_types: ServiceType;
+/**
+ * One pick-list: its table, the columns to read and the row type they make. A domain declares
+ * its own lists beside its own code (`definePickList<StageRow>('board_stages', '...')`) and
+ * passes them to usePickList; nothing here changes when a list is added.
+ */
+export interface PickListSpec<Row extends { key: string }> {
+  readonly table: string;
+  readonly columns: string;
+  /** Type only: carries Row; never set. */
+  readonly row?: Row;
 }
 
-export type PickListTable = keyof PickListRows;
+export function definePickList<Row extends { key: string }>(table: string, columns: string): PickListSpec<Row> {
+  return { table, columns };
+}
 
-const COLUMNS: { [T in PickListTable]: string } = {
-  contact_statuses: 'key, label, colour, sort_order',
-  lead_sources: 'key, label, colour, sort_order, is_active',
-  organization_types: 'key, label, colour, sort_order, is_active, is_system',
-  service_types: 'key, label, colour, sort_order, is_active, is_system, revenue_family, default_cadence',
-};
+export const CONTACT_STATUSES = definePickList<ContactStatus>('contact_statuses', 'key, label, colour, sort_order');
+export const LEAD_SOURCES = definePickList<LeadSource>('lead_sources', 'key, label, colour, sort_order, is_active');
+export const ORGANIZATION_TYPES = definePickList<OrganizationType>(
+  'organization_types',
+  'key, label, colour, sort_order, is_active, is_system',
+);
+export const SERVICE_TYPES = definePickList<ServiceType>(
+  'service_types',
+  'key, label, colour, sort_order, is_active, is_system, revenue_family, default_cadence',
+);
 
 /** A whole pick-list in display order (key breaks a tie). The lists are small, so one read. */
-export async function listPickList<T extends PickListTable>(table: T): Promise<PickListRows[T][]> {
-  const { data, error } = await getSupabase().from(table).select(COLUMNS[table]).order('sort_order').order('key');
+export async function listPickList<Row extends { key: string }>(list: PickListSpec<Row>): Promise<Row[]> {
+  const { data, error } = await getSupabase().from(list.table).select(list.columns).order('sort_order').order('key');
   if (error) throw error;
-  return (data ?? []) as unknown as PickListRows[T][];
+  return (data ?? []) as unknown as Row[];
 }

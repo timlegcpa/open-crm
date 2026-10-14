@@ -277,7 +277,7 @@ const CHECKS: Record<string, Check> = {
       if (!exprs.some((e) => CLIENT_REFERENCE.test(e) || !ownerGated(e))) continue;
       const key = `${r.t}.${r.name}`;
       flagged.add(key);
-      if (key in IMPERSONATION_EXEMPT) {
+      if (Object.hasOwn(IMPERSONATION_EXEMPT, key)) {
         if (!exprs.every(ownerGated)) out.push(`${key}: allowlisted, but no longer requires is_owner()`);
       } else if (!r.guarded) {
         out.push(`${r.t}: client-writable through ${r.name}, without the trg_impersonation_read_only statement trigger`);
@@ -321,8 +321,9 @@ const CHECKS: Record<string, Check> = {
       const seen = new Set<string>();
       const bodies = [src];
       for (let i = 0; i < bodies.length; i++) {
-        for (const [, called] of bodies[i].matchAll(/\bpublic\.(\w+)\s*\(/gi)) {
-          const name = called.toLowerCase();
+        // public.f(, "public"."f"(, public . f ( ...: a quoted name keeps its case, a bare one folds.
+        for (const [, quoted, bare] of bodies[i].matchAll(/"?\bpublic"?\s*\.\s*(?:"([^"]+)"|(\w+))\s*\(/gi)) {
+          const name = quoted ?? bare.toLowerCase();
           if (seen.has(name) || !byName.has(name)) continue;
           seen.add(name);
           bodies.push(...byName.get(name)!);
@@ -340,10 +341,11 @@ const CHECKS: Record<string, Check> = {
       const dynamic = /\bEXECUTE\s+(?!FUNCTION\b)/i.test(body);
       if (writes.length === 0 && !dynamic) continue;
       writers.add(r.fn);
-      if (r.fn in DEFINER_WRITE_EXEMPT) {
-        const firstWrite = r.src.search(WRITE);
-        const refusal = r.src.search(/IF\s+NOT\s+public\.is_owner\(\)\s+THEN\s+RAISE/i);
-        if (refusal < 0 || (firstWrite >= 0 && refusal > firstWrite)) out.push(`${r.fn}: allowlisted, but does not refuse non-owners before it writes`);
+      if (Object.hasOwn(DEFINER_WRITE_EXEMPT, r.fn)) {
+        // The refusal is the body's first statement, and no declaration calls into public
+        // before it (an initializer runs first): nothing can write, or return, ahead of it.
+        const head = /^\s*(?:DECLARE([\s\S]*?))?BEGIN\s+IF\s+NOT\s+public\.is_owner\(\)\s+THEN\s+RAISE\b/i.exec(r.src);
+        if (!head || /public\s*\./i.test(head[1] ?? '')) out.push(`${r.fn}: allowlisted, but does not refuse non-owners before it writes`);
         continue;
       }
       if (dynamic) out.push(`${r.fn}: runs dynamic SQL, so what it writes cannot be checked`);
@@ -457,7 +459,7 @@ const CHECKS: Record<string, Check> = {
       WHERE p.polrelid = 'storage.objects'::regclass AND p.polroles && ARRAY['anon'::regrole::oid, 0::oid]
       ORDER BY 1`);
     return [
-      ...buckets.filter((b) => !(b.id in PUBLIC_BUCKETS)).map((b) => `storage.buckets.${b.id}: public, so its files bypass every policy`),
+      ...buckets.filter((b) => !Object.hasOwn(PUBLIC_BUCKETS, b.id)).map((b) => `storage.buckets.${b.id}: public, so its files bypass every policy`),
       ...Object.keys(PUBLIC_BUCKETS).filter((id) => !buckets.some((b) => b.id === id)).map((id) => `${id}: public-bucket allowlist entry matches no public bucket; remove it`),
       ...policies.map((p) => `storage.objects.${p.name}: a policy for anon or PUBLIC`),
     ];
@@ -625,6 +627,20 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
        AS $$ BEGIN PERFORM public.mut_helper(); END; $$;
      REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
     /^public\.mut_rpc\(\): writes mut_notes, which has no trg_impersonation_read_only/],
+  ['View as client cannot write through a definer', 'the helper called by a quoted name',
+    `CREATE TABLE public.mut_notes (id int); ALTER TABLE public.mut_notes ENABLE ROW LEVEL SECURITY;
+     CREATE FUNCTION public.mut_helper() RETURNS void LANGUAGE sql SET search_path = '' AS 'UPDATE public.mut_notes SET id = 2';
+     REVOKE ALL ON FUNCTION public.mut_helper() FROM PUBLIC, anon, authenticated;
+     CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+       AS $$ BEGIN PERFORM "public" . "mut_helper" (); END; $$;
+     REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
+    /^public\.mut_rpc\(\): writes mut_notes, which has no trg_impersonation_read_only/],
+  ['View as client cannot write through a definer', 'the allowlisted definer writes through a helper before its refusal',
+    `CREATE FUNCTION public.mut_helper() RETURNS void LANGUAGE sql SET search_path = '' AS 'UPDATE public.contacts SET phone = phone WHERE false';
+     REVOKE ALL ON FUNCTION public.mut_helper() FROM PUBLIC, anon, authenticated;
+     CREATE OR REPLACE FUNCTION public.retry_job(p_job_id uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+       AS $$ BEGIN PERFORM public.mut_helper(); RETURN; IF NOT public.is_owner() THEN RAISE EXCEPTION 'denied'; END IF; END; $$;`,
+    /^public\.retry_job\(uuid\): allowlisted, but does not refuse non-owners before it writes$/],
   ['View as client cannot write through a definer', 'dynamic SQL',
     `CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
        AS $$ BEGIN EXECUTE format('DELETE FROM %I.%I', 'public', 'contacts'); END; $$;
@@ -675,6 +691,8 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
 
   ['buckets are private', 'a public bucket',
     `INSERT INTO storage.buckets (id, name, public) VALUES ('mut_open', 'mut_open', true);`, /^storage\.buckets\.mut_open: public/],
+  ['buckets are private', 'a public bucket named like an inherited property',
+    `INSERT INTO storage.buckets (id, name, public) VALUES ('constructor', 'constructor', true);`, /^storage\.buckets\.constructor: public/],
   ['buckets are private', 'a storage policy for anon',
     `CREATE POLICY mut_files ON storage.objects FOR SELECT TO anon USING (bucket_id = 'b');`, /^storage\.objects\.mut_files: a policy for anon or PUBLIC$/],
   ['buckets are private', 'a storage policy for PUBLIC',

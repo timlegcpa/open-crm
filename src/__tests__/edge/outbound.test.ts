@@ -129,6 +129,22 @@ describe('local adapter: dev_outbox in 0001', () => {
     ]);
   });
 
+  it('takes the sender from EMAIL_FROM when the message names none, as the provider would', async () => {
+    const out = createOutbound({ env: { ...NO_PROVIDERS, emailFrom: 'Example Org <crm@example.test>' }, db: serviceClient(db), log: collectLog().log });
+    await out.sendEmail({ ...EMAIL, to: 'cy@example.test' });
+    expect((await db.query<{ sender: string | null }>(`SELECT sender FROM public.dev_outbox WHERE recipient = 'cy@example.test'`)).rows)
+      .toEqual([{ sender: 'Example Org' }]);
+  });
+
+  it('a unique conflict on anything but the idempotency key is a failed write, not a duplicate', async () => {
+    const conflict: OutboxClient = {
+      from: () => ({ insert: async () => ({ error: { code: '23505', message: 'duplicate key value violates unique constraint "dev_outbox_pkey"' } }) }),
+    };
+    const out = createOutbound({ env: NO_PROVIDERS, db: conflict, log: collectLog().log });
+    expect(await out.sendEmail({ ...EMAIL, idempotencyKey: 'fresh:1' }))
+      .toEqual({ status: 'failed', channel: 'local', reason: 'outbox_error', httpStatus: null });
+  });
+
   it('reports a failed outbox write as failed, not sent', async () => {
     const out = createOutbound({ env: NO_PROVIDERS, db: noOutbox, log: collectLog().log });
     expect(await out.sendEmail(EMAIL)).toEqual({ status: 'failed', channel: 'local', reason: 'outbox_error', httpStatus: null });
