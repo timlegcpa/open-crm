@@ -971,13 +971,22 @@ CREATE TABLE public.dev_outbox (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   channel text NOT NULL CHECK (channel IN ('email', 'sms')),
   recipient text NOT NULL,
+  -- The From display name the provider would have shown.
+  sender text,
   subject text,
   body_text text,
   body_html text,
+  -- What the provider would have carried besides the body: List-Unsubscribe headers, tags.
+  headers jsonb,
+  -- A retry of a message already written is not written twice: the de-duplication the
+  -- provider gives a repeated idempotency key.
+  idempotency_key text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_dev_outbox_created ON public.dev_outbox (created_at DESC);
+CREATE UNIQUE INDEX uq_dev_outbox_idempotency_key ON public.dev_outbox (idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
 
 ALTER TABLE public.dev_outbox ENABLE ROW LEVEL SECURITY;
 CREATE POLICY dev_outbox_owner_select ON public.dev_outbox

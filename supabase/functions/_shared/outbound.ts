@@ -224,6 +224,11 @@ export function createOutbound(deps: {
 
   async function writeOutbox(row: Record<string, unknown>): Promise<SendResult> {
     const { error } = await db.from('dev_outbox').insert(row);
+    // A repeated idempotency key: the first write stands, as a provider would de-duplicate.
+    if ((error as { code?: unknown } | null)?.code === '23505' && row.idempotency_key) {
+      log.info('dev_outbox: repeated idempotency key; already written');
+      return { status: 'sent', channel: 'local', id: null };
+    }
     if (error) {
       log.error('dev_outbox insert failed', error);
       return { status: 'failed', channel: 'local', reason: 'outbox_error', httpStatus: null };
@@ -254,9 +259,26 @@ export function createOutbound(deps: {
         return invalid(channel, 'invalid_message', 'listUnsubscribe');
       }
 
+      const listHeaders = unsubscribe
+        ? {
+            'List-Unsubscribe': `<${unsubscribe}>`,
+            ...(m.listUnsubscribe?.oneClick ? { 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : {}),
+          }
+        : null;
+
       if (channel === 'local') {
         const note = files.length ? `\n\n[attachments: ${files.map((a) => `${a.filename} (${a.content.byteLength} bytes)`).join(', ')}]` : '';
-        return writeOutbox({ channel: 'email', recipient: m.to, subject, body_text: m.text + note, body_html: m.html });
+        const carried = { ...listHeaders, ...(replyTo ? { 'Reply-To': replyTo } : {}), ...(tags.length ? { tags: Object.fromEntries(tags) } : {}) };
+        return writeOutbox({
+          channel: 'email',
+          recipient: m.to,
+          sender: m.fromName ? displayName(m.fromName) || null : null,
+          subject,
+          body_text: m.text + note,
+          body_html: m.html,
+          headers: Object.keys(carried).length ? carried : null,
+          idempotency_key: m.idempotencyKey ? await providerKey(m.idempotencyKey) : null,
+        });
       }
 
       const from = parseFrom(env.emailFrom!);
@@ -271,12 +293,7 @@ export function createOutbound(deps: {
       if (replyTo) payload.reply_to = replyTo;
       if (tags.length) payload.tags = tags.map(([tagName, value]) => ({ name: tagName, value }));
       if (files.length) payload.attachments = files.map((a) => ({ filename: a.filename, content: toBase64(a.content) }));
-      if (unsubscribe) {
-        payload.headers = {
-          'List-Unsubscribe': `<${unsubscribe}>`,
-          ...(m.listUnsubscribe?.oneClick ? { 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } : {}),
-        };
-      }
+      if (listHeaders) payload.headers = listHeaders;
       const headers: Record<string, string> = {
         Authorization: `Bearer ${env.resendApiKey}`,
         'Content-Type': 'application/json',

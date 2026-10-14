@@ -10,38 +10,24 @@
  * by the rules (CONFORMING) must pass every check, so no check passes by flagging
  * nothing or fails by flagging everything.
  *
- * Exceptions live in the allowlists next to the checks, each with its reason.
+ * Exceptions live in ./allowlists, one file per domain, each with its reason.
  */
 import type { PGlite } from '@electric-sql/pglite';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
+import * as allowlists from './allowlists';
 import { createDb } from './harness';
 
 type Tx = Parameters<Parameters<PGlite['transaction']>[0]>[0];
 type Check = (tx: Tx) => Promise<string[]>;
 
-/** Functions anon may execute: display fields for pages shown before sign-in. */
-const ANON_EXECUTE_ALLOWED = ['public.get_org_branding()'];
-
-/**
- * Write policies that look client-writable to check 8 but are not, by `table.policy`.
- * An entry excuses only a reference to get_client_contact_id() or auth.uid(): the
- * policy must still require is_owner() at its top level, or it is reported anyway.
- */
-/**
- * SECURITY DEFINER functions a signed-in session may call that write a table without
- * trg_impersonation_read_only, each with its reason. An entry must open with the owner
- * refusal (IF NOT public.is_owner() THEN RAISE) before any write.
- */
-const DEFINER_WRITE_EXEMPT: Record<string, string> = {
-  'public.retry_job(uuid)': 'owner only: a View-as-client session is a client session, which never passes is_owner()',
-};
-
-const IMPERSONATION_EXEMPT: Record<string, string> = {
-  'audit_logs.audit_logs_owner_insert':
-    'is_owner() gates the insert; auth.uid() only pins user_id to the writer, and a View-as-client session is a client session, which never passes is_owner()',
-};
+// The exceptions, each domain's in its own file under ./allowlists with its reason.
+const ANON_EXECUTE_ALLOWED = allowlists.ANON_CALLABLE.map((f) => `public.${f}`);
+const DEFINER_WRITE_EXEMPT: Record<string, string> = Object.fromEntries(
+  Object.entries(allowlists.DEFINER_WRITE_EXEMPT).map(([f, why]) => [`public.${f}`, why]),
+);
+const IMPERSONATION_EXEMPT = allowlists.IMPERSONATION_EXEMPT;
 
 /** SQL: whether the table `rel` carries the View-as-client statement trigger, whole. */
 const READ_ONLY_GUARDED = (rel: string) => `EXISTS (

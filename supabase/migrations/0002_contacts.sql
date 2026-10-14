@@ -101,15 +101,16 @@ INSERT INTO public.service_types (key, label, sort_order, is_system, revenue_fam
   ('other', 'Other', 100, true, 'one_time', 'one_time');
 
 -- The rules above hold for every role, the server included: keys never change, system
--- rows stay exactly what the code expects (only label, colour and order move), and
--- the pipeline is the fixed set seeded here.
+-- rows stay exactly what the code expects (only label, colour and order move), and a
+-- fixed list (the trigger's argument is 'fixed': the pipeline seeded here, a later
+-- domain's stages) is exactly the set its migration seeds.
 CREATE FUNCTION public.guard_pick_list()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
-  fixed boolean := TG_TABLE_NAME = 'contact_statuses';
+  fixed boolean := TG_NARGS > 0 AND TG_ARGV[0] = 'fixed';
   o jsonb;
   n jsonb;
 BEGIN
@@ -145,7 +146,7 @@ END;
 $$;
 
 CREATE TRIGGER trg_contact_statuses_guard BEFORE INSERT OR UPDATE OR DELETE ON public.contact_statuses
-  FOR EACH ROW EXECUTE FUNCTION public.guard_pick_list();
+  FOR EACH ROW EXECUTE FUNCTION public.guard_pick_list('fixed');
 CREATE TRIGGER trg_lead_sources_guard BEFORE INSERT OR UPDATE OR DELETE ON public.lead_sources
   FOR EACH ROW EXECUTE FUNCTION public.guard_pick_list();
 CREATE TRIGGER trg_organization_types_guard BEFORE INSERT OR UPDATE OR DELETE ON public.organization_types

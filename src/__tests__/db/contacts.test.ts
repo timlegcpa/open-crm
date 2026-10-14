@@ -2,6 +2,9 @@
 import type { PGlite } from '@electric-sql/pglite';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { CONTACT_PATCH_COLUMNS } from '@/api/contacts';
+// Every function a signed-in session (or anon) may call directly, across all migrations,
+// one file per domain. Any other function in public is the server's alone (or a trigger's).
+import { ANON_CALLABLE, AUTHENTICATED_CALLABLE, SERVER_RPCS } from './allowlists';
 import { anon, as, count as countRows, createDb, errorOf, service, session, tryIn, user } from './harness';
 
 const OWNER = '00000000-0000-4000-8000-000000000001';
@@ -40,22 +43,6 @@ const CLIENT_A_VISIBLE: Record<string, 'own' | 'all'> = {
   client_tasks: 'own',
 };
 
-// Every function a signed-in session may call directly, across all migrations. Any
-// other function in public is the server's alone (or a trigger's, which needs no grant).
-const AUTHENTICATED_CALLABLE = [
-  'is_owner()', 'mfa_session_ok()', 'user_has_verified_mfa()', 'audit_actor()', 'is_owner_or_server()',
-  'org_profile_guard_principals()', 'set_updated_at()', 'retry_job(uuid)', 'get_job_status_counts()',
-  'get_org_branding()',
-  'get_client_contact_id()', 'is_view_as_client()', 'get_my_contact()', 'get_my_activity(integer)',
-  'contact_emails_set_default(uuid,uuid,text)',
-];
-const ANON_CALLABLE = ['get_org_branding()'];
-const SERVER_RPCS = [
-  'get_client_contact_id()', 'increment_invitation_attempt(uuid,integer)', 'contact_delete_claim_live(uuid)',
-  'admin_contact_delete_begin(uuid)', 'admin_contact_delete_release(uuid,jsonb,uuid,uuid[])',
-  'admin_delete_contact(uuid,uuid)', 'is_impersonation_session(uuid,uuid)',
-  'revoke_impersonation_auth_session(uuid)', 'auto_end_stale_impersonation_sessions()',
-];
 
 let db: PGlite;
 
@@ -208,6 +195,8 @@ describe('function privileges', () => {
       expect(await can('anon', f), `anon ${f}`).toBe(ANON_CALLABLE.includes(f));
       expect(await can('authenticated', f), `authenticated ${f}`).toBe(AUTHENTICATED_CALLABLE.includes(f));
     }
+    // No stale entry: every listed function exists.
+    for (const f of [...ANON_CALLABLE, ...AUTHENTICATED_CALLABLE, ...SERVER_RPCS]) expect(fns, f).toContain(f);
   });
 
   it('the server can call its RPCs', async () => {
@@ -493,6 +482,21 @@ describe('pick-lists', () => {
     expect(await errorOf(db, owner, `UPDATE public.lead_sources SET is_active = false WHERE key = 'esign'`)).toMatch(/only the label, colour and order/);
     expect(await errorOf(db, owner, `UPDATE public.service_types SET revenue_family = 'recurring' WHERE key = 'other'`)).toMatch(/only the label, colour and order/);
     expect(await errorOf(db, owner, `UPDATE public.lead_sources SET is_active = false, label = 'Old' WHERE key = 'referral'`)).toBeNull();
+  });
+
+  it('a list is fixed by its trigger argument, not by its name', async () => {
+    await db.exec(`
+      CREATE TABLE public.zz_stages (key text PRIMARY KEY, label text, colour text, sort_order int, is_active boolean, is_system boolean DEFAULT false);
+      CREATE TABLE public.zz_tags (LIKE public.zz_stages INCLUDING DEFAULTS);
+      GRANT INSERT ON public.zz_stages, public.zz_tags TO service_role;
+      CREATE TRIGGER g BEFORE INSERT OR UPDATE OR DELETE ON public.zz_stages FOR EACH ROW EXECUTE FUNCTION public.guard_pick_list('fixed');
+      CREATE TRIGGER g BEFORE INSERT OR UPDATE OR DELETE ON public.zz_tags FOR EACH ROW EXECUTE FUNCTION public.guard_pick_list();`);
+    try {
+      expect(await errorOf(db, service, `INSERT INTO public.zz_stages (key, label) VALUES ('x', 'X')`)).toMatch(/created only by migrations/);
+      expect(await errorOf(db, service, `INSERT INTO public.zz_tags (key, label) VALUES ('x', 'X')`)).toBeNull();
+    } finally {
+      await db.exec('DROP TABLE public.zz_stages, public.zz_tags');
+    }
   });
 
   it('a client cannot change organization types', async () => {

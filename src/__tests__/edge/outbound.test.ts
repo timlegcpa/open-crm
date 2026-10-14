@@ -97,6 +97,38 @@ describe('local adapter: dev_outbox in 0001', () => {
     ]);
   });
 
+  it('keeps the sender, headers and idempotency key, and writes a repeated key once', async () => {
+    const out = createOutbound({ env: NO_PROVIDERS, db: serviceClient(db), log: collectLog().log });
+    const message = {
+      ...EMAIL,
+      to: 'bo@example.test',
+      fromName: 'Example "Team"\r\nBcc: x@example.test',
+      replyTo: 'owner@example.test',
+      idempotencyKey: 'group:1:bo',
+      tags: { kind: 'group' },
+      listUnsubscribe: { url: 'https://crm.example.test/unsubscribe?t=abc', oneClick: true },
+    };
+    expect(await out.sendEmail(message)).toEqual({ status: 'sent', channel: 'local', id: null });
+    expect(await out.sendEmail(message)).toEqual({ status: 'sent', channel: 'local', id: null });
+    const rows = (
+      await db.query<Record<string, unknown>>(
+        `SELECT sender, headers, idempotency_key FROM public.dev_outbox WHERE recipient = 'bo@example.test'`,
+      )
+    ).rows;
+    expect(rows).toEqual([
+      {
+        sender: 'Example Team Bcc: x@example.test',
+        headers: {
+          'List-Unsubscribe': '<https://crm.example.test/unsubscribe?t=abc>',
+          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+          'Reply-To': 'owner@example.test',
+          tags: { kind: 'group' },
+        },
+        idempotency_key: 'group:1:bo',
+      },
+    ]);
+  });
+
   it('reports a failed outbox write as failed, not sent', async () => {
     const out = createOutbound({ env: NO_PROVIDERS, db: noOutbox, log: collectLog().log });
     expect(await out.sendEmail(EMAIL)).toEqual({ status: 'failed', channel: 'local', reason: 'outbox_error', httpStatus: null });

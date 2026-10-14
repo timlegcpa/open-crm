@@ -34,7 +34,8 @@
 --     storage.objects already carries the MFA gate (0001) and refuses every write from
 --     View as client (0002), for all buckets: never add another gate or change those.
 --   * A pick-list is a table guarded by public.guard_pick_list(), with the columns key,
---     label, colour, sort_order, is_active and is_system.
+--     label, colour, sort_order, is_active and is_system. A list the code depends on in
+--     full (stages) passes it the argument 'fixed': guard_pick_list('fixed').
 --   * A view is created WITH (security_invoker = true).
 --   * No cron schedules in a migration: scheduled work is a row in public.jobs run by the
 --     job-runner, or a schedule the adopter sets up outside the migrations.
