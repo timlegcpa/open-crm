@@ -6,7 +6,9 @@
 // files (.doc, .xls, OLE2) are allowed because real clients still send them, and OLE2
 // can carry VBA macros; the mitigation is the reader's Office Protected View on
 // download. Macro-enabled OOXML (.docm, .xlsm) has its own MIME types, which are not
-// on the list, so it is refused. A Storage bucket that holds uploads lists the same
+// on the list, so a file declared as one is refused; the bytes alone cannot tell it from
+// .docx or .xlsx (all are ZIP), so a download names the file by its stored MIME type,
+// never by the uploader's file name. A Storage bucket that holds uploads lists the same
 // MIME types in allowed_mime_types; change all three places together (this file, the
 // browser's list, the bucket).
 //

@@ -109,7 +109,8 @@ export interface HandlerOptions<A extends AuthModes, K extends BodyKind> {
   /** Default ['POST']. A function that takes GET must use body 'none'. */
   methods?: readonly HttpMethod[];
   auth: A;
-  /** Refuse the owner's View-as-client session (a client write function). */
+  /** Refuse the owner's View-as-client session (a client write function). Required with
+   *  auth.client, so a client function cannot forget to decide. */
   clientWrites?: boolean;
   /** Runs after auth, before the body. Required with auth.public. */
   rateLimit?: (ctx: RequestContext<PrincipalFor<A>>) => Promise<RateLimitOutcome>;
@@ -182,6 +183,9 @@ export function createHandler<A extends AuthModes, K extends BodyKind = 'json'>(
   if (auth.public && modes.length > 1) throw new Error(`${options.name}: public cannot be combined with another mode`);
   if (auth.public && !options.rateLimit) throw new Error(`${options.name}: a public function must declare rateLimit`);
   if (options.clientWrites && !auth.client) throw new Error(`${options.name}: clientWrites needs the client mode`);
+  if (auth.client && options.clientWrites === undefined) {
+    throw new Error(`${options.name}: a client function must declare clientWrites`);
+  }
   if (auth.internal && !/^x-[a-z0-9-]+$/.test(auth.internal.header)) {
     throw new Error(`${options.name}: an internal secret header must be a lowercase x- header`);
   }

@@ -133,7 +133,7 @@ describe('createHandler: combined modes', () => {
   });
 
   it('owner + client: the owner token is the owner, the client token the client, a dead one 401', async () => {
-    const either = sample({ auth: { owner: fakeOwnerAuth(), client: fakeClientAuth() } });
+    const either = sample({ auth: { owner: fakeOwnerAuth(), client: fakeClientAuth() }, clientWrites: false });
     const body = { a: 1 };
     expect(await bodyOf(await either(edgeRequest({ headers: CREDENTIALS.owner, body })))).toMatchObject({ kind: 'owner' });
     expect(await bodyOf(await either(edgeRequest({ headers: CREDENTIALS.client, body })))).toMatchObject({ kind: 'client' });
@@ -143,6 +143,7 @@ describe('createHandler: combined modes', () => {
   it('a View-as-client session can read where clientWrites is off, and sees impersonating', async () => {
     const reader = sample({
       auth: { client: fakeClientAuth() },
+      clientWrites: false,
       handle: async (ctx) => ctx.json(200, ctx.principal.kind === 'client' ? ctx.principal : null),
     });
     const res = await reader(edgeRequest({ headers: CREDENTIALS.viewAsClient, body: {} }));
@@ -370,6 +371,7 @@ describe('createHandler: refuses to start misconfigured', () => {
     ['no auth mode', { ...base, auth: {} }, /at least one auth mode/],
     ['public plus owner', { ...base, auth: { public: true, owner: fakeOwnerAuth() }, rateLimit: async () => 'allowed' }, /cannot be combined/],
     ['public without a rate limit', { ...base, auth: { public: true } }, /must declare rateLimit/],
+    ['the client mode without a clientWrites decision', { ...base, auth: { client: fakeClientAuth() } }, /must declare clientWrites/],
     ['clientWrites without the client mode', { ...base, auth: { owner: fakeOwnerAuth() }, clientWrites: true }, /clientWrites/],
     ['GET with a JSON body', { ...base, auth: { owner: fakeOwnerAuth() }, methods: ['GET'] }, /GET function/],
     ['an internal header that is not x-', { ...base, auth: { internal: { header: 'Authorization', secret: INTERNAL_SECRET } } }, /x- header/],
