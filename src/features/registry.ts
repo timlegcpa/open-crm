@@ -1,4 +1,4 @@
-import type { RouteObject } from 'react-router-dom';
+import { matchRoutes, type RouteObject } from 'react-router-dom';
 import { manifest as board } from '@/features/board/manifest';
 import { manifest as crm } from '@/features/crm/manifest';
 import { manifest as documents } from '@/features/documents/manifest';
@@ -13,11 +13,14 @@ import { manifest as requests } from '@/features/requests/manifest';
 import { manifest as settings } from '@/features/settings/manifest';
 import {
   NAV_SECTIONS,
+  type ContactHeaderAction,
+  type ContactSidePanel,
   type ContactTab,
   type FeatureManifest,
   type LazyComponent,
   type NavSectionKey,
   type OwnerNavItem,
+  type OwnerRouteHandle,
   type PortalHomeCard,
   type PortalTab,
   type SettingsSection,
@@ -73,6 +76,10 @@ export const portalHomeCards: PortalHomeCard[] = collect((f) => f.portalHomeCard
 export const publicRoutes: RouteObject[] = collect((f) => f.publicRoutes);
 /** Tabs on the contact record, in order. */
 export const contactTabs: ContactTab[] = collect((f) => f.contactTabs).sort(byOrderThenLabel);
+/** Buttons in the contact record's header, in order. */
+export const contactHeaderActions: ContactHeaderAction[] = collect((f) => f.contactHeaderActions).sort(byOrderThenKey);
+/** Panels in the contact record's right bar, in order. */
+export const contactSidePanels: ContactSidePanel[] = collect((f) => f.contactSidePanels).sort(byOrderThenKey);
 /** Settings sections, in order. */
 export const settingsSections: SettingsSection[] = collect((f) => f.settingsSections).sort(byOrderThenLabel);
 /** The portal's frame, from the one feature that provides it (registry.test.ts allows one); null for none. */
@@ -92,4 +99,9 @@ export function navGroups(items: readonly OwnerNavItem[] = ownerNav): NavGroup[]
     ...NAV_SECTIONS.map(({ key, label }) => ({ key, label, items: items.filter((item) => item.section === key) })),
   ];
   return groups.filter((group) => group.items.length > 0);
+}
+
+/** True when the owner route matching `pathname` opts into a bounded page (`handle: BOUNDED_PAGE`). */
+export function isBoundedPage(pathname: string, routes: RouteObject[] = ownerRoutes): boolean {
+  return (matchRoutes(routes, pathname) ?? []).some((m) => (m.route.handle as OwnerRouteHandle | undefined)?.bounded === true);
 }

@@ -17,8 +17,7 @@ export const manifest: FeatureManifest = {
     { path: 'contacts', element: <ContactsList /> },
     { path: 'contacts/new', element: <ContactIntake /> },
     { path: 'contacts/:id', element: <ContactWorkspace /> },
-    // A record tab (links.contactTab). Until the record grows a tab strip that renders the
-    // registry's `contactTabs`, a tab URL opens the record itself.
+    // A record tab (links.contactTab): the record with that feature's `contactTabs` entry open.
     { path: 'contacts/:id/:tab', element: <ContactWorkspace /> },
   ],
 };

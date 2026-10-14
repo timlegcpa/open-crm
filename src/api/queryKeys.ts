@@ -16,7 +16,8 @@ export const queryKeys = {
     forContact: (contactId: string) => ['contact-relationships', contactId] as const,
   },
   pickLists: {
-    contactStatuses: () => ['pick-lists', 'contact-statuses'] as const,
-    leadSources: () => ['pick-lists', 'lead-sources'] as const,
+    all: ['pick-lists'] as const,
+    /** One pick-list table; a screen that edits a list invalidates this key. */
+    table: (table: string) => ['pick-lists', table] as const,
   },
 };

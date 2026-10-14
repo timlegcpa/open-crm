@@ -29,6 +29,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import { matchesContactSearch } from '@/lib/contactSearch';
 import { dateSortKey, formatDate } from '@/lib/dates';
 import { getErrorMessage } from '@/lib/errors';
 
@@ -38,12 +39,6 @@ type SortKey = 'name' | 'status' | 'date';
 
 function contactDate(c: ContactListRow): string {
   return c.submitted_at ?? c.created_at;
-}
-
-function matchesSearch(c: ContactListRow, needle: string, digits: string): boolean {
-  const text = [c.full_name, c.business_name, c.email, c.phone].filter(Boolean).join(' ').toLowerCase();
-  if (text.includes(needle)) return true;
-  return digits.length > 0 && (c.phone ?? '').replace(/\D/g, '').includes(digits);
 }
 
 function SortHeader({
@@ -88,12 +83,8 @@ export function ContactsList() {
   const [deleteOutcomes, setDeleteOutcomes] = useState<DeleteOutcome[] | null>(null);
 
   const visible = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    const digits = needle.replace(/\D/g, '');
     const rows = (contacts.data ?? []).filter(
-      (c) =>
-        (statusFilter === ALL_STATUSES || c.status === statusFilter) &&
-        (needle === '' || matchesSearch(c, needle, digits)),
+      (c) => (statusFilter === ALL_STATUSES || c.status === statusFilter) && matchesContactSearch(c, search),
     );
     const direction = sort.ascending ? 1 : -1;
     const compare = (a: ContactListRow, b: ContactListRow): number => {

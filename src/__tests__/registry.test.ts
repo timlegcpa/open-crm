@@ -21,7 +21,10 @@ vi.mock('pdfjs-dist', () => {
 import { PUBLIC_PATHS, links } from '@/features/links';
 import {
   FEATURES,
+  contactHeaderActions,
+  contactSidePanels,
   contactTabs,
+  isBoundedPage,
   navGroups,
   ownerNav,
   ownerRoutes,
@@ -32,7 +35,7 @@ import {
   publicRoutes,
   settingsSections,
 } from '@/features/registry';
-import { NAV_SECTIONS, type OwnerNavItem } from '@/features/types';
+import { BOUNDED_PAGE, NAV_SECTIONS, type OwnerNavItem } from '@/features/types';
 
 const FEATURES_DIR = path.resolve(__dirname, '..', 'features');
 const DOMAINS = ['board', 'crm', 'documents', 'email', 'esign', 'marketing', 'mcp', 'messages', 'ops', 'portal', 'requests', 'settings'];
@@ -110,6 +113,8 @@ describe('feature registry', () => {
     expect(dupes(ownerNav.map((n) => n.path))).toEqual([]);
     expect(dupes(portalTabs.map((t) => t.path))).toEqual([]);
     expect(dupes(contactTabs.map((t) => t.key))).toEqual([]);
+    expect(dupes(contactHeaderActions.map((a) => a.key))).toEqual([]);
+    expect(dupes(contactSidePanels.map((p) => p.key))).toEqual([]);
     expect(dupes(settingsSections.map((s) => s.key))).toEqual([]);
     expect(dupes(portalHomeCards.map((c) => c.key))).toEqual([]);
     expect(dupes([...flatten(ownerRoutes), ...flatten(ownerStandaloneRoutes)].map((r) => r.full))).toEqual([]);
@@ -203,8 +208,31 @@ describe('feature registry', () => {
     expect(sorted(ownerNav)).toBe(true);
     expect(sorted(portalTabs)).toBe(true);
     expect(sorted(contactTabs)).toBe(true);
+    expect(sorted(contactHeaderActions)).toBe(true);
+    expect(sorted(contactSidePanels)).toBe(true);
     expect(sorted(settingsSections)).toBe(true);
     expect(sorted(portalHomeCards)).toBe(true);
+  });
+
+  it('a contact tab key never collides with the record route it sits under', () => {
+    // /contacts/:id/<key>: 'overview' is the record itself, so no feature may claim it.
+    expect(contactTabs.map((t) => t.key)).not.toContain('overview');
+  });
+
+  it('a bounded page is opt-in per route, and nothing else is bounded', () => {
+    const routes: RouteObject[] = [
+      { path: 'contacts', element: null },
+      { path: 'board', element: null, handle: BOUNDED_PAGE },
+      { path: 'board/:itemId', element: null },
+    ];
+    expect(isBoundedPage('/board', routes)).toBe(true);
+    expect(isBoundedPage('/board/b-1', routes)).toBe(false);
+    expect(isBoundedPage('/contacts', routes)).toBe(false);
+    expect(isBoundedPage('/nowhere', routes)).toBe(false);
+    // Every registered route that sets a handle uses the typed opt-in.
+    for (const { route, full } of flatten(ownerRoutes)) {
+      if (route.handle !== undefined) expect(route.handle, full).toEqual(BOUNDED_PAGE);
+    }
   });
 
   it('groups the nav: unsectioned items first, then the sections in order, empty ones left out', () => {

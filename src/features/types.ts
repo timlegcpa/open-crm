@@ -18,7 +18,9 @@ import type { RouteObject } from 'react-router-dom';
  *   tab paths are ABSOLUTE ('/documents'). Every nav path must match a route.
  * - Routes use `element` (and `children`), never `lazy`, `loader` or `action`: the app
  *   renders through useRoutes, where those data-router fields do nothing.
- * - Keys (contact tabs, settings sections, home cards) and paths are unique across features.
+ * - Keys (contact tabs, header actions, side panels, settings sections, home cards) and paths
+ *   are unique across features.
+ * - An owner route whose page lays out its own scrolling sets `handle: BOUNDED_PAGE`.
  * - A public page module lives under src/features/<id>/public/ (the build names its chunk
  *   `public-*`, and bundleBoundary.test.ts proves it never loads supabase-js).
  */
@@ -91,6 +93,31 @@ export interface ContactTab {
   badge?: LazyComponent<ContactTabProps>;
 }
 
+/**
+ * A button in the contact record's header (Message, New request, E-sign), contributed by the
+ * feature that does the work. It renders its own control (a small outline button, or a
+ * popover trigger) with an accessible name, and decides for itself when it is disabled.
+ */
+export interface ContactHeaderAction {
+  /** Unique across features. */
+  key: string;
+  order: number;
+  Component: LazyComponent<ContactTabProps>;
+}
+
+/**
+ * A panel in the contact record's right bar (portal access, what is waiting on the owner),
+ * contributed by the feature that owns its data. It draws its own heading and returns null
+ * when it has nothing to show. The bar shows on wide screens only, so a panel must never be
+ * the one way to reach something.
+ */
+export interface ContactSidePanel {
+  /** Unique across features. */
+  key: string;
+  order: number;
+  Component: LazyComponent<ContactTabProps>;
+}
+
 /** A section of Settings (/settings/<key>), contributed by the feature that owns the setting. */
 export interface SettingsSection {
   /** The URL segment; unique across features. */
@@ -124,5 +151,20 @@ export interface FeatureManifest {
   /** Routes that need no session ('sign/*', 'unsubscribe'). Relative paths, lazy pages under ./public/. */
   publicRoutes?: RouteObject[];
   contactTabs?: ContactTab[];
+  contactHeaderActions?: ContactHeaderAction[];
+  contactSidePanels?: ContactSidePanel[];
   settingsSections?: SettingsSection[];
 }
+
+/** What an owner route may carry in `handle`. The shell reads it for the route that matched. */
+export interface OwnerRouteHandle {
+  /**
+   * The page fills the window below the top bar and the page itself does not scroll; the
+   * page lays out its own scrolling areas (a board whose lanes scroll). Default: the page
+   * scrolls with the document.
+   */
+  bounded?: boolean;
+}
+
+/** `handle` for an owner route whose page manages its own scrolling: `{ path: 'board', element: <BoardPage />, handle: BOUNDED_PAGE }`. */
+export const BOUNDED_PAGE: OwnerRouteHandle = { bounded: true };

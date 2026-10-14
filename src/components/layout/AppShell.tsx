@@ -7,7 +7,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
 import { PAGE } from '@/components/layout/page';
 import { TOPBAR_SLOT_ID } from '@/components/layout/topbarSlot';
-import { navGroups, type NavGroup } from '@/features/registry';
+import { isBoundedPage, navGroups, type NavGroup } from '@/features/registry';
 import type { OwnerNavItem, ShellProps } from '@/features/types';
 import { ThemeContext, useTheme, type ThemeControls } from '@/hooks/useTheme';
 import { safeStorage, storageKey } from '@/lib/storage';
@@ -22,6 +22,10 @@ import { cn } from '@/lib/utils';
  * actions into it. On desktop the bar hides while the slot is empty (a page that draws its
  * own full-height layout); on a phone it always shows, because it carries the menu button.
  * Pin something under the bar with `top-[var(--topbar-h)]`.
+ *
+ * A route with `handle: BOUNDED_PAGE` gets a bounded page instead: the content area is
+ * exactly the window below the top bar and never scrolls itself, so the page (a board) can
+ * give each of its areas its own ScrollArea. The page's root should be `h-full min-h-0`.
  */
 
 /** One nav row: 32px, 13px label, 18px icon at a light stroke. */
@@ -169,6 +173,7 @@ export function AppShell(props: ShellProps) {
   const { isDark, toggle } = useTheme();
   const theme: ThemeControls = { isDark, toggle };
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const bounded = isBoundedPage(useLocation().pathname);
 
   return (
     <ThemeContext.Provider value={theme}>
@@ -179,10 +184,16 @@ export function AppShell(props: ShellProps) {
 
         {/* overflow-x-clip, not overflow-hidden: no sideways scroll, and no scroll container
             that would stop the top bar from sticking to the viewport. */}
-        <main className="min-w-0 flex-1 overflow-x-clip text-[14px] leading-[1.5] [--topbar-h:2.5rem] md:[--topbar-h:3rem]">
+        <main
+          data-bounded={bounded || undefined}
+          className={cn(
+            'min-w-0 flex-1 overflow-x-clip text-[14px] leading-[1.5] [--topbar-h:2.5rem] md:[--topbar-h:3rem]',
+            bounded && 'flex h-svh flex-col overflow-hidden',
+          )}
+        >
           {/* The id in `has-[#app-topbar-slot:empty]` is TOPBAR_SLOT_ID written out: Tailwind
               cannot read a variable. AppShell.test.tsx keeps the two in step. */}
-          <div className="sticky top-0 z-30 flex h-[var(--topbar-h)] items-center gap-3 border-b border-border bg-background px-3 md:px-5 md:has-[#app-topbar-slot:empty]:hidden">
+          <div className="sticky top-0 z-30 flex h-[var(--topbar-h)] shrink-0 items-center gap-3 border-b border-border bg-background px-3 md:px-5 md:has-[#app-topbar-slot:empty]:hidden">
             <Button
               variant="ghost"
               size="icon-sm"
@@ -201,7 +212,13 @@ export function AppShell(props: ShellProps) {
               </div>
             }
           >
-            <Outlet />
+            {bounded ? (
+              <div className="flex min-h-0 flex-1 flex-col">
+                <Outlet />
+              </div>
+            ) : (
+              <Outlet />
+            )}
           </Suspense>
         </main>
       </div>
