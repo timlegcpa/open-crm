@@ -8,6 +8,9 @@
 --   client  get_client_contact_id(): the contact an active portal account belongs to.
 --   server  service_role (edge functions). It bypasses RLS but not triggers.
 -- A role claim in a token grants nothing. anon has no access to anything in this file.
+-- The owner's View-as-client session is a client session that may only read: every
+-- table a client can write carries the trg_impersonation_read_only statement trigger,
+-- and storage.objects refuses its writes for every bucket.
 
 -- ---------------------------------------------------------------------------
 -- Pick-lists. Labels, colours and order are the owner's to edit; keys never change.
@@ -15,6 +18,12 @@
 -- ---------------------------------------------------------------------------
 
 -- The pipeline. Code branches on these keys, so the set is fixed; only the labels move.
+-- A lead arrives (new_lead); the owner reaches out and books a call (active_lead, one
+-- stage for both); after the call it is hot (likely soon), warm (the coming months) or
+-- cold (parked, and so out of the active pipeline). It becomes a client (recurring work)
+-- or one_time, or ends as lost (never signed); a client who leaves is former_client.
+-- esign_signer is a system status: the e-signature flow gives it to a contact created
+-- only to sign. It is not a pipeline stage the owner moves a contact through.
 CREATE TABLE public.contact_statuses (
   key text PRIMARY KEY,
   label text NOT NULL CHECK (char_length(label) BETWEEN 1 AND 60),
@@ -23,14 +32,16 @@ CREATE TABLE public.contact_statuses (
 );
 
 INSERT INTO public.contact_statuses (key, label, sort_order) VALUES
-  ('new_lead', 'New lead', 10),
-  ('active_lead', 'Active lead', 20),
-  ('nurture', 'Nurture', 30),
-  ('follow_up_later', 'Follow up later', 40),
-  ('client', 'Client', 50),
-  ('one_time', 'One-time client', 60),
-  ('lost', 'Lost', 70),
-  ('esign_signer', 'Signer only', 80);
+  ('new_lead', 'New', 10),
+  ('active_lead', 'Active', 20),
+  ('hot', 'Hot', 30),
+  ('warm', 'Warm', 40),
+  ('cold', 'Cold', 50),
+  ('client', 'Client', 60),
+  ('one_time', 'One-time client', 70),
+  ('former_client', 'Former client', 80),
+  ('lost', 'Lost', 90),
+  ('esign_signer', 'Signer only', 100);
 
 CREATE TABLE public.lead_sources (
   key text PRIMARY KEY CHECK (key ~ '^[a-z][a-z0-9_]{0,39}$'),
@@ -174,8 +185,8 @@ CREATE TABLE public.contacts (
   ) STORED,
   spouse_email text CHECK (spouse_email IS NULL OR char_length(btrim(spouse_email)) BETWEEN 3 AND 254),
   spouse_phone text,
-  date_of_birth date,
-  spouse_date_of_birth date,
+  -- No date of birth, for the contact or a spouse: a business CRM has no use for one,
+  -- and a column that is never collected can never leak.
   mailing_street text,
   mailing_city text,
   mailing_state text,
@@ -465,7 +476,17 @@ CREATE TABLE public.client_tasks (
 
 CREATE INDEX idx_client_tasks_contact_status ON public.client_tasks (contact_id, status);
 
--- The owner's "view as client" sessions. Written only by the impersonation functions.
+-- The owner's "View as client" sessions: the record of which sign-in session is the
+-- owner looking through a client's eyes. Written only by the server (service role).
+--
+-- Starting one mints the client's own ordinary session, so nothing in that session's
+-- token says the owner holds it; this row is the only record. Right after the swap the
+-- server binds the row to the minted session's id (the token's session_id claim). A
+-- bound session is read-only for as long as it exists, whatever ended_at says, because
+-- an access token stays valid after the row closes. An unbound row (the bind never
+-- happened) makes every session of the target read-only while it is open and for the
+-- sign-in link's hour after it started, since a session redeemed from that link carries
+-- no binding. See is_impersonation_session() below.
 CREATE TABLE public.impersonation_sessions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   owner_user_id uuid NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
@@ -473,8 +494,12 @@ CREATE TABLE public.impersonation_sessions (
   target_user_id uuid NOT NULL REFERENCES auth.users (id) ON DELETE CASCADE,
   target_email text NOT NULL,
   target_name text,
+  -- The minted session (auth.sessions.id) once bound; NULL until then.
+  session_id uuid,
   started_at timestamptz NOT NULL DEFAULT now(),
   ended_at timestamptz,
+  -- Closed by the stale-row sweep rather than by the owner.
+  auto_ended boolean NOT NULL DEFAULT false,
   ip_address inet,
   user_agent text
 );
@@ -483,6 +508,10 @@ CREATE INDEX idx_impersonation_sessions_active
   ON public.impersonation_sessions (owner_user_id) WHERE ended_at IS NULL;
 CREATE INDEX idx_impersonation_sessions_started
   ON public.impersonation_sessions (owner_user_id, started_at DESC);
+CREATE INDEX idx_impersonation_sessions_target
+  ON public.impersonation_sessions (target_user_id);
+CREATE UNIQUE INDEX impersonation_sessions_session_id_key
+  ON public.impersonation_sessions (session_id) WHERE session_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- The client principal
@@ -735,6 +764,147 @@ AS $$
      SET attempt_count = attempt_count + 1
    WHERE id = invitation_id AND attempt_count < max_attempts
   RETURNING attempt_count;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- View as client: read-only, bound to the one session it minted
+-- ---------------------------------------------------------------------------
+
+-- The one definition of "is this caller the owner's View-as-client session", for the
+-- user and the token's session_id. Edge functions ask it through RPC before anything
+-- whose meaning rests on the client being at the keyboard (a signature, a confirmation);
+-- the write trigger below asks it directly.
+CREATE FUNCTION public.is_impersonation_session(p_user uuid, p_session uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+  SELECT
+    (p_session IS NOT NULL AND EXISTS (
+      SELECT 1 FROM public.impersonation_sessions s WHERE s.session_id = p_session))
+    OR EXISTS (
+      SELECT 1 FROM public.impersonation_sessions s
+       WHERE s.target_user_id = p_user
+         AND s.session_id IS NULL
+         AND (s.ended_at IS NULL OR s.started_at > now() - interval '1 hour'));
+$$;
+
+-- The same question about the caller's own session: the user and session_id of the token
+-- in hand. It says nothing about anyone else, so signed-in sessions may ask it. The write
+-- trigger and the storage policies below ask it; the portal can, to show it is read-only.
+CREATE FUNCTION public.is_view_as_client()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+  SELECT public.is_impersonation_session(
+    auth.uid(),
+    NULLIF((SELECT auth.jwt()) ->> 'session_id', '')::uuid);
+$$;
+
+-- Refuses every write a View-as-client session makes. Statement level, so one lookup per
+-- statement. Only the authenticated API role is checked: the server (service role) runs
+-- its own guard, and the owner's own token is never a View-as-client session. Attached as
+-- trg_impersonation_read_only to every table a client session can write.
+CREATE FUNCTION public.enforce_impersonation_read_only()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF current_setting('role', true) = 'authenticated' AND public.is_view_as_client() THEN
+    RAISE EXCEPTION 'impersonation_read_only'
+      USING ERRCODE = '42501',
+            HINT = 'View as client is read-only.';
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER trg_impersonation_read_only
+  BEFORE INSERT OR UPDATE OR DELETE ON public.client_activity_log
+  FOR EACH STATEMENT EXECUTE FUNCTION public.enforce_impersonation_read_only();
+CREATE TRIGGER trg_impersonation_read_only
+  BEFORE INSERT OR UPDATE OR DELETE ON public.client_tasks
+  FOR EACH STATEMENT EXECUTE FUNCTION public.enforce_impersonation_read_only();
+
+-- Files. storage.objects is the storage service's table: a migration gives it policies,
+-- never triggers. These refuse the same writes for every bucket, whatever a bucket's own
+-- policies allow: an upload is refused, and an update or delete finds nothing to change.
+CREATE POLICY objects_view_as_client_insert ON storage.objects AS RESTRICTIVE FOR INSERT TO authenticated
+  WITH CHECK (NOT (SELECT public.is_view_as_client()));
+CREATE POLICY objects_view_as_client_update ON storage.objects AS RESTRICTIVE FOR UPDATE TO authenticated
+  USING (NOT (SELECT public.is_view_as_client()))
+  WITH CHECK (NOT (SELECT public.is_view_as_client()));
+CREATE POLICY objects_view_as_client_delete ON storage.objects AS RESTRICTIVE FOR DELETE TO authenticated
+  USING (NOT (SELECT public.is_view_as_client()));
+
+-- Server only: revoke the minted session of one row by deleting its auth.sessions row,
+-- which kills its refresh token. A bound row names its session. An unbound row cannot,
+-- so every session of the target that a sign-in link created (amr 'otp') within the
+-- link's hour from the row's start is revoked: the minted one is among them, and leaving
+-- it would hand an unrestricted session to whoever holds that browser once the row
+-- closes. Returns whether any session was removed.
+CREATE FUNCTION public.revoke_impersonation_auth_session(p_row uuid)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_row public.impersonation_sessions;
+  v_count integer;
+BEGIN
+  SELECT * INTO v_row FROM public.impersonation_sessions s WHERE s.id = p_row;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  IF v_row.session_id IS NOT NULL THEN
+    DELETE FROM auth.sessions WHERE id = v_row.session_id;
+  ELSE
+    DELETE FROM auth.sessions a
+     WHERE a.user_id = v_row.target_user_id
+       AND a.created_at >= v_row.started_at
+       AND a.created_at < v_row.started_at + interval '1 hour'
+       AND EXISTS (SELECT 1 FROM auth.mfa_amr_claims m
+                    WHERE m.session_id = a.id AND m.authentication_method = 'otp');
+  END IF;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count > 0;
+END;
+$$;
+
+-- Server only: close every row open longer than eight hours (an owner who closed the tab
+-- never ended it), and revoke each closed row's minted session, bound or not. Returns
+-- how many rows it closed. It runs on a schedule set up outside the migrations.
+CREATE FUNCTION public.auto_end_stale_impersonation_sessions()
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_id uuid;
+  closed integer := 0;
+BEGIN
+  FOR v_id IN
+    UPDATE public.impersonation_sessions
+       SET ended_at = started_at + interval '8 hours',
+           auto_ended = true
+     WHERE ended_at IS NULL
+       AND started_at < now() - interval '8 hours'
+    RETURNING id
+  LOOP
+    PERFORM public.revoke_impersonation_auth_session(v_id);
+    closed := closed + 1;
+  END LOOP;
+  RETURN closed;
+END;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -1177,13 +1347,11 @@ GRANT UPDATE (label, colour, sort_order, is_active, revenue_family, default_cade
 GRANT SELECT ON public.contacts TO authenticated;
 GRANT
   INSERT (submitted_at, first_name, last_name, email, phone, business_name, spouse_first_name,
-          spouse_last_name, spouse_email, spouse_phone, date_of_birth, spouse_date_of_birth,
-          mailing_street, mailing_city, mailing_state, mailing_zip, source, status, client_since,
-          portal_sidebar_config),
+          spouse_last_name, spouse_email, spouse_phone, mailing_street, mailing_city,
+          mailing_state, mailing_zip, source, status, client_since, portal_sidebar_config),
   UPDATE (submitted_at, first_name, last_name, email, phone, business_name, spouse_first_name,
-          spouse_last_name, spouse_email, spouse_phone, date_of_birth, spouse_date_of_birth,
-          mailing_street, mailing_city, mailing_state, mailing_zip, source, status, client_since,
-          portal_sidebar_config)
+          spouse_last_name, spouse_email, spouse_phone, mailing_street, mailing_city,
+          mailing_state, mailing_zip, source, status, client_since, portal_sidebar_config)
 ON public.contacts TO authenticated;
 
 GRANT SELECT ON public.client_portal_accounts TO authenticated;
@@ -1216,6 +1384,11 @@ REVOKE ALL ON FUNCTION
   public.client_tasks_status_transition(),
   public.stamp_client_activity_insert(),
   public.increment_invitation_attempt(uuid, integer),
+  public.is_impersonation_session(uuid, uuid),
+  public.is_view_as_client(),
+  public.enforce_impersonation_read_only(),
+  public.revoke_impersonation_auth_session(uuid),
+  public.auto_end_stale_impersonation_sessions(),
   public.contact_delete_claim_live(uuid),
   public.admin_contact_delete_begin(uuid),
   public.admin_contact_delete_release(uuid, jsonb, uuid, uuid[]),
@@ -1227,16 +1400,21 @@ FROM PUBLIC, anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION
   public.get_client_contact_id(),
   public.increment_invitation_attempt(uuid, integer),
+  public.is_impersonation_session(uuid, uuid),
+  public.revoke_impersonation_auth_session(uuid),
+  public.auto_end_stale_impersonation_sessions(),
   public.contact_delete_claim_live(uuid),
   public.admin_contact_delete_begin(uuid),
   public.admin_contact_delete_release(uuid, jsonb, uuid, uuid[]),
   public.admin_delete_contact(uuid, uuid)
 TO service_role;
 
--- Signed-in sessions: the client principal (policies call it), the portal's own-contact
--- and own-activity reads, and the owner's default-address switch.
+-- Signed-in sessions: the client principal and the caller's own View-as-client state
+-- (policies call both), the portal's own-contact and own-activity reads, and the owner's
+-- default-address switch.
 GRANT EXECUTE ON FUNCTION
   public.get_client_contact_id(),
+  public.is_view_as_client(),
   public.get_my_contact(),
   public.get_my_activity(integer),
   public.contact_emails_set_default(uuid, uuid, text)

@@ -9,10 +9,10 @@
 --   client       a portal user bound to a contact (defined with contacts, in 0002).
 --   service_role the server key used by edge functions; bypasses RLS.
 --
--- Conventions: RLS on every table; access is REVOKEd from every API role (anon,
--- authenticated and service_role) and then GRANTed per table, never inherited from
--- Supabase's default privileges; every function pins
--- `search_path = ''` and schema-qualifies what it touches; EXECUTE is revoked from
+-- Conventions: RLS on every table, and an MFA gate on every table and on storage.objects;
+-- access is REVOKEd from every API role (anon, authenticated and service_role) and then
+-- GRANTed per table, never inherited from Supabase's default privileges; every function
+-- pins `search_path = ''` and schema-qualifies what it touches; EXECUTE is revoked from
 -- PUBLIC and granted per function.
 
 -- ---------------------------------------------------------------------------
@@ -1029,23 +1029,29 @@ BEGIN
 END;
 $$;
 
+-- The same gate on storage.objects, where every bucket's policies live: whatever a
+-- bucket's own policies allow, a session that fails mfa_session_ok() reads and writes no
+-- file. It holds for every bucket a later migration creates, so none adds its own.
+CREATE POLICY objects_mfa_gate ON storage.objects AS RESTRICTIVE FOR ALL TO authenticated
+  USING ((SELECT public.mfa_session_ok())) WITH CHECK ((SELECT public.mfa_session_ok()));
+
 -- ---------------------------------------------------------------------------
 -- Privileges
 -- ---------------------------------------------------------------------------
 
 -- Tables: nothing inherited, service_role included (Supabase's default privileges grant
--- it ALL, TRUNCATE on audit_logs among them). service_role gets full access (audit_logs
--- without TRUNCATE); user sessions get only what a policy above can use.
+-- it ALL). service_role gets row access only: no TRUNCATE (it skips RLS and row
+-- triggers), and no REFERENCES, TRIGGER or MAINTAIN, which no request path needs. User
+-- sessions get only what a policy above can use.
 REVOKE ALL ON
   public.org_profile, public.mfa_recovery_lockouts, public.mfa_backup_code_generations,
   public.mfa_backup_codes, public.audit_logs, public.auth_rate_limits, public.app_settings,
   public.jobs, public.dev_outbox, public.csp_violation_reports
 FROM PUBLIC, anon, authenticated, service_role;
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.audit_logs TO service_role;
-GRANT ALL ON
+GRANT SELECT, INSERT, UPDATE, DELETE ON
   public.org_profile, public.mfa_recovery_lockouts, public.mfa_backup_code_generations,
-  public.mfa_backup_codes, public.auth_rate_limits, public.app_settings,
+  public.mfa_backup_codes, public.audit_logs, public.auth_rate_limits, public.app_settings,
   public.jobs, public.dev_outbox, public.csp_violation_reports
 TO service_role;
 

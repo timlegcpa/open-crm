@@ -1,6 +1,7 @@
 // @vitest-environment node
 import type { PGlite } from '@electric-sql/pglite';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { CONTACT_PATCH_COLUMNS } from '@/api/contacts';
 import { anon, as, count as countRows, createDb, errorOf, service, session, tryIn, user } from './harness';
 
 const OWNER = '00000000-0000-4000-8000-000000000001';
@@ -45,14 +46,15 @@ const AUTHENTICATED_CALLABLE = [
   'is_owner()', 'mfa_session_ok()', 'user_has_verified_mfa()', 'audit_actor()', 'is_owner_or_server()',
   'org_profile_guard_principals()', 'set_updated_at()', 'retry_job(uuid)', 'get_job_status_counts()',
   'get_org_branding()',
-  'get_client_contact_id()', 'get_my_contact()', 'get_my_activity(integer)',
+  'get_client_contact_id()', 'is_view_as_client()', 'get_my_contact()', 'get_my_activity(integer)',
   'contact_emails_set_default(uuid,uuid,text)',
 ];
 const ANON_CALLABLE = ['get_org_branding()'];
 const SERVER_RPCS = [
   'get_client_contact_id()', 'increment_invitation_attempt(uuid,integer)', 'contact_delete_claim_live(uuid)',
   'admin_contact_delete_begin(uuid)', 'admin_contact_delete_release(uuid,jsonb,uuid,uuid[])',
-  'admin_delete_contact(uuid,uuid)',
+  'admin_delete_contact(uuid,uuid)', 'is_impersonation_session(uuid,uuid)',
+  'revoke_impersonation_auth_session(uuid)', 'auto_end_stale_impersonation_sessions()',
 ];
 
 let db: PGlite;
@@ -92,8 +94,10 @@ beforeAll(async () => {
     INSERT INTO public.contact_upsells (contact_id, title, service_type) VALUES ('${CONTACT_A}', 'Add a plan', 'annual_plan');
     INSERT INTO public.portal_invitations (email, contact_id, expires_at)
       VALUES ('a@example.test', '${CONTACT_A}', now() + interval '1 day');
-    INSERT INTO public.impersonation_sessions (owner_user_id, target_contact_id, target_user_id, target_email)
-      VALUES ('${OWNER}', '${CONTACT_A}', '${USER_A}', 'a@example.test');
+    -- Unbound and closed more than an hour after it started, so it no longer restricts
+    -- client A (impersonation.test.ts covers the rows that do).
+    INSERT INTO public.impersonation_sessions (owner_user_id, target_contact_id, target_user_id, target_email, started_at, ended_at)
+      VALUES ('${OWNER}', '${CONTACT_A}', '${USER_A}', 'a@example.test', now() - interval '2 hours', now() - interval '90 minutes');
   `);
 }, 60_000);
 
@@ -428,8 +432,37 @@ describe('quotes and businesses', () => {
 
   it('pick-list values are enforced by foreign key', async () => {
     expect(await errorOf(db, owner, `INSERT INTO public.contacts (first_name, source) VALUES ('x', 'nowhere')`)).toMatch(/foreign key/);
-    expect(await errorOf(db, owner, `INSERT INTO public.contacts (first_name, status) VALUES ('x', 'free_user')`)).toMatch(/foreign key/);
-    expect(await errorOf(db, owner, `INSERT INTO public.contact_services (contact_id, service_type, state, cadence) VALUES ('${CONTACT_A}', 'tax_return', 'proposed', 'annual')`)).toMatch(/foreign key/);
+    // A free portal tier and the two retired pipeline stages are not statuses here.
+    for (const retired of ['free_user', 'nurture', 'follow_up_later']) {
+      expect(await errorOf(db, owner, `INSERT INTO public.contacts (first_name, status) VALUES ('x', $1)`, [retired]), retired).toMatch(/foreign key/);
+    }
+    expect(await errorOf(db, owner, `INSERT INTO public.contact_services (contact_id, service_type, state, cadence) VALUES ('${CONTACT_A}', 'not_a_service', 'proposed', 'annual')`)).toMatch(/foreign key/);
+  });
+});
+
+describe('the contact row', () => {
+  it('the pipeline is exactly these stages, in this order, with these labels', async () => {
+    const rows = await as<{ key: string; label: string }>(db, service, 'SELECT key, label FROM public.contact_statuses ORDER BY sort_order');
+    expect(rows.map((r) => [r.key, r.label])).toEqual([
+      ['new_lead', 'New'], ['active_lead', 'Active'], ['hot', 'Hot'], ['warm', 'Warm'], ['cold', 'Cold'],
+      ['client', 'Client'], ['one_time', 'One-time client'], ['former_client', 'Former client'], ['lost', 'Lost'],
+      ['esign_signer', 'Signer only'],
+    ]);
+  });
+
+  it('carries no date of birth, for the contact or a spouse', async () => {
+    const { rows } = await db.query<{ attname: string }>(
+      `SELECT attname FROM pg_attribute WHERE attrelid = 'public.contacts'::regclass AND attnum > 0 AND NOT attisdropped`);
+    expect(rows.length).toBeGreaterThan(20);
+    expect(rows.map((r) => r.attname).filter((c) => /birth|dob/i.test(c))).toEqual([]);
+  });
+
+  it('every column the Overview form saves is one a signed-in session may update', async () => {
+    for (const column of CONTACT_PATCH_COLUMNS) {
+      const { rows } = await db.query<{ ok: boolean }>(
+        `SELECT has_column_privilege('authenticated', 'public.contacts', $1, 'UPDATE') AS ok`, [column]);
+      expect(rows[0].ok, column).toBe(true);
+    }
   });
 });
 
@@ -440,7 +473,7 @@ describe('pick-lists', () => {
     expect(await as(db, owner, `DELETE FROM public.lead_sources WHERE key = 'event' RETURNING key`)).toEqual([{ key: 'event' }]);
   });
 
-  it('system rows stay, keys never change, and the pipeline has exactly its eight stages', async () => {
+  it('system rows stay, keys never change, and the pipeline has exactly its ten stages', async () => {
     expect(await as(db, owner, `DELETE FROM public.lead_sources WHERE key = 'esign' RETURNING key`)).toEqual([]);
     expect(await errorOf(db, owner, `INSERT INTO public.lead_sources (key, label, is_system) VALUES ('x', 'X', true)`)).toMatch(/created only by migrations/);
     expect(await errorOf(db, owner, `UPDATE public.lead_sources SET key = 'y' WHERE key = 'referral'`)).toMatch(/permission denied/);
@@ -448,7 +481,7 @@ describe('pick-lists', () => {
     expect(await errorOf(db, owner, `INSERT INTO public.contact_statuses (key, label) VALUES ('x', 'X')`)).toMatch(/permission denied/);
     expect(await errorOf(db, owner, `DELETE FROM public.contact_statuses`)).toMatch(/permission denied/);
     expect(await errorOf(db, owner, `UPDATE public.contact_statuses SET label = 'Won' WHERE key = 'client'`)).toBeNull();
-    expect(await count(owner, 'contact_statuses')).toBe(8);
+    expect(await count(owner, 'contact_statuses')).toBe(10);
   });
 
   it('the server is held to the same rules: built-in rows keep their meaning', async () => {

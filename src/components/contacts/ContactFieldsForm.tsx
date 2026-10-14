@@ -48,8 +48,6 @@ const SECTIONS: Array<{ title: string; fields: FieldDef[] }> = [
   {
     title: 'Dates',
     fields: [
-      { column: 'date_of_birth', label: 'Date of birth', kind: 'date' },
-      { column: 'spouse_date_of_birth', label: 'Spouse date of birth', kind: 'date' },
       { column: 'client_since', label: 'Client since', kind: 'date' },
       { column: 'submitted_at', label: 'Submitted', kind: 'timestamp' },
     ],
@@ -76,8 +74,6 @@ function toDraft(c: Contact): Draft {
     mailing_city: c.mailing_city ?? '',
     mailing_state: c.mailing_state ?? '',
     mailing_zip: c.mailing_zip ?? '',
-    date_of_birth: c.date_of_birth ?? '',
-    spouse_date_of_birth: c.spouse_date_of_birth ?? '',
     client_since: c.client_since ?? '',
     submitted_at: timestampToDateInput(c.submitted_at),
     status: c.status,

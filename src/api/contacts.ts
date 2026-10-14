@@ -24,8 +24,6 @@ export interface Contact extends ContactListRow {
   spouse_name: string | null;
   spouse_email: string | null;
   spouse_phone: string | null;
-  date_of_birth: string | null;
-  spouse_date_of_birth: string | null;
   mailing_street: string | null;
   mailing_city: string | null;
   mailing_state: string | null;
@@ -43,8 +41,7 @@ const LIST_COLUMNS =
 
 const DETAIL_COLUMNS =
   `${LIST_COLUMNS}, updated_at, spouse_first_name, spouse_last_name, spouse_name, spouse_email, ` +
-  'spouse_phone, date_of_birth, spouse_date_of_birth, mailing_street, mailing_city, mailing_state, ' +
-  'mailing_zip, client_since';
+  'spouse_phone, mailing_street, mailing_city, mailing_state, mailing_zip, client_since';
 
 // Same pattern as supabase/functions/_shared/http.ts, so an id the browser accepts is
 // never refused by an edge function. src/__tests__/edge/uuidParity.test.ts pins it.
@@ -122,8 +119,6 @@ export const CONTACT_PATCH_COLUMNS = [
   'spouse_first_name',
   'spouse_last_name',
   'spouse_phone',
-  'date_of_birth',
-  'spouse_date_of_birth',
   'mailing_street',
   'mailing_city',
   'mailing_state',

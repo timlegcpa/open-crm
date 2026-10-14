@@ -1,12 +1,15 @@
 // @vitest-environment node
 import type { PGlite } from '@electric-sql/pglite';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { anon, as, count as countRows, createDb, errorOf, service, session, user } from './harness';
+import {
+  anon, as, become, becomeSuperuser, count as countRows, createDb, errorOf, service, session, user, type Principal,
+} from './harness';
 
 const OWNER = '00000000-0000-4000-8000-000000000001';
 const SYSTEM = '00000000-0000-4000-8000-000000000002';
 const CLIENT = '00000000-0000-4000-8000-000000000003';
 const MFA_OWNER = '00000000-0000-4000-8000-000000000004';
+const FILE_USER = '00000000-0000-4000-8000-000000000005';
 
 const owner = user(OWNER);
 const client = user(CLIENT, { appRole: 'admin' }); // a forged role claim grants nothing
@@ -130,6 +133,29 @@ describe('audit log is append-only', () => {
   it('refuses TRUNCATE: the service role lacks the privilege, and the owner role hits the trigger', async () => {
     expect(await errorOf(db, service, `TRUNCATE public.audit_logs`)).toMatch(/permission denied/);
     await expect(db.exec(`TRUNCATE public.audit_logs`)).rejects.toThrow(/append-only/);
+  });
+});
+
+describe('files: the MFA gate holds in every bucket', () => {
+  // A bucket whose own policy asks nothing about MFA, so only objects_mfa_gate stands
+  // between an enrolled user at aal1 and their file. Rolled back with the session.
+  const filesSeenBy = (who: Principal) =>
+    session(db, service, async (tx) => {
+      await becomeSuperuser(tx);
+      await tx.exec(`
+        INSERT INTO auth.users (id, email) VALUES ('${FILE_USER}', 'files@example.test');
+        INSERT INTO auth.mfa_factors (user_id, status) VALUES ('${FILE_USER}', 'verified');
+        INSERT INTO storage.buckets (id, name) VALUES ('own-files', 'own-files');
+        CREATE POLICY own_files_select ON storage.objects FOR SELECT TO authenticated
+          USING (bucket_id = 'own-files' AND owner_id = (SELECT auth.uid())::text);
+        INSERT INTO storage.objects (bucket_id, name, owner_id) VALUES ('own-files', 'a.pdf', '${FILE_USER}');`);
+      await become(tx, who);
+      return (await tx.query('SELECT name FROM storage.objects')).rows.length;
+    });
+
+  it('an enrolled user at aal1 sees none of its files; at aal2 it sees them', async () => {
+    expect(await filesSeenBy(user(FILE_USER))).toBe(0);
+    expect(await filesSeenBy(user(FILE_USER, { aal: 'aal2' }))).toBe(1);
   });
 });
 
