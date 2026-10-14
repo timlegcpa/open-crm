@@ -1,29 +1,21 @@
 import { createClient } from '@supabase/supabase-js';
+import { createAudit } from '../_shared/audit.ts';
+import { authorizeOwner, supabaseClients } from '../_shared/auth.ts';
 import { loadConfig } from '../_shared/config.ts';
 import { createDeleteContactHandler, type BeginResult } from './handler.ts';
 
 const config = loadConfig((name) => Deno.env.get(name));
-const server = createClient(config.supabaseUrl, config.serviceRoleKey, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
+const clients = supabaseClients(createClient, config);
+const server = clients.service;
+const auditLog = createAudit({ db: server });
 
 Deno.serve(
   createDeleteContactHandler({
     allowedOrigins: config.allowedOrigins,
 
-    async authorizeOwner(token) {
-      const { data, error } = await server.auth.getUser(token);
-      if (error || !data.user) return null;
-      // The database decides, with the caller's own token: is_owner() checks the owner
-      // row and the MFA level in the same claims PostgREST sees.
-      const asCaller = createClient(config.supabaseUrl, config.anonKey, {
-        auth: { persistSession: false, autoRefreshToken: false },
-        global: { headers: { Authorization: `Bearer ${token}` } },
-      });
-      const { data: isOwner, error: ownerErr } = await asCaller.rpc('is_owner');
-      if (ownerErr) throw ownerErr;
-      return isOwner === true ? data.user.id : null;
-    },
+    // The database decides, with the caller's own token: is_owner() checks the owner row
+    // and the MFA level in the same claims PostgREST sees.
+    authorizeOwner: (token) => authorizeOwner(clients, token),
 
     async begin(contactId) {
       const { data, error } = await server.rpc('admin_contact_delete_begin', { p_contact_id: contactId });
@@ -57,8 +49,8 @@ Deno.serve(
     },
 
     async audit(ownerId, contactId, portalUsersRemoved, orphanedUserIds) {
-      const { error } = await server.from('audit_logs').insert({
-        user_id: ownerId,
+      await auditLog.write({
+        actorId: ownerId,
         action: 'contact_deleted',
         details: {
           contact_id: contactId,
@@ -66,11 +58,6 @@ Deno.serve(
           ...(orphanedUserIds.length > 0 ? { orphaned_sign_ins: orphanedUserIds } : {}),
         },
       });
-      if (error) throw error;
-    },
-
-    log(message, detail) {
-      console.error(`[delete-contact] ${message}`, detail);
     },
   }),
 );

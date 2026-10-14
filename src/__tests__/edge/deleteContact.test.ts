@@ -10,6 +10,7 @@ import {
   type BeginResult,
   type DeleteContactDeps,
 } from '../../../supabase/functions/delete-contact/handler';
+import { CREDENTIALS, describeEdgeContract, fakeOwnerAuth, throwInternal } from './contract';
 
 const OWNER = '00000000-0000-4000-8000-000000000001';
 const SYSTEM = '00000000-0000-4000-8000-000000000002';
@@ -41,7 +42,8 @@ function deps(over: Partial<DeleteContactDeps> = {}): DeleteContactDeps & { logs
   return {
     logs,
     allowedOrigins: [ORIGIN],
-    authorizeOwner: async (token) => (token === TOKEN ? OWNER : null),
+    authorizeOwner: async (token) =>
+      token === TOKEN ? { ok: true, principal: { kind: 'owner', userId: OWNER } } : { ok: false, status: 403 },
     async begin(contactId) {
       const [row] = await asServer<BeginResult>(`SELECT * FROM public.admin_contact_delete_begin($1)`, [contactId]);
       return row;
@@ -63,7 +65,7 @@ function deps(over: Partial<DeleteContactDeps> = {}): DeleteContactDeps & { logs
         JSON.stringify({ contact_id: contactId, portal_users_removed: removed, orphaned_sign_ins: orphaned }),
       ]);
     },
-    log: (message) => logs.push(message),
+    logSink: (_level, line) => logs.push(line),
     ...over,
   };
 }
@@ -94,6 +96,16 @@ beforeEach(async () => {
       ('${CONTACT}', '${USER_B}', 'active', 'b@example.test', 'secondary');
   `);
 }, 60_000);
+
+// The shared door test, with the contract's owner credentials and the real database.
+describeEdgeContract({
+  name: 'delete-contact',
+  handler: createDeleteContactHandler(deps({ authorizeOwner: fakeOwnerAuth() })),
+  failingHandler: createDeleteContactHandler(deps({ authorizeOwner: fakeOwnerAuth(), begin: throwInternal })),
+  credentials: CREDENTIALS.owner,
+  wrongPrincipal: CREDENTIALS.client,
+  body: { kind: 'json', valid: { contact_id: CONTACT }, maxBytes: 1024 },
+});
 
 describe('delete-contact: who may call it', () => {
   it('refuses a request with no token, a non-owner, and a browser on another origin', async () => {
@@ -227,14 +239,14 @@ describe('delete-contact: the claim protocol', () => {
     const res = await call(d, request({ contact_id: CONTACT }));
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: 'The contact could not be deleted. Try again.' });
-    expect(d.logs).toContain('release failed');
+    expect(d.logs).toContainEqual(expect.stringMatching(/^\[delete-contact\] rid=\S+ release failed: release down$/));
   });
 
   it('a failed audit write does not undo a completed delete', async () => {
     const d = deps({ audit: async () => { throw new Error('audit down'); } });
     const res = await call(d, request({ contact_id: CONTACT }));
     expect(res.status).toBe(200);
-    expect(d.logs).toContain('audit failed');
+    expect(d.logs).toContainEqual(expect.stringMatching(/^\[delete-contact\] rid=\S+ audit failed: audit down$/));
   });
 
   it('removes a sign-in the final delete reports that was never destroyed', async () => {
