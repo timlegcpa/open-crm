@@ -151,7 +151,8 @@ describe('zero firm strings', () => {
       if (bad.length) offenders.push(`${rel}: ${bad.join(', ')}`);
     }
     expect(offenders).toEqual([]);
-  });
+    // Reads every file in the tree; under a parallel vitest run it outlasts the 5 s default.
+  }, 30_000);
 
   it('the README names the author only inside its Author section', () => {
     const readme = readFileSync(path.join(ROOT, 'README.md'), 'utf8').replace(/\r\n/g, '\n');
