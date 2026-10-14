@@ -1,4 +1,6 @@
 import { useState, type FormEvent } from 'react';
+import { Link } from 'react-router-dom';
+import { links } from '@/features/links';
 import { useAuth } from '@/lib/auth';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -21,7 +23,7 @@ export function SignInForm({ orgName }: { orgName: string | null }) {
       const result = await login(email.trim(), password);
       // One message for every rejection: which half was wrong is not the caller's to learn.
       if (result === 'rejected') setError('Email or password is incorrect.');
-      if (result === 'unreachable') setError('Could not reach the server. Check that the local stack is running.');
+      if (result === 'unreachable') setError('Could not reach the server. Check your connection and try again.');
     } finally {
       setBusy(false);
     }
@@ -47,6 +49,9 @@ export function SignInForm({ orgName }: { orgName: string | null }) {
           <Button type="submit" disabled={busy || !email || !password}>
             {busy ? 'Signing in...' : 'Sign in'}
           </Button>
+          <Link to={links.forgotPassword()} className="self-center text-sm text-muted-foreground underline-offset-4 hover:underline">
+            Forgot password?
+          </Link>
         </form>
       </CardContent>
     </Card>

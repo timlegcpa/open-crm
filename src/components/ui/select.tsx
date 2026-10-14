@@ -4,6 +4,14 @@ import { Check, ChevronDown, ChevronUp } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 
+/**
+ * The "nothing selected" item value. Radix refuses `<SelectItem value="">` (empty is
+ * reserved for showing the placeholder), so an optional Select offers
+ * `<SelectItem value={SELECT_NONE}>None</SelectItem>` and turns SELECT_NONE back into
+ * `null` before it reaches the database. One sentinel, so no Select reads another's.
+ */
+export const SELECT_NONE = "_none"
+
 const Select = SelectPrimitive.Root
 
 const SelectGroup = SelectPrimitive.Group

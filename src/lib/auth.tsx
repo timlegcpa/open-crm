@@ -10,8 +10,15 @@ import { getSupabase } from '@/lib/supabase';
  */
 export type MfaGate = 'checking' | 'required' | 'satisfied';
 
-/** Whether the signed-in account is this install's owner, as the database decides it. */
-export type OwnerState = 'checking' | 'owner' | 'not-owner' | 'error';
+/**
+ * Who the signed-in account is, as the DATABASE decides it (never a claim in the token):
+ * 'owner'  — is_owner() is true: the owner app
+ * 'client' — get_client_contact_id() names a contact (an active portal account): the portal
+ * 'none'   — signed in, but neither: no access
+ * 'error'  — the check could not be answered: fail closed, no access
+ * 'checking' — not answered yet: render nothing protected
+ */
+export type Principal = 'checking' | 'owner' | 'client' | 'none' | 'error';
 
 /** 'unreachable' means the Auth server never answered, not that the password was wrong. */
 export type LoginResult = 'ok' | 'rejected' | 'unreachable';
@@ -20,7 +27,9 @@ interface AuthContextType {
   session: Session | null;
   isLoadingAuth: boolean;
   mfaGate: MfaGate;
-  ownerState: OwnerState;
+  principal: Principal;
+  /** The contact the signed-in client is, when `principal` is 'client'; otherwise null. */
+  clientContactId: string | null;
   login: (email: string, password: string) => Promise<LoginResult>;
   completeMfa: () => Promise<void>;
   logout: () => Promise<void>;
@@ -44,19 +53,34 @@ async function evaluateMfaGate(session: Session | null): Promise<MfaGate> {
   }
 }
 
-async function checkOwner(): Promise<OwnerState> {
+interface PrincipalResult {
+  principal: Exclude<Principal, 'checking'>;
+  clientContactId: string | null;
+}
+
+/**
+ * The owner check first; only an account that is not the owner is asked whether it is a
+ * client, so an owner session never calls the client RPC. Any failure is 'error'.
+ */
+async function resolvePrincipal(): Promise<PrincipalResult> {
   try {
-    const { data, error } = await getSupabase().rpc('is_owner');
-    if (error) return 'error';
-    return data === true ? 'owner' : 'not-owner';
+    const owner = await getSupabase().rpc('is_owner');
+    if (owner.error) return { principal: 'error', clientContactId: null };
+    if (owner.data === true) return { principal: 'owner', clientContactId: null };
+    const client = await getSupabase().rpc('get_client_contact_id');
+    if (client.error) return { principal: 'error', clientContactId: null };
+    return typeof client.data === 'string' && client.data !== ''
+      ? { principal: 'client', clientContactId: client.data }
+      : { principal: 'none', clientContactId: null };
   } catch {
-    return 'error';
+    return { principal: 'error', clientContactId: null };
   }
 }
 
 /**
  * Never throws and never blocks: a broken audit write must not lock the owner out
  * or strand them signed in. A failure is logged to the console so it is visible.
+ * Owner sessions only: the audit table accepts rows from the owner alone.
  */
 async function recordAudit(userId: string, action: 'owner_login' | 'owner_logout'): Promise<void> {
   try {
@@ -71,7 +95,8 @@ async function recordAudit(userId: string, action: 'owner_login' | 'owner_logout
   }
 }
 
-const UNRESOLVED = { userId: null, gate: 'checking', state: 'checking' } as const;
+const UNRESOLVED_GATE = { userId: null, gate: 'checking' } as const;
+const UNRESOLVED_PRINCIPAL = { userId: null, principal: 'checking', clientContactId: null } as const;
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
@@ -82,8 +107,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // when that user is still the current one, so a session change re-gates on the
   // same render that exposes it instead of one frame later. Both are cleared on
   // sign-out, so signing back in as the same user never reuses an old answer.
-  const [mfaEval, setMfaEval] = useState<{ userId: string | null; gate: MfaGate }>(UNRESOLVED);
-  const [ownerEval, setOwnerEval] = useState<{ userId: string | null; state: OwnerState }>(UNRESOLVED);
+  const [mfaEval, setMfaEval] = useState<{ userId: string | null; gate: MfaGate }>(UNRESOLVED_GATE);
+  const [principalEval, setPrincipalEval] = useState<{
+    userId: string | null;
+    principal: Principal;
+    clientContactId: string | null;
+  }>(UNRESOLVED_PRINCIPAL);
   // A sign-in that still owes its second factor is not a completed sign-in, so
   // its audit row waits until the owner check passes.
   const loginAuditPending = useRef(false);
@@ -98,8 +127,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSession(next);
       if (event === 'SIGNED_OUT') {
         loginAuditPending.current = false;
-        setMfaEval(UNRESOLVED);
-        setOwnerEval(UNRESOLVED);
+        setMfaEval(UNRESOLVED_GATE);
+        setPrincipalEval(UNRESOLVED_PRINCIPAL);
       }
     });
     return () => subscription.unsubscribe();
@@ -126,10 +155,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!currentUserId || mfaGate !== 'satisfied') return;
     let cancelled = false;
     void (async () => {
-      const state = await checkOwner();
+      const result = await resolvePrincipal();
       if (cancelled) return;
-      setOwnerEval({ userId: currentUserId, state });
-      if (state === 'owner' && loginAuditPending.current) {
+      setPrincipalEval({ userId: currentUserId, ...result });
+      if (result.principal === 'owner' && loginAuditPending.current) {
         loginAuditPending.current = false;
         void recordAudit(currentUserId, 'owner_login');
       }
@@ -137,7 +166,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => { cancelled = true; };
   }, [currentUserId, mfaGate]);
 
-  const ownerState: OwnerState = ownerEval.userId === currentUserId ? ownerEval.state : 'checking';
+  const current = principalEval.userId === currentUserId ? principalEval : UNRESOLVED_PRINCIPAL;
+  const principal: Principal = current.principal;
 
   const login = async (email: string, password: string): Promise<LoginResult> => {
     // Armed before the call: the SIGNED_IN event can start the owner check before
@@ -168,14 +198,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = async () => {
     // Logged before signing out, while the token is still valid. A session that
     // never finished signing in gets no sign-out row either.
-    if (currentUserId && ownerState === 'owner' && !loginAuditPending.current) {
+    if (currentUserId && principal === 'owner' && !loginAuditPending.current) {
       await recordAudit(currentUserId, 'owner_logout');
     }
     await getSupabase().auth.signOut();
   };
 
   return (
-    <AuthContext.Provider value={{ session, isLoadingAuth, mfaGate, ownerState, login, completeMfa, logout }}>
+    <AuthContext.Provider
+      value={{
+        session,
+        isLoadingAuth,
+        mfaGate,
+        principal,
+        clientContactId: current.clientContactId,
+        login,
+        completeMfa,
+        logout,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
