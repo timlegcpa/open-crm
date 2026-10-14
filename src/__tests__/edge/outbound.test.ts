@@ -295,6 +295,19 @@ describe('Twilio adapter', () => {
     const result = await createOutbound({ env: TWILIO, db: noOutbox, fetch: f.fn, log }).sendSms({ to: '+15555550123', body: 'x' });
     expect(result).toEqual({ status: 'failed', channel: 'twilio', reason: 'rejected', httpStatus: 400 });
     expect(lines.join('\n')).not.toContain('5555550123');
+    expect(lines.join('\n')).toContain('code=21211');
+  });
+
+  it('a provider message that echoes a name or an address is never logged, JSON or not', async () => {
+    for (const reply of [
+      () => new Response('Recipient Ada Example at 12 Elm Street is invalid', { status: 400 }),
+      jsonReply(422, { name: 'validation_error', message: 'Recipient Ada Example at 12 Elm Street is invalid' }),
+    ]) {
+      const { lines, log } = collectLog();
+      await createOutbound({ env: RESEND, db: noOutbox, fetch: fakeFetch(reply).fn, log }).sendEmail(EMAIL);
+      expect(lines.join('\n')).not.toMatch(/Ada|Elm Street/);
+      expect(lines.join('\n')).toMatch(/status=4\d\d/);
+    }
   });
 });
 

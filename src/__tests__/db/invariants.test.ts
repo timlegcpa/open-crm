@@ -29,10 +29,43 @@ const ANON_EXECUTE_ALLOWED = ['public.get_org_branding()'];
  * An entry excuses only a reference to get_client_contact_id() or auth.uid(): the
  * policy must still require is_owner() at its top level, or it is reported anyway.
  */
+/**
+ * SECURITY DEFINER functions a signed-in session may call that write a table without
+ * trg_impersonation_read_only, each with its reason. An entry must open with the owner
+ * refusal (IF NOT public.is_owner() THEN RAISE) before any write.
+ */
+const DEFINER_WRITE_EXEMPT: Record<string, string> = {
+  'public.retry_job(uuid)': 'owner only: a View-as-client session is a client session, which never passes is_owner()',
+};
+
 const IMPERSONATION_EXEMPT: Record<string, string> = {
   'audit_logs.audit_logs_owner_insert':
     'is_owner() gates the insert; auth.uid() only pins user_id to the writer, and a View-as-client session is a client session, which never passes is_owner()',
 };
+
+/** SQL: whether the table `rel` carries the View-as-client statement trigger, whole. */
+const READ_ONLY_GUARDED = (rel: string) => `EXISTS (
+  SELECT 1 FROM pg_trigger tg
+  WHERE tg.tgrelid = ${rel}
+    AND tg.tgname = 'trg_impersonation_read_only'
+    AND tg.tgfoid = 'public.enforce_impersonation_read_only()'::regprocedure
+    AND (tg.tgtype & 1) = 0            -- FOR EACH STATEMENT
+    AND (tg.tgtype & 2) = 2            -- BEFORE
+    AND (tg.tgtype & 28) = 28          -- INSERT (4), DELETE (8) and UPDATE (16)
+    AND tg.tgenabled IN ('O', 'A')
+    AND tg.tgqual IS NULL
+    AND tg.tgattr = ''::int2vector)`;
+
+/**
+ * The clauses Postgres actually applies for a policy command, an omitted one read as
+ * true: INSERT checks WITH CHECK, DELETE and SELECT check USING, and UPDATE or ALL check
+ * both, an omitted WITH CHECK falling back to USING.
+ */
+function appliedClauses(cmd: string, qual: string | null, chk: string | null): string[] {
+  if (cmd === 'a') return [chk ?? 'true'];
+  if (cmd === 'd' || cmd === 'r') return [qual ?? 'true'];
+  return [qual ?? 'true', chk ?? qual ?? 'true'];
+}
 
 // ---------------------------------------------------------------------------
 // Reading rendered policy expressions. Every check runs with search_path = '', so
@@ -242,21 +275,10 @@ const CHECKS: Record<string, Check> = {
    * does not require is_owner() at its top level.
    */
   async 'View as client cannot write'(tx) {
-    const found = await rows<{ t: string; name: string; qual: string | null; chk: string | null; guarded: boolean }>(tx, `
-      SELECT c.relname AS t, p.polname AS name,
+    const found = await rows<{ t: string; name: string; cmd: string; qual: string | null; chk: string | null; guarded: boolean }>(tx, `
+      SELECT c.relname AS t, p.polname AS name, p.polcmd AS cmd,
              pg_get_expr(p.polqual, p.polrelid) AS qual, pg_get_expr(p.polwithcheck, p.polrelid) AS chk,
-             EXISTS (
-               SELECT 1 FROM pg_trigger tg
-               WHERE tg.tgrelid = c.oid
-                 AND tg.tgname = 'trg_impersonation_read_only'
-                 AND tg.tgfoid = 'public.enforce_impersonation_read_only()'::regprocedure
-                 AND (tg.tgtype & 1) = 0            -- FOR EACH STATEMENT
-                 AND (tg.tgtype & 2) = 2            -- BEFORE
-                 AND (tg.tgtype & 28) = 28          -- INSERT (4), DELETE (8) and UPDATE (16)
-                 AND tg.tgenabled IN ('O', 'A')
-                 AND tg.tgqual IS NULL
-                 AND tg.tgattr = ''::int2vector
-             ) AS guarded
+             ${READ_ONLY_GUARDED('c.oid')} AS guarded
       FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
       WHERE c.relnamespace = 'public'::regnamespace AND p.polpermissive AND p.polcmd IN ('a', 'w', 'd', '*')
         AND p.polroles && ARRAY['authenticated'::regrole::oid, 0::oid]
@@ -264,7 +286,7 @@ const CHECKS: Record<string, Check> = {
     const out: string[] = [];
     const flagged = new Set<string>();
     for (const r of found) {
-      const exprs = [r.qual, r.chk].filter((e): e is string => e !== null);
+      const exprs = appliedClauses(r.cmd, r.qual, r.chk);
       if (!exprs.some((e) => CLIENT_REFERENCE.test(e) || !ownerGated(e))) continue;
       const key = `${r.t}.${r.name}`;
       flagged.add(key);
@@ -276,6 +298,42 @@ const CHECKS: Record<string, Check> = {
     }
     for (const key of Object.keys(IMPERSONATION_EXEMPT)) {
       if (!flagged.has(key)) out.push(`${key}: allowlist entry matches no write policy; remove it`);
+    }
+    return out;
+  },
+
+  /**
+   * 8b. Nor through a SECURITY DEFINER function, which runs past RLS: every table such a
+   * function writes, when a signed-in session may call it, carries trg_impersonation_read_only,
+   * unless the function is allowlisted and refuses everyone but the owner first.
+   */
+  async 'View as client cannot write through a definer'(tx) {
+    const found = await rows<{ fn: string; src: string }>(tx, `
+      SELECT p.oid::regprocedure::text AS fn, p.prosrc AS src FROM pg_proc p
+      WHERE p.pronamespace = 'public'::regnamespace AND p.prosecdef
+        AND p.prorettype <> 'trigger'::regtype
+        AND has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      ORDER BY 1`);
+    const guarded = new Set((await rows<{ t: string }>(tx, `
+      SELECT c.relname AS t FROM pg_class c
+      WHERE c.relnamespace = 'public'::regnamespace AND ${READ_ONLY_GUARDED('c.oid')}`)).map((r) => r.t));
+    const out: string[] = [];
+    const writers = new Set<string>();
+    for (const r of found) {
+      const writes = [...r.src.matchAll(/\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+public\.(\w+)/gi)];
+      if (writes.length === 0) continue;
+      writers.add(r.fn);
+      if (r.fn in DEFINER_WRITE_EXEMPT) {
+        const refusal = r.src.search(/IF\s+NOT\s+public\.is_owner\(\)\s+THEN\s+RAISE/i);
+        if (refusal < 0 || refusal > (writes[0].index ?? 0)) out.push(`${r.fn}: allowlisted, but does not refuse non-owners before it writes`);
+        continue;
+      }
+      for (const t of new Set(writes.map((w) => w[1]))) {
+        if (!guarded.has(t)) out.push(`${r.fn}: writes ${t}, which has no trg_impersonation_read_only statement trigger`);
+      }
+    }
+    for (const fn of Object.keys(DEFINER_WRITE_EXEMPT)) {
+      if (!writers.has(fn)) out.push(`${fn}: allowlist entry matches no definer that writes; remove it`);
     }
     return out;
   },
@@ -298,8 +356,8 @@ const CHECKS: Record<string, Check> = {
    * cannot reach another bucket's objects.)
    */
   async 'storage policies name their bucket'(tx) {
-    const found = await rows<{ name: string; qual: string | null; chk: string | null }>(tx, `
-      SELECT p.polname AS name, pg_get_expr(p.polqual, p.polrelid) AS qual, pg_get_expr(p.polwithcheck, p.polrelid) AS chk
+    const found = await rows<{ name: string; cmd: string; qual: string | null; chk: string | null }>(tx, `
+      SELECT p.polname AS name, p.polcmd AS cmd, pg_get_expr(p.polqual, p.polrelid) AS qual, pg_get_expr(p.polwithcheck, p.polrelid) AS chk
       FROM pg_policy p
       WHERE p.polrelid = 'storage.objects'::regclass AND p.polpermissive
       ORDER BY 1`);
@@ -307,8 +365,7 @@ const CHECKS: Record<string, Check> = {
     for (const r of found) {
       const buckets = new Set<string>();
       let unnamed = false;
-      for (const e of [r.qual, r.chk]) {
-        if (e === null) continue;
+      for (const e of appliedClauses(r.cmd, r.qual, r.chk)) {
         const named = conjuncts(e).map(bucketOf).filter((b): b is string => b !== null);
         if (named.length === 0) unnamed = true;
         named.forEach((b) => buckets.add(b));
@@ -496,6 +553,29 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
   ['View as client cannot write', 'an allowlist entry whose policy is gone',
     'DROP POLICY audit_logs_owner_insert ON public.audit_logs;', /^audit_logs\.audit_logs_owner_insert: allowlist entry matches no write policy/],
 
+  ['View as client cannot write', 'an insert policy with no WITH CHECK (Postgres reads it as true)',
+    `CREATE TABLE public.mut_notes (id int); ALTER TABLE public.mut_notes ENABLE ROW LEVEL SECURITY;
+     CREATE POLICY mut_notes_insert ON public.mut_notes FOR INSERT TO authenticated;`,
+    /^mut_notes: client-writable through mut_notes_insert, without/],
+  ['View as client cannot write', 'a delete policy with no USING',
+    `CREATE TABLE public.mut_notes (id int); ALTER TABLE public.mut_notes ENABLE ROW LEVEL SECURITY;
+     CREATE POLICY mut_notes_delete ON public.mut_notes FOR DELETE TO authenticated;`,
+    /^mut_notes: client-writable through mut_notes_delete, without/],
+
+  ['View as client cannot write through a definer', 'a client RPC that writes an owner-only table',
+    `CREATE TABLE public.mut_notes (id int, contact_id uuid); ALTER TABLE public.mut_notes ENABLE ROW LEVEL SECURITY;
+     CREATE FUNCTION public.mut_add_note() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = ''
+       AS 'INSERT INTO public.mut_notes (id, contact_id) VALUES (1, public.get_client_contact_id())';
+     REVOKE ALL ON FUNCTION public.mut_add_note() FROM PUBLIC, anon;
+     GRANT EXECUTE ON FUNCTION public.mut_add_note() TO authenticated;`,
+    /^public\.mut_add_note\(\): writes mut_notes, which has no trg_impersonation_read_only/],
+  ['View as client cannot write through a definer', 'the allowlisted definer loses its owner refusal',
+    `CREATE OR REPLACE FUNCTION public.retry_job(p_job_id uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+       AS $$ BEGIN UPDATE public.jobs SET attempts = 0 WHERE id = p_job_id; END; $$;`,
+    /^public\.retry_job\(uuid\): allowlisted, but does not refuse non-owners before it writes$/],
+  ['View as client cannot write through a definer', 'an allowlist entry whose definer is gone',
+    'DROP FUNCTION public.retry_job(uuid);', /^public\.retry_job\(uuid\): allowlist entry matches no definer/],
+
   ['realtime tables have row-level security', 'a published table without RLS',
     'CREATE TABLE public.mut_open (id int); ALTER PUBLICATION supabase_realtime ADD TABLE public.mut_open;', /^public\.mut_open: published to supabase_realtime/],
 
@@ -507,6 +587,8 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
     `CREATE POLICY mut_files ON storage.objects FOR UPDATE TO authenticated USING (bucket_id = 'a') WITH CHECK (bucket_id = 'b');`, /^storage\.objects\.mut_files: names more than one bucket \(a, b\)$/],
   ['storage policies name their bucket', 'an insert whose WITH CHECK names no bucket',
     `CREATE POLICY mut_files ON storage.objects FOR INSERT TO authenticated WITH CHECK ((SELECT public.is_owner()));`, /^storage\.objects\.mut_files: a clause does not require bucket_id/],
+  ['storage policies name their bucket', 'an insert with no WITH CHECK at all (Postgres reads it as true)',
+    `CREATE POLICY mut_files ON storage.objects FOR INSERT TO authenticated;`, /^storage\.objects\.mut_files: a clause does not require bucket_id/],
 
   ['View as client cannot write files', 'the upload refusal dropped',
     'DROP POLICY objects_view_as_client_insert ON storage.objects;', /^storage\.objects: no restrictive INSERT policy/],

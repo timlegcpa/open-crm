@@ -50,15 +50,32 @@ export function isAllowedUploadMime(mime: string): mime is UploadMimeType {
   return (ALLOWED_UPLOAD_MIME_TYPES as readonly string[]).includes(mime);
 }
 
+// Text has no signature, so its check is the content: valid UTF-8 with no control
+// character other than tab, line feed, form feed and carriage return.
+const TEXT_MIME_TYPES: ReadonlySet<string> = new Set(['text/csv', 'text/plain']);
+// deno-lint-ignore no-control-regex -- matching control characters is the point
+const BINARY_CONTROL = /[\u0000-\u0008\u000b\u000e-\u001f\u007f]/;
+
+function isPlainText(view: Uint8Array): boolean {
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(view);
+  } catch {
+    return false;
+  }
+  return !BINARY_CONTROL.test(text);
+}
+
 /**
- * True when `mime` is on the allowlist AND the bytes start with its signature. A type
- * with no fixed signature (CSV, plain text) passes on the allowlist alone; a type that
- * is not on the list never passes, so a caller cannot forget the allowlist check.
+ * True when `mime` is on the allowlist AND the bytes are what it claims: the type's
+ * signature, or for CSV and plain text, text. A type that is not on the list never
+ * passes, so a caller cannot forget the allowlist check.
  */
 export function verifyMagicBytes(mime: string, bytes: Uint8Array | ArrayBuffer): boolean {
   if (!isAllowedUploadMime(mime)) return false;
-  const signatures = MAGIC_BYTES[mime];
-  if (!signatures) return true;
   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (TEXT_MIME_TYPES.has(mime)) return isPlainText(view);
+  const signatures = MAGIC_BYTES[mime];
+  if (!signatures) return false;
   return signatures.some((sig) => view.length >= sig.length && sig.every((byte, i) => byte === null || view[i] === byte));
 }
