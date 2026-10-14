@@ -1273,8 +1273,14 @@ CREATE POLICY client_activity_log_insert ON public.client_activity_log
       AND user_id = (SELECT auth.uid())
       AND pg_column_size(details) <= 1024
       AND (
-        (action = 'document_delete' AND (details - ARRAY['document_id', 'filename', 'actor_role']) = '{}'::jsonb)
-        OR (action = 'message_read' AND (details - ARRAY['count', 'actor_role']) = '{}'::jsonb)
+        (action = 'document_delete' AND (details - ARRAY['document_id', 'filename', 'actor_role']) = '{}'::jsonb
+          AND (details->'document_id' IS NULL
+               OR (jsonb_typeof(details->'document_id') = 'string'
+                   AND details->>'document_id' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
+          AND (details->'filename' IS NULL
+               OR (jsonb_typeof(details->'filename') = 'string' AND char_length(details->>'filename') <= 255)))
+        OR (action = 'message_read' AND (details - ARRAY['count', 'actor_role']) = '{}'::jsonb
+          AND (details->'count' IS NULL OR jsonb_typeof(details->'count') = 'number'))
       )
     )
   );

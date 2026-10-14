@@ -317,38 +317,53 @@ const CHECKS: Record<string, Check> = {
     const byName = new Map<string, string[]>();
     for (const r of all) byName.set(r.name, [...(byName.get(r.name) ?? []), r.src]);
     // A definer's own body plus every public function it reaches: they all run as its owner.
+    // Comments out, so a keyword split by one (INSERT /* */ INTO) still reads as a write.
+    const uncomment = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
+    // Schemas whose functions only read (auth.uid()) or compute; a call anywhere else is not followed.
+    const FOLLOWED_ELSEWHERE = new Set(['pg_catalog', 'auth', 'extensions']);
     const reach = (src: string) => {
       const seen = new Set<string>();
-      const bodies = [src];
+      const bodies = [uncomment(src)];
+      const foreign = new Set<string>();
       for (let i = 0; i < bodies.length; i++) {
-        // public.f(, "public"."f"(, public . f ( ...: a quoted name keeps its case, a bare one folds.
-        for (const [, quoted, bare] of bodies[i].matchAll(/"?\bpublic"?\s*\.\s*(?:"([^"]+)"|(\w+))\s*\(/gi)) {
-          const name = quoted ?? bare.toLowerCase();
+        // schema.f(, "schema"."f"(, schema . f ( ...: a quoted name keeps its case, a bare one folds.
+        for (const [, qs, bs, qf, bf] of bodies[i].matchAll(/(?:"([^"]+)"|\b(\w+))\s*\.\s*(?:"([^"]+)"|(\w+))\s*\(/g)) {
+          const schema = qs ?? bs.toLowerCase();
+          const name = qf ?? bf.toLowerCase();
+          if (schema !== 'public') {
+            if (!FOLLOWED_ELSEWHERE.has(schema)) foreign.add(`${schema}.${name}`);
+            continue;
+          }
           if (seen.has(name) || !byName.has(name)) continue;
           seen.add(name);
-          bodies.push(...byName.get(name)!);
+          bodies.push(...byName.get(name)!.map(uncomment));
         }
       }
-      return bodies.join('\n');
+      return { body: bodies.join('\n'), foreign };
     };
-    const WRITE = /\b(?:INSERT\s+INTO|UPDATE(?:\s+ONLY)?|DELETE\s+FROM(?:\s+ONLY)?|MERGE\s+INTO)\s+("?\w+"?)\s*\.\s*("?\w+"?)/gi;
+    const WRITE = /\b(?:INSERT\s+INTO|UPDATE(?:\s+ONLY)?|DELETE\s+FROM(?:\s+ONLY)?|MERGE\s+INTO|TRUNCATE(?:\s+TABLE)?(?:\s+ONLY)?)\s+("?\w+"?)\s*\.\s*("?\w+"?)/gi;
     const out: string[] = [];
     const writers = new Set<string>();
     for (const r of all.filter((f) => f.definer && f.callable)) {
-      const body = reach(r.src);
+      const { body, foreign } = reach(r.src);
       const writes = [...body.matchAll(WRITE)];
       // Dynamic SQL: what it writes cannot be read from the source.
       const dynamic = /\bEXECUTE\s+(?!FUNCTION\b)/i.test(body);
-      if (writes.length === 0 && !dynamic) continue;
+      if (writes.length === 0 && !dynamic && foreign.size === 0) continue;
       writers.add(r.fn);
       if (Object.hasOwn(DEFINER_WRITE_EXEMPT, r.fn)) {
-        // The refusal is the body's first statement, and no declaration calls into public
-        // before it (an initializer runs first): nothing can write, or return, ahead of it.
-        const head = /^\s*(?:DECLARE([\s\S]*?))?BEGIN\s+IF\s+NOT\s+public\.is_owner\(\)\s+THEN\s+RAISE\b/i.exec(r.src);
-        if (!head || /public\s*\./i.test(head[1] ?? '')) out.push(`${r.fn}: allowlisted, but does not refuse non-owners before it writes`);
+        // The refusal is the body's first statement and stops it (RAISE EXCEPTION, or a bare
+        // RAISE '...'; never NOTICE), no handler catches it, and no declaration calls into
+        // public before it (an initializer runs first): nothing writes, or returns, ahead of it.
+        const src = uncomment(r.src);
+        const head = /^\s*(?:DECLARE([\s\S]*?))?BEGIN\s+IF\s+NOT\s+public\.is_owner\(\)\s+THEN\s+RAISE\s+(?:EXCEPTION\b|')/i.exec(src);
+        if (!head || /public\s*\./i.test(head[1] ?? '') || /\bEXCEPTION\s+WHEN\b/i.test(src)) {
+          out.push(`${r.fn}: allowlisted, but does not refuse non-owners before it writes`);
+        }
         continue;
       }
       if (dynamic) out.push(`${r.fn}: runs dynamic SQL, so what it writes cannot be checked`);
+      for (const f of foreign) out.push(`${r.fn}: calls ${f}, outside public, which the check cannot follow`);
       const targets = new Set(writes.map(([, schema, table]) => `${schema.replace(/"/g, '')}.${table.replace(/"/g, '')}`));
       for (const target of targets) {
         const [s, t] = target.split('.');
@@ -641,6 +656,32 @@ const MUTATIONS: Array<[check: string, what: string, sql: string, expected: RegE
      CREATE OR REPLACE FUNCTION public.retry_job(p_job_id uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
        AS $$ BEGIN PERFORM public.mut_helper(); RETURN; IF NOT public.is_owner() THEN RAISE EXCEPTION 'denied'; END IF; END; $$;`,
     /^public\.retry_job\(uuid\): allowlisted, but does not refuse non-owners before it writes$/],
+  ['View as client cannot write through a definer', 'the allowlisted refusal only raises a notice',
+    `CREATE OR REPLACE FUNCTION public.retry_job(p_job_id uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+       AS $$ BEGIN IF NOT public.is_owner() THEN RAISE NOTICE 'not the owner'; END IF; UPDATE public.jobs SET attempts = 0 WHERE id = p_job_id; END; $$;`,
+    /^public\.retry_job\(uuid\): allowlisted, but does not refuse non-owners before it writes$/],
+  ['View as client cannot write through a definer', 'the allowlisted refusal caught by a handler',
+    `CREATE OR REPLACE FUNCTION public.retry_job(p_job_id uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+       AS $$ BEGIN IF NOT public.is_owner() THEN RAISE EXCEPTION 'denied'; END IF; UPDATE public.jobs SET attempts = 0 WHERE id = p_job_id;
+       EXCEPTION WHEN OTHERS THEN UPDATE public.jobs SET attempts = 0 WHERE id = p_job_id; END; $$;`,
+    /^public\.retry_job\(uuid\): allowlisted, but does not refuse non-owners before it writes$/],
+  ['View as client cannot write through a definer', 'a truncate',
+    `CREATE TABLE public.mut_notes (id int); ALTER TABLE public.mut_notes ENABLE ROW LEVEL SECURITY;
+     CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = '' AS 'TRUNCATE TABLE public.mut_notes';
+     REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
+    /^public\.mut_rpc\(\): writes mut_notes, which has no trg_impersonation_read_only/],
+  ['View as client cannot write through a definer', 'a write split by a comment',
+    `CREATE TABLE public.mut_notes (id int); ALTER TABLE public.mut_notes ENABLE ROW LEVEL SECURITY;
+     CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path = '' AS 'INSERT /* x */ INTO public.mut_notes VALUES (1)';
+     REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
+    /^public\.mut_rpc\(\): writes mut_notes, which has no trg_impersonation_read_only/],
+  ['View as client cannot write through a definer', 'a call into another schema',
+    `CREATE SCHEMA mut_private;
+     CREATE FUNCTION mut_private.helper() RETURNS void LANGUAGE sql SET search_path = '' AS 'SELECT 1';
+     CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
+       AS $$ BEGIN PERFORM mut_private.helper(); END; $$;
+     REVOKE ALL ON FUNCTION public.mut_rpc() FROM PUBLIC, anon; GRANT EXECUTE ON FUNCTION public.mut_rpc() TO authenticated;`,
+    /^public\.mut_rpc\(\): calls mut_private\.helper, outside public/],
   ['View as client cannot write through a definer', 'dynamic SQL',
     `CREATE FUNCTION public.mut_rpc() RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = ''
        AS $$ BEGIN EXECUTE format('DELETE FROM %I.%I', 'public', 'contacts'); END; $$;

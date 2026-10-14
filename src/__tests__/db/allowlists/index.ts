@@ -12,8 +12,17 @@ export const domains: Record<string, DomainAllowlist> = Object.fromEntries(
 
 const all = Object.values(domains);
 const list = (pick: (d: DomainAllowlist) => string[] | undefined) => [...new Set(all.flatMap((d) => pick(d) ?? []))].sort();
-const record = (pick: (d: DomainAllowlist) => Record<string, string> | undefined) =>
-  Object.assign({}, ...all.map((d) => pick(d) ?? {})) as Record<string, string>;
+// One reason per exemption: a second file naming the same key is an error, never a silent overwrite.
+const record = (pick: (d: DomainAllowlist) => Record<string, string> | undefined) => {
+  const out: Record<string, string> = {};
+  for (const [file, d] of Object.entries(domains)) {
+    for (const [key, why] of Object.entries(pick(d) ?? {})) {
+      if (Object.hasOwn(out, key)) throw new Error(`allowlists/${file}.ts: ${key} is already exempted by another domain's file`);
+      out[key] = why;
+    }
+  }
+  return out;
+};
 
 export const ANON_CALLABLE = list((d) => d.anonCallable);
 export const AUTHENTICATED_CALLABLE = list((d) => d.authenticatedCallable);

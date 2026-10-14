@@ -341,8 +341,12 @@ describe('portal activity', () => {
       errorOf(db, clientA, `INSERT INTO public.client_activity_log (contact_id, user_id, action, details)
         VALUES ('${CONTACT_A}', '${USER_A}', '${action}', '${details}')`);
     expect(await insert('message_read', '{"count":2}')).toBeNull();
-    expect(await insert('document_delete', '{"document_id":"d1","filename":"a.pdf"}')).toBeNull();
+    expect(await insert('document_delete', '{"document_id":"3f2c1d4e-5b6a-4c7d-8e9f-0a1b2c3d4e5f","filename":"a.pdf"}')).toBeNull();
     expect(await insert('message_read', '{"count":2,"note":"the owner said yes"}')).toMatch(/row-level security/);
+    // The allowed keys hold their own kind of value, not free text.
+    expect(await insert('message_read', '{"count":"The owner approved the refund"}')).toMatch(/row-level security/);
+    expect(await insert('document_delete', '{"document_id":"the owner said yes"}')).toMatch(/row-level security/);
+    expect(await insert('document_delete', `{"filename":"${'y'.repeat(300)}"}`)).toMatch(/row-level security/);
     expect(await insert('document_delete', '{"count":2}')).toMatch(/row-level security/);
     expect(await insert('document_delete', `{"filename":"${'y'.repeat(2000)}"}`)).toMatch(/row-level security/);
   });
