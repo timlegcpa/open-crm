@@ -158,10 +158,13 @@ describe('an unbound row (the bind never happened)', () => {
     expect(await record(open, asOwner)).toBe(1);
   });
 
-  it("keeps restricting for the sign-in link's hour after it started, then stops", async () => {
+  it("keeps restricting until a token issued in its life has expired, then stops", async () => {
     const own = asClient(clientId, { sessionId: OWN_DEVICE });
-    await expectReadOnly(complete({ sessionId: null, startedAgo: '30 minutes', endedAgo: '20 minutes' }, own));
-    expect(await complete({ sessionId: null, startedAgo: '2 hours', endedAgo: '90 minutes' }, own)).toBe(1);
+    // Closed inside the sign-in link's hour: restricted until an hour after the link's hour.
+    await expectReadOnly(complete({ sessionId: null, startedAgo: '90 minutes', endedAgo: '80 minutes' }, own));
+    // Closed after the link's hour: a token refreshed just before the close still has its hour.
+    await expectReadOnly(complete({ sessionId: null, startedAgo: '3 hours', endedAgo: '30 minutes' }, own));
+    expect(await complete({ sessionId: null, startedAgo: '3 hours', endedAgo: '70 minutes' }, own)).toBe(1);
   });
 });
 
@@ -332,13 +335,13 @@ describe('auto_end_stale_impersonation_sessions', () => {
       await become(tx, asServer);
       const closed = (await tx.query<{ n: number }>('SELECT public.auto_end_stale_impersonation_sessions() AS n')).rows[0].n;
       const rows = (await tx.query<{ id: string; auto_ended: boolean; length: string | null }>(
-        `SELECT id, auto_ended, (ended_at - started_at)::text AS length FROM public.impersonation_sessions`)).rows;
+        `SELECT id, auto_ended, CASE WHEN ended_at = now() THEN 'now' ELSE (ended_at - started_at)::text END AS length FROM public.impersonation_sessions`)).rows;
       await becomeSuperuser(tx);
       const byId = Object.fromEntries(rows.map((r) => [r.id, { auto: r.auto_ended, length: r.length }]));
       return { closed, stale: byId[stale], fresh: byId[fresh], ended: byId[ended], left: await sessionsLeft(tx), own };
     });
     expect(out.closed).toBe(1);
-    expect(out.stale).toEqual({ auto: true, length: '08:00:00' });
+    expect(out.stale).toEqual({ auto: true, length: 'now' });
     expect(out.fresh).toEqual({ auto: false, length: null });
     expect(out.ended).toEqual({ auto: false, length: '01:00:00' });
     expect(out.left).toEqual([out.own]);

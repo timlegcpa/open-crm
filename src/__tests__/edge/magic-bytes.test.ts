@@ -65,9 +65,20 @@ describe('verifyMagicBytes', () => {
     expect(verifyMagicBytes('image/webp', Uint8Array.from([...ascii('RIFF'), 0x24, 0x10, 0x00, 0x00, ...ascii('WAVE')]))).toBe(false);
   });
 
-  it('accepts CSV and plain text on the allowlist alone, since they have no signature', () => {
-    expect(verifyMagicBytes('text/csv', ascii('name,amount\n'))).toBe(true);
+  it('accepts CSV and plain text when the bytes are text: UTF-8, a BOM, tabs and line ends', () => {
+    expect(verifyMagicBytes('text/csv', ascii('name,amount\r\nAda,10\n'))).toBe(true);
     expect(verifyMagicBytes('text/plain', new Uint8Array(0))).toBe(true);
+    expect(verifyMagicBytes('text/plain', Uint8Array.from([0xef, 0xbb, 0xbf, ...new TextEncoder().encode('caf\u00e9\tna\u00efve\f')]))).toBe(true);
+  });
+
+  it('refuses CSV and plain text whose bytes are binary or not UTF-8', () => {
+    const exe = Uint8Array.from([0x4d, 0x5a, 0x00, 0xff, 0x00, 0xfe, 0x00, 0x80]);
+    for (const mime of ['text/csv', 'text/plain']) {
+      expect(verifyMagicBytes(mime, exe)).toBe(false);
+      expect(verifyMagicBytes(mime, Uint8Array.from([0x61, 0x00, 0x62]))).toBe(false); // NUL
+      expect(verifyMagicBytes(mime, Uint8Array.from([0x61, 0xc3]))).toBe(false); // truncated UTF-8
+      expect(verifyMagicBytes(mime, Uint8Array.from([0x61, 0x1b, 0x5b]))).toBe(false); // escape
+    }
   });
 
   it('refuses every type that is not on the allowlist, even when the bytes match a listed one', () => {

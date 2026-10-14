@@ -773,7 +773,10 @@ $$;
 -- The one definition of "is this caller the owner's View-as-client session", for the
 -- user and the token's session_id. Edge functions ask it through RPC before anything
 -- whose meaning rests on the client being at the keyboard (a signature, a confirmation);
--- the write trigger below asks it directly.
+-- the write trigger below asks it directly. An unbound row restricts every session of the
+-- target until an access token issued in its life has expired: revoking a session stops
+-- refreshes, not a token already in hand. Its life runs to the later of its close and the
+-- sign-in link's hour; tokens last one hour (jwt_expiry in config.toml).
 CREATE FUNCTION public.is_impersonation_session(p_user uuid, p_session uuid)
 RETURNS boolean
 LANGUAGE sql
@@ -788,7 +791,8 @@ AS $$
       SELECT 1 FROM public.impersonation_sessions s
        WHERE s.target_user_id = p_user
          AND s.session_id IS NULL
-         AND (s.ended_at IS NULL OR s.started_at > now() - interval '1 hour'));
+         AND (s.ended_at IS NULL
+              OR greatest(s.ended_at, s.started_at + interval '1 hour') > now() - interval '1 hour'));
 $$;
 
 -- The same question about the caller's own session: the user and session_id of the token
@@ -880,8 +884,9 @@ END;
 $$;
 
 -- Server only: close every row open longer than eight hours (an owner who closed the tab
--- never ended it), and revoke each closed row's minted session, bound or not. Returns
--- how many rows it closed. It runs on a schedule set up outside the migrations.
+-- never ended it), and revoke each closed row's minted session, bound or not. A row is
+-- closed now, not back-dated, so an unbound row keeps restricting until tokens refreshed
+-- before the sweep have expired. Returns how many rows it closed. It runs on a schedule set up outside the migrations.
 CREATE FUNCTION public.auto_end_stale_impersonation_sessions()
 RETURNS integer
 LANGUAGE plpgsql
@@ -894,7 +899,7 @@ DECLARE
 BEGIN
   FOR v_id IN
     UPDATE public.impersonation_sessions
-       SET ended_at = started_at + interval '8 hours',
+       SET ended_at = now(),
            auto_ended = true
      WHERE ended_at IS NULL
        AND started_at < now() - interval '8 hours'

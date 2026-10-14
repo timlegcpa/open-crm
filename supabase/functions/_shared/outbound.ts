@@ -187,6 +187,14 @@ export function createOutbound(deps: {
     return 'local';
   }
 
+  /** A provider error's machine code (Resend `name`, Twilio `code`), never its message. */
+  function providerErrorCode(body: unknown): string | null {
+    if (typeof body !== 'object' || body === null) return null;
+    const raw = (body as { name?: unknown; code?: unknown }).name ?? (body as { code?: unknown }).code;
+    const code = typeof raw === 'number' ? String(raw) : raw;
+    return typeof code === 'string' && /^[a-z0-9_]{1,64}$/i.test(code) ? code : null;
+  }
+
   /** POST and classify. Never returns the provider's body. */
   async function post(channel: 'resend' | 'twilio', url: string, init: RequestInit): Promise<SendResult> {
     let res: Response;
@@ -197,8 +205,9 @@ export function createOutbound(deps: {
       return { status: 'unknown', channel };
     }
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      log.error(`${channel}: refused`, { message: body.slice(0, 300) }, { status: res.status });
+      // Only the provider's error code is logged: its message can echo the recipient.
+      const code = await res.json().then(providerErrorCode, () => null);
+      log.error(`${channel}: refused`, undefined, { status: res.status, code });
       return { status: 'failed', channel, reason: reasonFor(res.status), httpStatus: res.status };
     }
     // An unreadable success body is still a successful send.
