@@ -5,7 +5,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { renderEmail } from '../_shared/email-layout.ts';
 import type { OrgIdentity } from '../_shared/organization.ts';
 import type { EmailMessage, SendResult } from '../_shared/outbound.ts';
-import type { ListProgress, NeedsContactRow, NeedsListRow, NeedsSendStore, SendOutcome } from './handler.ts';
+import type { ListProgress, NeedsContactRow, NeedsListRow, NeedsSendStore, RecipientCheck, SendOutcome } from './handler.ts';
 
 export const LIST_COLUMNS = 'id, contact_id, title, intro_message, status, content_version, reminder_count';
 
@@ -78,10 +78,21 @@ export function createNeedsSendStore(deps: {
       if (error) throw error;
     },
 
-    async sendList(listId, expectedVersion) {
-      const { data, error } = await server.rpc('needs_send_list', { p_list_id: listId, p_expected_version: expectedVersion });
+    async sendList(listId, expectedVersion, { contactId, email }) {
+      const { data, error } = await server.rpc('needs_send_list', {
+        p_list_id: listId,
+        p_expected_version: expectedVersion,
+        p_contact_id: contactId,
+        p_email: email,
+      });
       if (error) throw error;
       return data as SendOutcome;
+    },
+
+    async recipientCurrent(listId, { contactId, email }) {
+      const { data, error } = await server.rpc('needs_recipient_current', { p_list_id: listId, p_contact_id: contactId, p_email: email });
+      if (error) throw error;
+      return data as RecipientCheck;
     },
 
     async claimReminder(listId, expectedCount) {

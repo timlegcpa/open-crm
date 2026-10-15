@@ -387,10 +387,14 @@ describe('sending', () => {
   it('needs_send_list publishes only at the version read, and names why not', async () => {
     await session(db, asServer, async (tx) => {
       const v = await versionOf(tx, draftA);
-      const send = async (id: string, ver: number) =>
-        (await tx.query<{ r: string }>(`SELECT public.needs_send_list($1, $2) AS r`, [id, ver])).rows[0].r;
+      const send = async (id: string, ver: number, contact = contactA, email = 'ada@example.com') =>
+        (await tx.query<{ r: string }>(`SELECT public.needs_send_list($1, $2, $3, $4) AS r`, [id, ver, contact, email])).rows[0].r;
       expect(await send(draftA, v + 1)).toBe('changed');
-      expect(await send(draftA, v)).toBe('sent');
+      // The recipient the caller read: another contact, or an address the contact no longer has.
+      expect(await send(draftA, v, contactB)).toBe('contact_changed');
+      expect(await send(draftA, v, contactA, 'old@example.com')).toBe('address_changed');
+      expect((await tx.query<{ status: string }>(`SELECT status FROM public.needs_lists WHERE id = $1`, [draftA])).rows[0].status).toBe('draft');
+      expect(await send(draftA, v, contactA, ' ADA@example.com ')).toBe('sent');
       expect(await send(draftA, v)).toBe('already_sent');
       expect(await send(closedA, 0)).toBe('not_draft');
       expect(await send(randomUUID(), 0)).toBe('gone');
@@ -1088,7 +1092,8 @@ describe('needs_owner_save_draft: the builder saves a draft in one call', () => 
     await session(db, owner, async (tx) => {
       const made = await save(tx, null, null, 'Sent soon', ITEMS);
       await become(tx, asServer);
-      expect((await tx.query<{ r: string }>(`SELECT public.needs_send_list($1, $2) AS r`, [made.id, made.content_version])).rows[0].r).toBe('sent');
+      expect((await tx.query<{ r: string }>(`SELECT public.needs_send_list($1, $2, $3, 'ada@example.com') AS r`,
+        [made.id, made.content_version, contactA])).rows[0].r).toBe('sent');
       await become(tx, owner);
       expect((await refused(tx, () => save(tx, made.id, made.content_version, 'Too late', '[]'))).message).toMatch(/not_draft/);
       expect((await listRow(tx, made.id)).title).toBe('Sent soon');
@@ -1123,7 +1128,8 @@ describe('needs_owner_save_draft: the builder saves a draft in one call', () => 
 describe('function privileges', () => {
   it('a signed-in session or anon can call none of the server functions', async () => {
     for (const who of [owner, asA(), asAnon]) {
-      await expectDenied(as(db, who, `SELECT public.needs_send_list($1, 0)`, [draftA]));
+      await expectDenied(as(db, who, `SELECT public.needs_send_list($1, 0, $2, 'ada@example.com')`, [draftA, contactA]));
+      await expectDenied(as(db, who, `SELECT public.needs_recipient_current($1, $2, 'ada@example.com')`, [draftA, contactA]));
       await expectDenied(as(db, who, `SELECT public.needs_client_submit($1, $2)`, [contactA, sentA]));
       await expectDenied(as(db, who, `SELECT public.needs_replace_draft($1, 'x', '[]'::jsonb)`, [draftA]));
       await expectDenied(as(db, who, `SELECT * FROM public.start_link_lookup($1)`, [HASH('b')]));

@@ -13,8 +13,9 @@
 //      send never supersedes an earlier link: a send that lost the publish race would
 //      otherwise kill the winner's.
 //   3. Publish, only at the content version read in step 1 (needs_send_list, a
-//      compare-and-swap): an edit landing in between publishes nothing, and a change of
-//      contact moves the version too.
+//      compare-and-swap) and only while the list still goes to the contact and address
+//      read in step 1 (checked under the publish's row lock): an edit or an address
+//      correction landing in between publishes and emails nothing.
 //   4. The email. Its failure does not undo the send (the client sees the request in the
 //      portal, and Remind retries); the answer says whether it went: email_sent true,
 //      false, or null when the provider's answer was lost.
@@ -69,7 +70,8 @@ export interface ListProgress {
   required_open: number;
 }
 
-export type SendOutcome = 'sent' | 'already_sent' | 'changed' | 'gone' | 'not_draft';
+export type SendOutcome = 'sent' | 'already_sent' | 'changed' | 'contact_changed' | 'address_changed' | 'gone' | 'not_draft';
+export type RecipientCheck = 'ok' | 'gone' | 'contact_changed' | 'address_changed';
 
 /** The database and the mail, as the send and remind paths need them. */
 export interface NeedsSendStore {
@@ -96,8 +98,10 @@ export interface NeedsSendStore {
   expireStartLink(linkId: string): Promise<void>;
   /** needs_supersede_start_links: the list's other pending links stop working. */
   supersedeStartLinks(listId: string, keepLinkId: string): Promise<void>;
-  /** needs_send_list. */
-  sendList(listId: string, expectedVersion: number): Promise<SendOutcome>;
+  /** needs_send_list: publish at the version read, to the contact and address read. */
+  sendList(listId: string, expectedVersion: number, recipient: { contactId: string; email: string }): Promise<SendOutcome>;
+  /** needs_recipient_current: whether the list still goes to this contact and address. */
+  recipientCurrent(listId: string, recipient: { contactId: string; email: string }): Promise<RecipientCheck>;
   /** needs_claim_reminder, from the count the caller read. */
   claimReminder(listId: string, expectedCount: number): Promise<'claimed' | 'in_progress' | 'not_sent'>;
   /** needs_release_reminder: a reminder whose email failed gives its count back. */
@@ -212,6 +216,13 @@ export async function remindList(
       return { status: 'changed' };
     }
     startLinkId = target.startLinkId;
+    // The address may have been corrected while the destination was worked out: never
+    // remind an address the contact no longer has.
+    if ((await store.recipientCurrent(list.id, { contactId: list.contact_id, email })) !== 'ok') {
+      await expireQuietly(store, startLinkId, log);
+      await giveBack();
+      return { status: 'changed' };
+    }
     const org = await store.loadOrg();
     const { subject, content } = requestReminderEmail({
       org, clientName: clientFirstName(contact), title: list.title, remaining, url: target.url, startLink: startLinkId !== null,
@@ -288,12 +299,14 @@ export function createSendNeedsListHandler(deps: SendNeedsDeps): (req: Request) 
       const target = await destination(deps, siteUrl, list, email, actorId);
       if (!target) refuse(409, 'The request changed while sending. Review it, then send again.', 'changed');
       const { url, startLinkId } = target;
-      const outcome = await deps.sendList(list.id, list.content_version);
+      const outcome = await deps.sendList(list.id, list.content_version, { contactId: list.contact_id, email });
       if (outcome !== 'sent') {
         // Nothing was published by this call, so its link is never emailed: retire it.
         await expireQuietly(deps, startLinkId, log);
         if (outcome === 'already_sent') refuse(409, 'This request was already sent.', 'already_sent');
-        if (outcome === 'changed') refuse(409, 'The request changed while sending. Review it, then send again.', 'changed');
+        if (outcome === 'changed' || outcome === 'contact_changed' || outcome === 'address_changed') {
+          refuse(409, 'The request changed while sending. Review it, then send again.', 'changed');
+        }
         if (outcome === 'gone') refuse(404, 'This request no longer exists.', 'not_found');
         refuse(409, 'This request can no longer be sent.', 'not_draft');
       }

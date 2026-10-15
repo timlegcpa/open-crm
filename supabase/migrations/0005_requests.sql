@@ -91,7 +91,9 @@
 --     job-runner, or a schedule the adopter sets up outside the migrations.
 --
 -- Errors the server functions answer with, as text, so the edge functions can map each:
---   needs_send_list            sent | already_sent | changed | gone | not_draft
+--   needs_send_list            sent | already_sent | changed | contact_changed | address_changed
+--                              | gone | not_draft
+--   needs_recipient_current    ok | gone | contact_changed | address_changed
 --   needs_client_submit        submitted | already_submitted | incomplete | not_open | not_found
 --   needs_claim_reminder       claimed | in_progress | not_sent
 --   needs_issue_start_link     raises contact_changed / address_changed
@@ -673,34 +675,77 @@ $$;
 -- Sending and reminding (send-needs-list, needs-reminder-dispatcher)
 -- ---------------------------------------------------------------------------
 
+-- Whether the list still goes to the contact and address the caller read and is about to
+-- email: the list is locked (FOR SHARE) and re-read, and the address must still be the
+-- contact's current one (contacts.email, the mirror of its default primary address). A
+-- send or reminder that read the old recipient emails nobody.
+--   ok | gone | contact_changed | address_changed
+CREATE FUNCTION public.needs_recipient_current(p_list_id uuid, p_contact_id uuid, p_email text)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_contact uuid;
+BEGIN
+  SELECT l.contact_id INTO v_contact FROM public.needs_lists l WHERE l.id = p_list_id FOR SHARE;
+  IF NOT FOUND THEN
+    RETURN 'gone';
+  END IF;
+  IF v_contact IS DISTINCT FROM p_contact_id THEN
+    RETURN 'contact_changed';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.contacts c
+                  WHERE c.id = p_contact_id
+                    AND lower(pg_catalog.btrim(c.email)) = lower(pg_catalog.btrim(p_email))) THEN
+    RETURN 'address_changed';
+  END IF;
+  RETURN 'ok';
+END;
+$$;
+
 -- Publish a draft: draft -> sent, only while its content is still the version the caller
--- read (a compare-and-swap). Nothing is visible to the client until this succeeds, so an
--- edit landing between the caller's read and here publishes nothing. When it matches no
--- row, the reason is read back, because only one of the four reasons is "already sent":
---   sent          published now
---   already_sent  another call published it first (whether its email landed is unknown)
---   changed       still a draft, so the content moved: nothing was sent
---   gone          deleted
---   not_draft     submitted or closed meanwhile
-CREATE FUNCTION public.needs_send_list(p_list_id uuid, p_expected_version integer)
+-- read (a compare-and-swap) and it still goes to the contact and address the caller read
+-- (needs_recipient_current, under this function's row lock). Nothing is visible to the
+-- client until this succeeds, so an edit or an address correction landing between the
+-- caller's read and here publishes nothing. Only one of the reasons is "already sent":
+--   sent             published now
+--   already_sent     another call published it first (whether its email landed is unknown)
+--   changed          still a draft, so the content moved: nothing was sent
+--   contact_changed  the list now belongs to another contact: nothing was sent
+--   address_changed  the contact's address changed: nothing was sent
+--   gone             deleted
+--   not_draft        submitted or closed meanwhile
+CREATE FUNCTION public.needs_send_list(p_list_id uuid, p_expected_version integer, p_contact_id uuid, p_email text)
 RETURNS text
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
   v_status text;
+  v_version integer;
+  v_recipient text;
 BEGIN
-  UPDATE public.needs_lists l
-     SET status = 'sent', sent_at = now()
-   WHERE l.id = p_list_id AND l.status = 'draft' AND l.content_version = p_expected_version;
-  IF FOUND THEN
-    RETURN 'sent';
-  END IF;
-  SELECT l.status INTO v_status FROM public.needs_lists l WHERE l.id = p_list_id;
+  SELECT l.status, l.content_version INTO v_status, v_version
+    FROM public.needs_lists l WHERE l.id = p_list_id FOR UPDATE;
   IF NOT FOUND THEN
     RETURN 'gone';
   END IF;
-  RETURN CASE v_status WHEN 'draft' THEN 'changed' WHEN 'sent' THEN 'already_sent' ELSE 'not_draft' END;
+  IF v_status = 'sent' THEN
+    RETURN 'already_sent';
+  END IF;
+  IF v_status <> 'draft' THEN
+    RETURN 'not_draft';
+  END IF;
+  IF v_version IS DISTINCT FROM p_expected_version THEN
+    RETURN 'changed';
+  END IF;
+  v_recipient := public.needs_recipient_current(p_list_id, p_contact_id, p_email);
+  IF v_recipient <> 'ok' THEN
+    RETURN v_recipient;
+  END IF;
+  UPDATE public.needs_lists l SET status = 'sent', sent_at = now() WHERE l.id = p_list_id;
+  RETURN 'sent';
 END;
 $$;
 
@@ -1539,7 +1584,8 @@ REVOKE ALL ON FUNCTION
   public.needs_owner_save_draft(uuid, uuid, integer, text, text, boolean, jsonb),
   public.needs_owner_delete_list(uuid),
   public.needs_delete_draft(uuid, uuid, integer, uuid, inet, text),
-  public.needs_send_list(uuid, integer),
+  public.needs_recipient_current(uuid, uuid, text),
+  public.needs_send_list(uuid, integer, uuid, text),
   public.needs_claim_reminder(uuid, integer),
   public.needs_release_reminder(uuid, integer),
   public.needs_issue_start_link(uuid, uuid, text, text, timestamptz, uuid),
@@ -1565,7 +1611,8 @@ GRANT EXECUTE ON FUNCTION
   public.needs_list_progress(uuid[]),
   public.needs_replace_draft(uuid, text, jsonb, text, uuid, boolean),
   public.needs_delete_draft(uuid, uuid, integer, uuid, inet, text),
-  public.needs_send_list(uuid, integer),
+  public.needs_recipient_current(uuid, uuid, text),
+  public.needs_send_list(uuid, integer, uuid, text),
   public.needs_claim_reminder(uuid, integer),
   public.needs_release_reminder(uuid, integer),
   public.needs_issue_start_link(uuid, uuid, text, text, timestamptz, uuid),
