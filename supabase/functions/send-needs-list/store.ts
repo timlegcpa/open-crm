@@ -5,7 +5,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { renderEmail } from '../_shared/email-layout.ts';
 import type { OrgIdentity } from '../_shared/organization.ts';
 import type { EmailMessage, SendResult } from '../_shared/outbound.ts';
-import type { ListProgress, NeedsContactRow, NeedsListRow, NeedsSendStore, RecipientCheck, SendOutcome } from './handler.ts';
+import type { ListProgress, NeedsContactRow, NeedsListRow, NeedsSendStore, RecipientCheck, ReminderClaim, SendOutcome } from './handler.ts';
 
 export const LIST_COLUMNS = 'id, contact_id, title, intro_message, status, content_version, reminder_count';
 
@@ -98,11 +98,11 @@ export function createNeedsSendStore(deps: {
     async claimReminder(listId, expectedCount) {
       const { data, error } = await server.rpc('needs_claim_reminder', { p_list_id: listId, p_expected_count: expectedCount });
       if (error) throw error;
-      return data as 'claimed' | 'in_progress' | 'not_sent';
+      return data as ReminderClaim;
     },
 
-    async releaseReminder(listId, claimedCount) {
-      const { error } = await server.rpc('needs_release_reminder', { p_list_id: listId, p_claimed_count: claimedCount });
+    async releaseReminder(listId, claimedCount, previous) {
+      const { error } = await server.rpc('needs_release_reminder', { p_list_id: listId, p_claimed_count: claimedCount, p_previous: previous });
       if (error) throw error;
     },
 

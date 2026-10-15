@@ -10,12 +10,10 @@ import {
   FolderInput,
   Loader2,
   Menu,
-  PenLine,
   X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -31,7 +29,6 @@ import { toast } from '@/components/ui/sonner';
 import { useAuth } from '@/lib/auth';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { getErrorMessage } from '@/lib/errors';
-import { links } from '@/features/links';
 import {
   documentKeys,
   downloadDocument,
@@ -57,8 +54,9 @@ import {
   reconcileActiveId,
   resolveShortcut,
 } from '../lib/documentWorkstation';
-import { isAnnotatable, isPdf, isZoomableMime } from '../viewer/mime';
+import { isAnnotatable, isZoomableMime } from '../viewer/mime';
 import WorkstationRail from './WorkstationRail';
+import SendForSignatureButton from './SendForSignatureButton';
 import MoveDialog from '../explorer/MoveDialog';
 import type { DialogTarget } from '../explorer/useExplorerState';
 import { useWorkstationDocs, type WorkstationScope } from './useWorkstationDocs';
@@ -99,7 +97,6 @@ export default function DocumentWorkstation({
   const { session } = useAuth();
   const userId = session?.user?.id ?? null;
   const queryClient = useQueryClient();
-  const navigate = useNavigate();
   const isMobile = useIsMobile();
 
   // Every listing, rail and count of documents and folders hangs off these two prefixes.
@@ -597,17 +594,7 @@ export default function DocumentWorkstation({
           </Button>
         )}
 
-        {activeDoc && scope.heldBy === 'owner' && isPdf(activeDoc.mimeType) && (
-          <Button
-            variant="ghost"
-            size="xs"
-            onClick={() => navigate(links.newEnvelope({ contactId, documentId: activeDoc.id }))}
-            title="Send this document for signature"
-          >
-            <PenLine />
-            Send for signature
-          </Button>
-        )}
+        {activeDoc && <SendForSignatureButton contactId={contactId} documentId={activeDoc.id} mimeType={activeDoc.mimeType} />}
 
         {activeDoc && (
           <Button

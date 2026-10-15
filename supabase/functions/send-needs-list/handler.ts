@@ -29,8 +29,9 @@
 // is refused before it mints or sends anything; the claimed number keys the email. A
 // contact still without an active account gets a fresh start link, and only once that
 // email was accepted do the list's older links stop working (needs_supersede_start_links:
-// never the link just sent, never a newer one). A failed email gives the count back and
-// expires its link.
+// never the link just sent, never a newer one). A failed email gives the count back,
+// restores last_reminded_at (so it never delays the next automatic reminder) and expires
+// its link.
 
 import { createHandler, HttpError, type Principal } from '../_shared/handler.ts';
 import type { AuthOutcome, OwnerPrincipal } from '../_shared/auth.ts';
@@ -75,6 +76,10 @@ export interface ListProgress {
 
 export type SendOutcome = 'sent' | 'already_sent' | 'changed' | 'contact_changed' | 'address_changed' | 'gone' | 'not_draft';
 export type RecipientCheck = 'ok' | 'gone' | 'contact_changed' | 'address_changed';
+/** needs_claim_reminder's answer; a claim carries the last_reminded_at it replaced, as text. */
+export type ReminderClaim =
+  | { status: 'claimed'; previous: string | null }
+  | { status: 'in_progress' | 'not_sent' };
 
 /** The database and the mail, as the send and remind paths need them. */
 export interface NeedsSendStore {
@@ -106,9 +111,12 @@ export interface NeedsSendStore {
   /** needs_recipient_current: whether the list still goes to this contact and address. */
   recipientCurrent(listId: string, recipient: { contactId: string; email: string }): Promise<RecipientCheck>;
   /** needs_claim_reminder, from the count the caller read. */
-  claimReminder(listId: string, expectedCount: number): Promise<'claimed' | 'in_progress' | 'not_sent'>;
-  /** needs_release_reminder: a reminder whose email failed gives its count back. */
-  releaseReminder(listId: string, claimedCount: number): Promise<void>;
+  claimReminder(listId: string, expectedCount: number): Promise<ReminderClaim>;
+  /**
+   * needs_release_reminder: a reminder whose email failed gives its count back and puts
+   * last_reminded_at back to the stamp its claim replaced.
+   */
+  releaseReminder(listId: string, claimedCount: number, previous: string | null): Promise<void>;
   loadOrg(): Promise<OrgIdentity>;
   sendEmail(message: { to: string; subject: string; content: EmailContent; fromName: string; idempotencyKey: string }): Promise<SendResult>;
   newToken?: () => string;
@@ -224,11 +232,12 @@ export async function remindList(
   // Claim this reminder's number before minting or sending anything.
   const number = list.reminder_count;
   const claim = await store.claimReminder(list.id, number);
-  if (claim !== 'claimed') return { status: claim };
+  if (claim.status !== 'claimed') return { status: claim.status };
+  const previous = claim.previous ?? null;
 
   const giveBack = async () => {
     try {
-      await store.releaseReminder(list.id, number);
+      await store.releaseReminder(list.id, number, previous);
     } catch (err) {
       log.error('could not give a reminder count back', err);
     }

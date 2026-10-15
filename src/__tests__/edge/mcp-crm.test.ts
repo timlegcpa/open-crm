@@ -188,8 +188,8 @@ function pgliteStore(): NeedsSendStore {
     async claimReminder(id, expected) {
       return (await q<{ r: never }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, expected]))[0].r;
     },
-    async releaseReminder(id, claimed) {
-      await q(`SELECT public.needs_release_reminder($1, $2)`, [id, claimed]);
+    async releaseReminder(id, claimed, previous) {
+      await q(`SELECT public.needs_release_reminder($1, $2, $3)`, [id, claimed, previous]);
     },
     loadOrg: async () => ({ displayName: 'Example Co', legalName: null, senderName: 'Example Co', postalAddress: null, logoUrl: null, brandColor: null }),
     async sendEmail({ to, subject, content, idempotencyKey }) {
@@ -1024,7 +1024,7 @@ describe('the request tools', () => {
     store.loadList = async (id) => {
       const row = await load(id);
       // An owner's Remind claims this reminder's number first.
-      expect((await q<{ r: string }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, row!.reminder_count]))[0].r).toBe('claimed');
+      expect((await q<{ r: { status: string } }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, row!.reminder_count]))[0].r.status).toBe('claimed');
       return row;
     };
     const out = await callOn(createMcpCrmHandler(liveDeps({}, store)), 'remind_request', go(r.listId, r.c.id, r.token));

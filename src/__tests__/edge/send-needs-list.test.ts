@@ -92,8 +92,8 @@ function pgliteStore(sent: Sent[], status: () => SendResult = () => ({ status: '
     async claimReminder(id, n) {
       return (await q<{ r: never }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, n]))[0].r;
     },
-    async releaseReminder(id, n) {
-      await q(`SELECT public.needs_release_reminder($1, $2)`, [id, n]);
+    async releaseReminder(id, n, previous) {
+      await q(`SELECT public.needs_release_reminder($1, $2, $3)`, [id, n, previous]);
     },
     loadOrg: async () => ORG,
     async sendEmail({ to, subject, content, idempotencyKey }) {
@@ -402,12 +402,17 @@ describe('send-needs-list: remind', () => {
     }
   });
 
-  it('a failed reminder is an error and is not counted', async () => {
+  it('a failed reminder is an error, is not counted, and never delays the next automatic one', async () => {
     const id = await draft(withAccount);
     await call(deps([]), { list_id: id });
+    // An earlier reminder's stamp, which the automatic reminders schedule from.
+    await q(`UPDATE public.needs_lists SET last_reminded_at = '2026-01-02 03:04:05.123456+00' WHERE id = $1`, [id]);
+    const stamp = async () => (await q<{ at: string | null }>(`SELECT last_reminded_at::text AS at FROM public.needs_lists WHERE id = $1`, [id]))[0].at;
+    const before = await stamp();
     const res = await call(deps([], {}, () => ({ status: 'failed', channel: 'resend', reason: 'rejected', httpStatus: 422 })), { list_id: id, remind: true });
     expect([res.status, (await res.json()).code]).toEqual([502, 'email_failed']);
     expect((await listRow(id)).reminder_count).toBe(0);
+    expect(await stamp()).toBe(before);
   });
 
   it('a failed reminder leaves the client\u2019s link working and retires the one it never sent', async () => {

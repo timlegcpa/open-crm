@@ -26,7 +26,7 @@ export const allowlist: DomainAllowlist = {
     'needs_recipient_current(uuid,uuid,text)',
     'needs_send_list(uuid,integer,uuid,text)',
     'needs_claim_reminder(uuid,integer)',
-    'needs_release_reminder(uuid,integer)',
+    'needs_release_reminder(uuid,integer,timestamp with time zone)',
     'needs_issue_start_link(uuid,uuid,text,text,timestamp with time zone,uuid)',
     'needs_supersede_start_links(uuid,uuid)',
     'needs_client_set_answer(uuid,uuid,text,bytea)',

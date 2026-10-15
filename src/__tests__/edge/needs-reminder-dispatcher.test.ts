@@ -50,8 +50,8 @@ function store(sent: string[], status: () => SendResult): NeedsSendStore {
     recipientCurrent: async (id, { contactId, email }) =>
       (await q<{ r: never }>(`SELECT public.needs_recipient_current($1, $2, $3) AS r`, [id, contactId, email]))[0].r,
     claimReminder: async (id, n) => (await q<{ r: never }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, n]))[0].r,
-    releaseReminder: async (id, n) => {
-      await q(`SELECT public.needs_release_reminder($1, $2)`, [id, n]);
+    releaseReminder: async (id, n, previous) => {
+      await q(`SELECT public.needs_release_reminder($1, $2, $3)`, [id, n, previous]);
     },
     loadOrg: async () => ORG,
     async sendEmail({ to }) {

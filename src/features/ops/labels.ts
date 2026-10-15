@@ -32,7 +32,20 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   email_change_requested: 'Email change requested',
   sign_out_all_devices: 'Signed out everywhere',
   lead_intake_key_rotated: 'Lead intake key replaced',
+  lead_intake_key_revoked: 'Lead intake key removed',
   org_logo_updated: 'Logo changed',
+  // Documents
+  document_delete: 'Document deleted',
+  folder_delete: 'Folder deleted',
+  folder_bulk_delete: 'Folders deleted',
+  // Requests
+  needs_list_sent: 'Request sent',
+  needs_list_reminded: 'Request reminder sent',
+  needs_list_deleted: 'Request deleted',
+  needs_list_files_deleted: "Deleted request's files removed",
+  'needs.reveal_answer': 'Sensitive answer revealed',
+  // E-signature
+  esign_envelope_deleted: 'Envelope deleted',
   // Portal and View as client
   portal_invite_sent: 'Portal invitation sent',
   portal_invite_resent: 'Portal invitation sent again',
@@ -41,6 +54,9 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   impersonate_end: 'View as client ended',
   // Group email
   group_email_sent: 'Group email sent',
+  // Messages (written by the key table's trigger)
+  messages_key_created: 'Messages encryption set up',
+  messages_key_rewrapped: 'Messages password or recovery key changed',
   // The AI connector: its approvals, and what the agent did through it
   mcp_oauth_approved: 'AI connector approved',
   mcp_oauth_denied: 'AI connector refused',

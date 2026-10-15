@@ -95,7 +95,7 @@
 --                              | gone | not_draft
 --   needs_recipient_current    ok | gone | contact_changed | address_changed
 --   needs_client_submit        submitted | already_submitted | incomplete | not_open | not_found
---   needs_claim_reminder       claimed | in_progress | not_sent
+--   needs_claim_reminder       {status: claimed | in_progress | not_sent, previous}
 --   needs_issue_start_link     raises contact_changed / address_changed
 -- and the draft functions raise not_found / not_draft (plus stale_content, has_answers,
 -- has_documents for a delete).
@@ -752,38 +752,49 @@ $$;
 -- Claim the next reminder of a sent list: the count moves FIRST, and only from the count
 -- the caller read (a compare-and-swap), so two reminders at once cannot both go: the
 -- second finds the count moved and is refused. The claimed number keys the email and is
--- what a failed email gives back (needs_release_reminder).
---   claimed       this caller sends reminder number p_expected_count
---   in_progress   the count moved since the caller read it: another reminder got there
---   not_sent      the list is not (or no longer) sent
+-- what a failed email gives back (needs_release_reminder). The claim also stamps
+-- last_reminded_at, the column the automatic reminders schedule from, so it returns the
+-- stamp it replaced (as text, at full precision) for the release to restore.
+--   {"status": "claimed", "previous": ...}   this caller sends reminder number p_expected_count
+--   {"status": "in_progress"}   the count moved since the caller read it: another reminder got there
+--   {"status": "not_sent"}      the list is not (or no longer) sent
 CREATE FUNCTION public.needs_claim_reminder(p_list_id uuid, p_expected_count integer)
-RETURNS text
+RETURNS jsonb
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
   v_status text;
+  v_previous timestamptz;
 BEGIN
+  SELECT l.status, l.last_reminded_at INTO v_status, v_previous
+    FROM public.needs_lists l
+   WHERE l.id = p_list_id
+     FOR UPDATE;
+  IF NOT FOUND OR v_status <> 'sent' THEN
+    RETURN jsonb_build_object('status', 'not_sent');
+  END IF;
   UPDATE public.needs_lists l
      SET reminder_count = l.reminder_count + 1, last_reminded_at = now()
-   WHERE l.id = p_list_id AND l.status = 'sent' AND l.reminder_count = p_expected_count;
-  IF FOUND THEN
-    RETURN 'claimed';
+   WHERE l.id = p_list_id AND l.reminder_count = p_expected_count;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'in_progress');
   END IF;
-  SELECT l.status INTO v_status FROM public.needs_lists l WHERE l.id = p_list_id;
-  RETURN CASE WHEN v_status = 'sent' THEN 'in_progress' ELSE 'not_sent' END;
+  RETURN jsonb_build_object('status', 'claimed', 'previous', v_previous::text);
 END;
 $$;
 
--- A reminder whose email failed gives its count back, only while nothing claimed after it.
-CREATE FUNCTION public.needs_release_reminder(p_list_id uuid, p_claimed_count integer)
+-- A reminder whose email failed gives its count back, and last_reminded_at returns to the
+-- stamp its claim replaced, so a failed reminder never delays the next automatic one. Both
+-- only while nothing claimed after it: a later reminder keeps its count and its stamp.
+CREATE FUNCTION public.needs_release_reminder(p_list_id uuid, p_claimed_count integer, p_previous timestamptz)
 RETURNS boolean
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 BEGIN
   UPDATE public.needs_lists l
-     SET reminder_count = l.reminder_count - 1
+     SET reminder_count = l.reminder_count - 1, last_reminded_at = p_previous
    WHERE l.id = p_list_id AND l.reminder_count = p_claimed_count + 1;
   RETURN FOUND;
 END;
@@ -1587,7 +1598,7 @@ REVOKE ALL ON FUNCTION
   public.needs_recipient_current(uuid, uuid, text),
   public.needs_send_list(uuid, integer, uuid, text),
   public.needs_claim_reminder(uuid, integer),
-  public.needs_release_reminder(uuid, integer),
+  public.needs_release_reminder(uuid, integer, timestamptz),
   public.needs_issue_start_link(uuid, uuid, text, text, timestamptz, uuid),
   public.needs_supersede_start_links(uuid, uuid),
   public.needs_client_set_answer(uuid, uuid, text, bytea),
@@ -1614,7 +1625,7 @@ GRANT EXECUTE ON FUNCTION
   public.needs_recipient_current(uuid, uuid, text),
   public.needs_send_list(uuid, integer, uuid, text),
   public.needs_claim_reminder(uuid, integer),
-  public.needs_release_reminder(uuid, integer),
+  public.needs_release_reminder(uuid, integer, timestamptz),
   public.needs_issue_start_link(uuid, uuid, text, text, timestamptz, uuid),
   public.needs_supersede_start_links(uuid, uuid),
   public.needs_client_set_answer(uuid, uuid, text, bytea),

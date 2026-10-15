@@ -405,24 +405,41 @@ describe('sending', () => {
 
   it('needs_claim_reminder takes the next count only from the count read; a failed one gives it back', async () => {
     await session(db, asServer, async (tx) => {
+      type Claim = { status: string; previous?: string | null };
       const claim = async (id: string, n: number) =>
-        (await tx.query<{ r: string }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, n])).rows[0].r;
-      const release = async (id: string, n: number) =>
-        (await tx.query<{ r: boolean }>(`SELECT public.needs_release_reminder($1, $2) AS r`, [id, n])).rows[0].r;
+        (await tx.query<{ r: Claim }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, n])).rows[0].r;
+      const release = async (id: string, n: number, previous: string | null) =>
+        (await tx.query<{ r: boolean }>(`SELECT public.needs_release_reminder($1, $2, $3) AS r`, [id, n, previous])).rows[0].r;
       const countOf = async () => (await tx.query<{ n: number; at: string | null }>(
-        `SELECT reminder_count AS n, last_reminded_at AS at FROM public.needs_lists WHERE id = $1`, [sentA])).rows[0];
-      expect(await claim(sentA, 0)).toBe('claimed');
-      expect(await claim(sentA, 0)).toBe('in_progress'); // a second reminder read the same count
+        `SELECT reminder_count AS n, last_reminded_at::text AS at FROM public.needs_lists WHERE id = $1`, [sentA])).rows[0];
+      const first = await claim(sentA, 0);
+      expect(first).toEqual({ status: 'claimed', previous: null });
+      expect(await claim(sentA, 0)).toEqual({ status: 'in_progress' }); // a second reminder read the same count
       expect((await countOf()).n).toBe(1);
       expect((await countOf()).at).not.toBeNull();
-      expect(await release(sentA, 0)).toBe(true);
-      expect((await countOf()).n).toBe(0);
-      expect(await claim(sentA, 0)).toBe('claimed');
-      expect(await claim(sentA, 1)).toBe('claimed');
-      expect(await release(sentA, 0)).toBe(false); // a later reminder went: the count stays
-      expect((await countOf()).n).toBe(2);
-      expect(await claim(draftA, 0)).toBe('not_sent');
-      expect(await claim(closedA, 0)).toBe('not_sent');
+      expect(await release(sentA, 0, first.previous ?? null)).toBe(true);
+      // The failed reminder gave back its count AND its stamp: it never delays the next one.
+      expect(await countOf()).toEqual({ n: 0, at: null });
+
+      // An earlier stamp comes back at full precision.
+      await tx.query(`UPDATE public.needs_lists SET last_reminded_at = '2026-01-02 03:04:05.123456+00' WHERE id = $1`, [sentA]);
+      const earlier = (await countOf()).at;
+      const again = await claim(sentA, 0);
+      expect(again).toEqual({ status: 'claimed', previous: earlier });
+      expect((await countOf()).at).not.toBe(earlier);
+      expect(await release(sentA, 0, again.previous ?? null)).toBe(true);
+      expect(await countOf()).toEqual({ n: 0, at: earlier });
+
+      // A later reminder went: the stale release changes neither the count nor the stamp.
+      const kept = await claim(sentA, 0);
+      expect((await claim(sentA, 1)).status).toBe('claimed');
+      const latest = await countOf();
+      expect(await release(sentA, 0, kept.previous ?? null)).toBe(false);
+      expect(await countOf()).toEqual(latest);
+      expect(latest.n).toBe(2);
+      expect(await claim(draftA, 0)).toEqual({ status: 'not_sent' });
+      expect(await claim(closedA, 0)).toEqual({ status: 'not_sent' });
+      expect(await claim(randomUUID(), 0)).toEqual({ status: 'not_sent' });
     });
   });
 });

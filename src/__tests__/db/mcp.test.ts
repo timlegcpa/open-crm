@@ -1372,17 +1372,19 @@ describe('mcp_claim_reminder and mcp_release_reminder', () => {
         const id = await sentList(tx);
         const claim = await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contactA });
         // The shared reminder takes its number; a failed email gives it back.
-        const taken = await call<string>(tx, 'needs_claim_reminder', { p_list_id: id, p_expected_count: claim.count });
-        if (!delivered) await call(tx, 'needs_release_reminder', { p_list_id: id, p_claimed_count: claim.count });
+        const taken = await call<{ status: string; previous: string | null }>(tx, 'needs_claim_reminder', { p_list_id: id, p_expected_count: claim.count });
+        // The requests claim replaced the connector's own stamp, and its release restores that.
+        const stampedByConnector = taken.previous !== null;
+        if (!delivered) await call(tx, 'needs_release_reminder', { p_list_id: id, p_claimed_count: claim.count, p_previous: taken.previous });
         const released = await call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_count: claim.count, p_previous: claim.previous });
         const row = (await tx.query<{ n: number; at: string | null }>(`SELECT reminder_count AS n, last_reminded_at::text AS at FROM public.needs_lists WHERE id = $1`, [id])).rows[0];
-        return { taken, released, count: row.n, held: row.at !== null };
+        return { taken: taken.status, stampedByConnector, released, count: row.n, held: row.at !== null };
       };
       return { delivered: await run(true), failed: await run(false) };
     });
     expect(out).toEqual({
-      delivered: { taken: 'claimed', released: false, count: 1, held: true },
-      failed: { taken: 'claimed', released: true, count: 0, held: false },
+      delivered: { taken: 'claimed', stampedByConnector: true, released: false, count: 1, held: true },
+      failed: { taken: 'claimed', stampedByConnector: true, released: true, count: 0, held: false },
     });
   });
 
