@@ -5,11 +5,16 @@
 //   1. The draft must be sendable: pages, signers, a required field per signer, every
 //      field on a real page, a phone per signer for 'high' (and text messages available).
 //      Problems come back together, 400 with a `validation` list.
-//   2. The live pages are assembled into {envelope}/source.pdf, and its SHA-256 is kept:
-//      the exact bytes every signer reviews. Above 24 MB it is refused, so the executed
-//      copy (source plus the audit pages) still fits the documents store's limit.
-//   3. draft -> sent is CLAIMED with a status guard before any signer is touched: a
-//      double click loses the claim and sends nothing twice.
+//   2. The live pages are assembled into a file of THIS attempt's own
+//      ({envelope}/source-{attempt}.pdf, never overwritten), and its SHA-256 is kept: the
+//      exact bytes every signer reviews. Above 24 MB it is refused, so the executed copy
+//      (source plus the audit pages) still fits the documents store's limit.
+//   3. draft -> sent is CLAIMED with a status guard AND the draft revision the send read,
+//      before any signer is touched, and the claim points the envelope at this attempt's
+//      file. A double click loses the claim and sends nothing twice; an edit that landed
+//      after the read bumped the revision, so the send loses rather than send a PDF the
+//      fields no longer match. A losing attempt removes its own file and never touches the
+//      winner's.
 //   4. Per signer: a fresh link token (only its SHA-256 is stored), a portal task when
 //      the signer's contact has an active portal account (the task links by signer id and
 //      carries no token: the portal exchanges it after checking the login email), and the
@@ -50,7 +55,7 @@ export interface SendValidationError {
   validation: string[];
 }
 
-export const SEND_ENVELOPE_ERRORS = ['bad_request', 'validation_failed', 'too_large', 'sms_unavailable', 'site_url_missing', 'not_found', 'not_draft'] as const;
+export const SEND_ENVELOPE_ERRORS = ['bad_request', 'validation_failed', 'too_large', 'sms_unavailable', 'site_url_missing', 'not_found', 'not_draft', 'draft_changed'] as const;
 
 /** Leaves the executed copy (this plus the audit pages) room under the 25 MiB store limit. */
 export const MAX_ASSEMBLED_BYTES = 24 * 1024 * 1024;
@@ -106,9 +111,9 @@ export function createSendEnvelopeHandler(deps: SendEnvelopeDeps): (req: Request
         throw new HttpError(500, 'Signing links are not set up on this server yet (SITE_URL).', 'site_url_missing');
       }
 
-      const envelope = await maybeOne<{ id: string; title: string; status: string; verification_level: 'standard' | 'high' }>(
+      const envelope = await maybeOne<{ id: string; title: string; status: string; verification_level: 'standard' | 'high'; draft_revision: number }>(
         'envelope read',
-        db.from('esign_envelopes').select('id, title, status, verification_level').eq('id', envelopeId).maybeSingle(),
+        db.from('esign_envelopes').select('id, title, status, verification_level, draft_revision').eq('id', envelopeId).maybeSingle(),
       );
       if (!envelope) throw envelopeNotFound();
       if (envelope.status !== 'draft') throw notDraft();
@@ -159,8 +164,8 @@ export function createSendEnvelopeHandler(deps: SendEnvelopeDeps): (req: Request
       if (assembled.byteLength > MAX_ASSEMBLED_BYTES) {
         throw new HttpError(413, 'The assembled document is over 24 MB. Remove pages or use smaller files.', 'too_large');
       }
-      const sourcePath = `${envelopeId}/source.pdf`;
-      await deps.storage.putWorking(sourcePath, assembled, { upsert: true });
+      const sourcePath = `${envelopeId}/source-${crypto.randomUUID()}.pdf`;
+      await deps.storage.putWorking(sourcePath, assembled, { upsert: false });
       const sourceSha256 = await sha256Bytes(assembled);
 
       // 3. The claim, with the source recorded in the same write.
@@ -173,9 +178,21 @@ export function createSendEnvelopeHandler(deps: SendEnvelopeDeps): (req: Request
           .update({ status: 'sent', sent_at: sentAt.toISOString(), expires_at: expiresAt, source_pdf_path: sourcePath, source_pdf_sha256: sourceSha256 })
           .eq('id', envelopeId)
           .eq('status', 'draft')
+          .eq('draft_revision', envelope.draft_revision)
           .select('id'),
       );
-      if (claimed.length === 0) throw notDraft();
+      if (claimed.length === 0) {
+        try {
+          await deps.storage.removeWorking([sourcePath]);
+        } catch (err) {
+          log.error('a lost send left its source file; it is stranded', err, { envelope_id: envelopeId });
+        }
+        const [after] = await rows<{ status: string }>('envelope reread', db.from('esign_envelopes').select('status').eq('id', envelopeId));
+        if (after?.status === 'draft') {
+          throw new HttpError(409, 'The envelope changed while it was being sent. Check it and send again.', 'draft_changed');
+        }
+        throw notDraft();
+      }
 
       const contactIds = [...new Set(signers.map((s) => s.contact_id).filter((id): id is string => !!id))];
       const contacts = contactIds.length

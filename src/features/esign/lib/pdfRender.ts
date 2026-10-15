@@ -1,4 +1,5 @@
 import { getDocumentWatchdogged, type PDFDocumentProxy } from '@/lib/pdfjs';
+import type { PageGeometry } from './coords';
 
 /**
  * PDF pages drawn onto canvases through THE pdf.js entry point (`@/lib/pdfjs`), for the
@@ -10,9 +11,8 @@ export interface RenderedPage {
   /** The canvas's pixel size as drawn. */
   canvasWidthPx: number;
   canvasHeightPx: number;
-  /** The page's own size in PDF points (scale 1). */
-  pageWidthPt: number;
-  pageHeightPt: number;
+  /** The viewport's viewBox (CropBox), rotation and scale: the canvas <-> user-space mapping. */
+  geometry: PageGeometry;
 }
 
 export interface OpenedPdf {
@@ -60,7 +60,12 @@ export function openPdf(src: { url: string } | { data: Uint8Array }): OpenedPdf 
       canvas.height = heightPx;
       await page.render({ canvasContext: context, viewport, canvas }).promise;
       if (destroyed) throw new Error('cancelled');
-      return { canvasWidthPx: widthPx, canvasHeightPx: heightPx, pageWidthPt: base.width, pageHeightPt: base.height };
+      const [x0, y0, x1, y1] = viewport.viewBox;
+      return {
+        canvasWidthPx: widthPx,
+        canvasHeightPx: heightPx,
+        geometry: { viewBox: [x0, y0, x1, y1], rotation: viewport.rotation, scale: viewport.scale },
+      };
     } finally {
       settle();
     }

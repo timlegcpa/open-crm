@@ -70,8 +70,8 @@ beforeAll(async () => {
 
     INSERT INTO public.esign_envelopes (id, created_by, primary_contact_id, title, status, expires_at, sent_at, completed_at, signed_pdf_sha256)
     VALUES ('${E_DRAFT}', '${OWNER}', '${CONTACT_A}', 'Engagement letter', 'draft', NULL, NULL, NULL, NULL),
-           ('${E_SENT}', '${OWNER}', '${CONTACT_A}', 'Lease', 'sent', now() + interval '14 days', now(), NULL, NULL),
-           ('${E_DONE}', '${OWNER}', '${CONTACT_B}', 'Order form', 'completed', now() - interval '1 day', now() - interval '3 days',
+           ('${E_SENT}', '${OWNER}', '${CONTACT_A}', 'Lease', 'draft', now() + interval '14 days', now(), NULL, NULL),
+           ('${E_DONE}', '${OWNER}', '${CONTACT_B}', 'Order form', 'draft', now() - interval '1 day', now() - interval '3 days',
             now() - interval '2 days', '${HASH('a')}');
     INSERT INTO public.esign_envelope_documents (id, envelope_id, "order", file_name, storage_path, byte_size, page_count) VALUES
       ('${D_DRAFT}', '${E_DRAFT}', 0, 'letter.pdf', '${E_DRAFT}/sources/${D_DRAFT}.pdf', 100, 2),
@@ -89,6 +89,9 @@ beforeAll(async () => {
       ('${E_DRAFT}', '${S_DRAFT}', 0, 'signature', 10, 10, 100, 30), ('${E_SENT}', '${S_SENT_A}', 0, 'date', 10, 50, 80, 20);
     INSERT INTO public.esign_envelope_events (envelope_id, signer_id, event_type) VALUES
       ('${E_SENT}', '${S_SENT_A}', 'invite_sent'), ('${E_DRAFT}', NULL, 'envelope_created');
+    -- Built as drafts, then moved on: the database takes shape changes from drafts only.
+    UPDATE public.esign_envelopes SET status = 'sent' WHERE id = '${E_SENT}';
+    UPDATE public.esign_envelopes SET status = 'completed' WHERE id = '${E_DONE}';
     INSERT INTO public.esign_templates (id, name, page_count, created_by) VALUES ('${T_TEMPLATE}', 'Standard letter', 2, '${OWNER}');
     INSERT INTO public.esign_template_fields (template_id, role, page_index, field_type, x, y, width, height)
       VALUES ('${T_TEMPLATE}', 'primary', 0, 'signature', 1, 1, 10, 10);
@@ -512,6 +515,31 @@ describe('esign_check_sms_code', () => {
     expect((await run(newer, HASH('e'), HASH('8'))).out).toEqual([{ status: 'invalid', attempts: 1 }, { status: 'approved', attempts: 2 }]);
   });
 
+  it('issuing a code spends the signer’s older ones at once', async () => {
+    const out = await session(db, service, async (tx) => {
+      await tx.exec(`INSERT INTO public.esign_sms_verifications (signer_id, code_hash, sent_to_last_four, expires_at)
+                     VALUES ('${S_SENT_A}', '${HASH('8')}', '1234', now() + interval '10 minutes')`);
+      return (await tx.query<{ h: string; spent: boolean }>(
+        `SELECT left(code_hash, 1) AS h, consumed_at IS NOT NULL AS spent FROM public.esign_sms_verifications WHERE signer_id = '${S_SENT_A}' ORDER BY h`,
+      )).rows;
+    });
+    expect(out).toEqual([{ h: '8', spent: false }, { h: 'e', spent: true }]);
+  });
+
+  it('once the newest code is used, an older one never comes back to life', async () => {
+    const newer = `INSERT INTO public.esign_sms_verifications (signer_id, code_hash, sent_to_last_four, expires_at, created_at)
+                   VALUES ('${S_SENT_A}', '${HASH('8')}', '1234', now() + interval '10 minutes', now() + interval '1 second')`;
+    expect((await run(newer, HASH('8'), HASH('e'))).out).toEqual([{ status: 'approved', attempts: 1 }, { status: 'none', attempts: 0 }]);
+  });
+
+  it('an approval spends every code the signer still holds, not just the one it matched', async () => {
+    // Two outstanding codes, as if the older one had escaped the supersede trigger.
+    const both = `INSERT INTO public.esign_sms_verifications (signer_id, code_hash, sent_to_last_four, expires_at, created_at)
+                  VALUES ('${S_SENT_A}', '${HASH('8')}', '1234', now() + interval '10 minutes', now() + interval '1 second');
+                  UPDATE public.esign_sms_verifications SET consumed_at = NULL WHERE code_hash = '${HASH('e')}'`;
+    expect((await run(both, HASH('8'), HASH('e'))).out).toEqual([{ status: 'approved', attempts: 1 }, { status: 'none', attempts: 0 }]);
+  });
+
   it('another signer’s code never approves this one', async () => {
     const other = `DELETE FROM public.esign_sms_verifications;
                    INSERT INTO public.esign_sms_verifications (signer_id, code_hash, sent_to_last_four, expires_at)
@@ -521,6 +549,99 @@ describe('esign_check_sms_code', () => {
 
   it('refuses a call with no address', async () => {
     expect(await errorOf(db, service, check(HASH('e'), 'NULL'))).toMatch(/address is required/);
+  });
+});
+
+describe('an envelope’s shape changes only while it is a draft', () => {
+  it('the server too is refused a shape change once the envelope is sent or completed', async () => {
+    const refused = [
+      `INSERT INTO public.esign_envelope_fields (envelope_id, signer_id, page_index, field_type, x, y, width, height)
+         VALUES ('${E_SENT}', '${S_SENT_A}', 0, 'signature', 1, 1, 10, 10)`,
+      `DELETE FROM public.esign_envelope_fields WHERE envelope_id = '${E_SENT}'`,
+      `UPDATE public.esign_envelope_fields SET x = 99 WHERE envelope_id = '${E_SENT}'`,
+      `DELETE FROM public.esign_envelope_pages WHERE envelope_id = '${E_SENT}'`,
+      `DELETE FROM public.esign_envelope_documents WHERE envelope_id = '${E_SENT}'`,
+      `INSERT INTO public.esign_envelope_signers (envelope_id, "order", role, email) VALUES ('${E_SENT}', 9, 'other', 'late@example.test')`,
+      `DELETE FROM public.esign_envelope_signers WHERE id = '${S_SENT_B}'`,
+      `UPDATE public.esign_envelope_signers SET email = 'swap@example.test' WHERE id = '${S_SENT_A}'`,
+      `UPDATE public.esign_envelope_signers SET role = 'other' WHERE id = '${S_SENT_A}'`,
+      `UPDATE public.esign_envelope_signers SET status = 'pending' WHERE id = '${S_SENT_A}'`,
+      `UPDATE public.esign_envelope_signers SET status = 'pending' WHERE id = '${S_DONE}'`,
+    ];
+    for (const sql of refused) expect(await errorOf(db, service, sql), sql).toMatch(/not a draft/);
+  });
+
+  it('a signer’s life after send, a deleted contact and a deleted envelope still pass', async () => {
+    for (const sql of [
+      `UPDATE public.esign_envelope_signers SET status = 'signed', signed_at = now() WHERE id = '${S_SENT_A}'`,
+      `UPDATE public.esign_envelope_signers SET token_hash = '${HASH('9')}', opened_email_at = now() WHERE id = '${S_SENT_B}'`,
+      `UPDATE public.esign_envelope_signers SET contact_id = NULL WHERE id = '${S_SENT_A}'`,
+      `DELETE FROM public.esign_envelopes WHERE id = '${E_SENT}'`,
+    ]) {
+      expect(await errorOf(db, service, sql), sql).toBeNull();
+    }
+  });
+
+  it('every draft edit bumps the draft revision', async () => {
+    const out = await session(db, service, async (tx) => {
+      const rev = async () => (await tx.query<{ r: number }>(`SELECT draft_revision AS r FROM public.esign_envelopes WHERE id = '${E_DRAFT}'`)).rows[0].r;
+      const before = await rev();
+      await tx.exec(`UPDATE public.esign_envelope_fields SET x = 11 WHERE envelope_id = '${E_DRAFT}'`);
+      const afterField = await rev();
+      await tx.exec(`UPDATE public.esign_envelope_signers SET role = 'other' WHERE id = '${S_DRAFT}'`);
+      return { field: afterField - before, signer: (await rev()) - afterField };
+    });
+    expect(out).toEqual({ field: 1, signer: 1 });
+  });
+});
+
+describe('esign_expire_envelope', () => {
+  const expire = (setup: string) =>
+    session(db, service, async (tx) => {
+      await tx.exec(`UPDATE public.esign_envelopes SET expires_at = now() - interval '1 minute' WHERE id = '${E_SENT}'; ${setup}`);
+      const r = (await tx.query<{ r: Record<string, unknown> }>(`SELECT public.esign_expire_envelope('${E_SENT}', now()) AS r`)).rows[0].r;
+      const env = (await tx.query<{ status: string }>(`SELECT status FROM public.esign_envelopes WHERE id = '${E_SENT}'`)).rows[0].status;
+      const signers = (await tx.query<{ status: string }>(`SELECT status FROM public.esign_envelope_signers WHERE envelope_id = '${E_SENT}' ORDER BY "order"`)).rows.map((x) => x.status);
+      return { r, env, signers };
+    });
+
+  it('expires the waiting signers and the envelope together, and names the tasks to dismiss', async () => {
+    expect(await expire('')).toEqual({
+      r: { status: 'expired', signers_expired: 2, task_ids: [TASK_ESIGN] },
+      env: 'expired',
+      signers: ['expired', 'expired'],
+    });
+  });
+
+  it('leaves an envelope everyone signed for finalize, untouched', async () => {
+    expect(await expire(`UPDATE public.esign_envelope_signers SET status = 'signed', signed_at = now() WHERE envelope_id = '${E_SENT}'`)).toEqual({
+      r: { status: 'all_signed', signers_expired: 0, task_ids: [] },
+      env: 'sent',
+      signers: ['signed', 'signed'],
+    });
+  });
+
+  it('keeps a signer who signed, expiring only the rest', async () => {
+    const out = await expire(`UPDATE public.esign_envelope_signers SET status = 'signed', signed_at = now() WHERE id = '${S_SENT_A}'`);
+    expect(out).toEqual({ r: { status: 'expired', signers_expired: 1, task_ids: [] }, env: 'expired', signers: ['signed', 'expired'] });
+  });
+
+  it('does nothing to an envelope no longer due: ended another way, or given more time', async () => {
+    for (const setup of [
+      `UPDATE public.esign_envelopes SET status = 'declined' WHERE id = '${E_SENT}'`,
+      `UPDATE public.esign_envelopes SET expires_at = now() + interval '1 day' WHERE id = '${E_SENT}'`,
+    ]) {
+      expect((await expire(setup)).r).toEqual({ status: 'not_due', signers_expired: 0, task_ids: [] });
+    }
+  });
+});
+
+describe('one executed copy per envelope and contact', () => {
+  it('a second documents row for the same envelope and contact is refused', async () => {
+    const row = (id: string) => `('${id}', '${CONTACT_B}', 'e.pdf', 'e.pdf', '${CONTACT_B}/esign/${E_DONE}.pdf', 10, 'application/pdf', 'owner', '${E_DONE}')`;
+    expect(await errorOf(db, service, `INSERT INTO public.client_documents (id, contact_id, filename, original_filename, storage_path, file_size, mime_type, held_by, esign_envelope_id)
+      VALUES ${row('25000000-0000-4000-8000-0000000000e1')}, ${row('25000000-0000-4000-8000-0000000000e2')}`))
+      .toMatch(/client_documents_esign_envelope_contact_key/);
   });
 });
 

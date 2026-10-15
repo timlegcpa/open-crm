@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { FieldRow, PageRow, SignerRow } from '../contract';
+import { reorderOperations } from '../lib/pageOrder';
+import { envelopeRefetchInterval, RESENDABLE_SIGNER_STATUSES } from '../contract';
 import { fieldContentKey, moveRect, newServerFields, placeAt, resizeRect, MIN_H, MIN_W, type PlacedField } from '../lib/fieldPlacement';
 import { filingFolderProblem } from '../lib/filingFolder';
 import { escapeLikePattern } from '../lib/likePattern';
@@ -72,6 +74,11 @@ describe('merging the server fields into the layout', () => {
   it('collapses duplicates within one answer, and skips a page past the end', () => {
     expect(newServerFields([field('a'), field('b', { x: '72.1' })], [], pages)).toHaveLength(1);
     expect(newServerFields([field('c', { page_index: 5 })], [], pages)).toEqual([]);
+  });
+
+  it('never brings back a field deleted here while the server still holds it', () => {
+    // The delete happened during a save: the refetch that save triggers still has the field.
+    expect(newServerFields([field('dead'), field('live', { x: 300 })], [], pages, new Set(['dead']))).toMatchObject([{ remoteId: 'live' }]);
   });
 
   it('keys content on signer, page, type and rounded corner', () => {
@@ -251,5 +258,30 @@ describe('the signer picker', () => {
   it('falls back to the id only for a contact with no address, and never offers a lost contact', () => {
     expect(buildSignerPickerOptions([base({ email: null, spouse_email: null })], new Set(), new Set(['c1']))).toEqual([]);
     expect(buildSignerPickerOptions([base({ status: 'lost' })], new Set(), new Set())).toEqual([]);
+  });
+});
+
+describe('the page reorder after a drag', () => {
+  it('sends every live page at 0..n-1, never just the moved ones', () => {
+    // Stored orders 0, 2, 3 after page 1 was deleted; drag the last page to the front.
+    expect(reorderOperations([{ id: 'c' }, { id: 'a' }, { id: 'b' }])).toEqual([
+      { page_id: 'c', order: 0 },
+      { page_id: 'a', order: 1 },
+      { page_id: 'b', order: 2 },
+    ]);
+  });
+});
+
+describe('resend and polling on a sent envelope', () => {
+  it('a pending signer can be resent to', () => {
+    expect(RESENDABLE_SIGNER_STATUSES).toEqual(expect.arrayContaining(['pending', 'invited', 'viewed']));
+    expect(RESENDABLE_SIGNER_STATUSES).not.toContain('signed');
+  });
+
+  it('the envelope polls while out for signature and stops once terminal', () => {
+    expect(envelopeRefetchInterval('sent')).toBe(30_000);
+    expect(envelopeRefetchInterval('partially_signed')).toBe(30_000);
+    for (const s of ['draft', 'completed', 'voided', 'declined', 'expired'] as const) expect(envelopeRefetchInterval(s)).toBe(false);
+    expect(envelopeRefetchInterval(undefined)).toBe(false);
   });
 });

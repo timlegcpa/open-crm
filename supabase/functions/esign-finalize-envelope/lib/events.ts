@@ -72,6 +72,55 @@ function who(s: SignerLike | undefined): string {
   return `${resolveSignerName(s)} (${s.email})`;
 }
 
+export interface AuditSource {
+  event_type: string;
+  signer_id: string | null;
+  created_at: string;
+  ip: string | null;
+  metadata: Record<string, unknown> | null;
+}
+
+export interface AuditEntry {
+  created_at: string;
+  phrase: string;
+  ip: string | null;
+}
+
+/**
+ * The executed PDF's event log, from events in time order: one entry per event that
+ * belongs on a certificate, except that a signer's link opens collapse into ONE entry at
+ * the first open, with the count and the last time. A link holder can open the link as
+ * often as they like; the certificate stays bounded.
+ */
+export function auditTrail(events: readonly AuditSource[], signerOf: (signerId: string | null) => SignerLike | undefined): AuditEntry[] {
+  const opens = new Map<string, { count: number; last: string }>();
+  for (const e of events) {
+    if (e.event_type !== 'signer_opened_link') continue;
+    const key = e.signer_id ?? '';
+    const seen = opens.get(key);
+    opens.set(key, { count: (seen?.count ?? 0) + 1, last: e.created_at });
+  }
+  const written = new Set<string>();
+  const out: AuditEntry[] = [];
+  for (const e of events) {
+    const signer = signerOf(e.signer_id);
+    if (e.event_type === 'signer_opened_link') {
+      const key = e.signer_id ?? '';
+      if (written.has(key)) continue;
+      written.add(key);
+      const { count, last } = opens.get(key) ?? { count: 1, last: e.created_at };
+      const phrase = count === 1
+        ? `${who(signer)} opened the sign link.`
+        : `${who(signer)} opened the sign link ${count} times, first at ${e.created_at}, last at ${last}.`;
+      out.push({ created_at: e.created_at, phrase, ip: e.ip });
+      continue;
+    }
+    const phrase = auditPhrase(e.event_type, signer, e.metadata);
+    if (phrase) out.push({ created_at: e.created_at, phrase, ip: e.ip });
+  }
+  return out;
+}
+
 /**
  * The executed PDF's audit trail, one sentence per event that belongs on a certificate.
  * Diagnostics (rate limits, failed codes, the draft's creation) are left out.

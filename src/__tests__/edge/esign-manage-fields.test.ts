@@ -5,14 +5,14 @@ import { randomUUID } from 'node:crypto';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createManageFieldsHandler, type ManageFieldsDeps } from '../../../supabase/functions/esign-manage-fields/handler';
 import { CREDENTIALS, describeEdgeContract, edgeRequest, fakeOwnerAuth } from './contract';
-import { addField, createWorld, ORIGINS, seedDraft, type World } from './esign-world';
+import { addField, createWorld, landsBeforeFirst, ORIGINS, seedDraft, SEND_SQL, type World } from './esign-world';
 
 let w: World;
 
 function deps(over: Partial<ManageFieldsDeps> = {}): ManageFieldsDeps {
   return { allowedOrigins: ORIGINS, authorizeOwner: fakeOwnerAuth(), db: w.db, logSink: w.logSink, ...over };
 }
-const manage = (body: unknown) => createManageFieldsHandler(deps())(edgeRequest({ headers: CREDENTIALS.owner, body }));
+const manage = (body: unknown, d = deps()) => createManageFieldsHandler(d)(edgeRequest({ headers: CREDENTIALS.owner, body }));
 const box = (page_index: number, field_type: 'signature' | 'date' = 'signature') => ({ page_index, field_type, x: 10, y: 20, width: 100, height: 30 });
 
 beforeAll(async () => {
@@ -73,6 +73,15 @@ describe('esign-manage-fields', () => {
     await w.q(`UPDATE public.esign_envelopes SET status = 'sent', expires_at = now() + interval '1 day' WHERE id = $1`, [one.envelopeId]);
     const sent = await manage({ envelope_id: one.envelopeId, action: 'set', signer_id: one.signerIds[0], fields: [box(0)] });
     expect([sent.status, (await sent.json()).code]).toEqual([409, 'not_draft']);
+  });
+
+  it('a removal that lands after a send is refused by the database, as not_draft', async () => {
+    const d = await seedDraft(w, { signers: [{ email: 'late@example.com' }] });
+    const f = await addField(w, d.envelopeId, d.signerIds[0]);
+    const db = landsBeforeFirst(w, 'esign_envelope_fields', SEND_SQL, [d.envelopeId]);
+    const res = await manage({ envelope_id: d.envelopeId, action: 'remove', field_id: f }, deps({ db }));
+    expect([res.status, (await res.json()).code]).toEqual([409, 'not_draft']);
+    expect(await w.q(`SELECT 1 FROM public.esign_envelope_fields WHERE id = $1`, [f])).toHaveLength(1);
   });
 
   it('removes one field of this envelope only', async () => {

@@ -35,7 +35,7 @@ export interface SignerViewPdfDeps {
   allowedOrigins: string[];
   db: EsignDb;
   storage: Pick<EsignStorage, 'getWorking'>;
-  /** Default: 30 per address and 300 in all per 10 minutes. */
+  /** Default: 30 per address and 3000 in all per 10 minutes. */
   rateLimit?: RateLimit;
   now?: () => Date;
   logSink?: LogSink;
@@ -48,7 +48,7 @@ export function createSignerViewPdfHandler(deps: SignerViewPdfDeps): (req: Reque
     name: 'esign-signer-view-pdf',
     allowedOrigins: deps.allowedOrigins,
     auth: { public: true },
-    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_signer_view_pdf', { max: 30, windowMinutes: 10 }, { max: 300, windowMinutes: 10 }),
+    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_signer_view_pdf', { max: 30, windowMinutes: 10 }, { max: 3000, windowMinutes: 10 }),
     maxBodyBytes: 8_192,
     logSink: deps.logSink,
     async handle({ body, log, ip, userAgent }) {

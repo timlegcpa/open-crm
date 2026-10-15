@@ -93,9 +93,15 @@ export interface PlacedField {
 /**
  * The server fields not already in `local`: unknown by id AND by content slot. Never
  * replaces what is there, so an edit made while a save is in flight survives the refetch
- * that save triggers. A field whose page index is past the visible pages is left out.
+ * that save triggers. A field whose page index is past the visible pages is left out, and so
+ * is one whose id is in `deadIds` (deleted here, still on the server until the next save).
  */
-export function newServerFields(server: readonly FieldRow[], local: readonly PlacedField[], visiblePages: readonly PageRow[]): PlacedField[] {
+export function newServerFields(
+  server: readonly FieldRow[],
+  local: readonly PlacedField[],
+  visiblePages: readonly PageRow[],
+  deadIds: ReadonlySet<string> = new Set(),
+): PlacedField[] {
   const knownIds = new Set<string>();
   const knownContent = new Set<string>();
   for (const f of local) {
@@ -104,7 +110,7 @@ export function newServerFields(server: readonly FieldRow[], local: readonly Pla
   }
   const out: PlacedField[] = [];
   for (const f of server) {
-    if (knownIds.has(f.id)) continue;
+    if (knownIds.has(f.id) || deadIds.has(f.id)) continue;
     const key = fieldContentKey(f);
     if (knownContent.has(key)) continue;
     knownContent.add(key);

@@ -5,7 +5,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { sha256Hex } from '../../../supabase/functions/_shared/crypto';
 import { createResendInviteHandler, type ResendInviteDeps } from '../../../supabase/functions/esign-resend-invite/handler';
 import { CREDENTIALS, describeEdgeContract, edgeRequest, fakeOwnerAuth, throwInternal } from './contract';
-import { createWorld, ORIGINS, seedSentEnvelope, SITE_URL, type World } from './esign-world';
+import { createWorld, leaveSignerPending, ORIGINS, seedSentEnvelope, SITE_URL, type World } from './esign-world';
 
 let w: World;
 const NOW = new Date('2030-01-10T12:00:00Z');
@@ -79,7 +79,7 @@ describe('esign-resend-invite', () => {
 
   it('recovers a signer left pending by a failed first send', async () => {
     const { envelopeId, signers } = await seedSentEnvelope(w, { signers: [{ email: 'ada@example.com' }] });
-    await w.q(`UPDATE public.esign_envelope_signers SET status = 'pending', token_hash = NULL, invited_at = NULL WHERE id = $1`, [signers[0].id]);
+    await leaveSignerPending(w, envelopeId, signers[0].id, 'token_hash = NULL, invited_at = NULL');
     expect((await resend({ envelope_id: envelopeId, signer_id: signers[0].id })).status).toBe(200);
     const [s] = await w.q<{ status: string; invited_at: string | null }>(`SELECT status, invited_at FROM public.esign_envelope_signers WHERE id = $1`, [signers[0].id]);
     expect(s.status).toBe('invited');

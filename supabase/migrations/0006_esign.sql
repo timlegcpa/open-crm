@@ -50,6 +50,14 @@
 --     remaps the fields in the same transaction. So a stolen owner session cannot forge
 --     an executed envelope by writing rows: signing, completing and filing are server
 --     work.
+--   * An envelope's shape (documents, pages, signers, fields) changes only while it is a
+--     draft, for every writer, the server included (esign_guard_draft_edit, under the
+--     envelope row lock); each change bumps draft_revision, and send claims draft -> sent
+--     only at the revision it assembled.
+--   * Completion and delivery are apart: delivered_at is set once the copy is filed, the
+--     completion event written and every party emailed (each recorded in `delivery`);
+--     the expiry run re-drives a completed envelope until then. One filed copy per
+--     envelope and contact (client_documents_esign_envelope_contact_key).
 --   * No client session reads an e-sign table. A signer reaches the flow through a link
 --     (a token whose SHA-256 is stored, never the token) or, signed in to the portal,
 --     through esign-portal-signer-token, which trades the session for a fresh link. So no
@@ -73,9 +81,10 @@
 --     objects safe; should a signed-in write policy ever be added there, it must exclude
 --     names matching '%/esign/%'.
 --   * SMS codes are generated, HMAC'd and compared per signer: a code row is written
---     BEFORE the text is sent (the row is the state), the latest unconsumed row is the
---     only one that can match, and esign_check_sms_code holds the attempt cap in one
---     transaction. Two signers sharing a phone never share a code.
+--     BEFORE the text is sent (the row is the state), a new row spends every older one
+--     (esign_supersede_sms_codes) and an approval spends them all, so only the newest code
+--     can ever match, and esign_check_sms_code holds the attempt cap in one transaction.
+--     Two signers sharing a phone never share a code.
 --   * Retention: working files and drawn images of a terminal envelope go after 90 days
 --     (esign-expire-envelopes, aged per status as esign_purge_terminal_signature_images
 --     says), SMS code rows after 30 days, signer sessions a day after they expire
@@ -109,6 +118,16 @@ CREATE TABLE public.esign_envelopes (
   sent_at timestamptz,
   completed_at timestamptz,
   voided_at timestamptz,
+  -- Bumped by every change to the draft's documents, pages, signers or fields (the
+  -- draft-edit trigger); send claims draft -> sent only at the revision it assembled.
+  draft_revision integer NOT NULL DEFAULT 0 CHECK (draft_revision >= 0),
+  -- After completion: which completion emails went out (recipient digest -> sent at),
+  -- how many delivery runs there were, and when everything was delivered. The expiry
+  -- run re-drives a completed envelope until delivered_at is set.
+  delivery jsonb NOT NULL DEFAULT '{}'::jsonb
+    CHECK (jsonb_typeof(delivery) = 'object' AND pg_column_size(delivery) <= 8192),
+  delivery_attempts integer NOT NULL DEFAULT 0 CHECK (delivery_attempts >= 0),
+  delivered_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   -- Every envelope past draft has a deadline; the expiry run depends on it.
@@ -336,6 +355,10 @@ ALTER TABLE public.client_documents
   FOREIGN KEY (esign_envelope_id) REFERENCES public.esign_envelopes (id) ON DELETE SET NULL;
 CREATE INDEX idx_client_documents_esign_envelope ON public.client_documents (esign_envelope_id)
   WHERE esign_envelope_id IS NOT NULL;
+-- One executed copy per envelope and contact, however many finalize runs race to file it
+-- (rows with no envelope are NULL here, and NULLs never collide).
+ALTER TABLE public.client_documents
+  ADD CONSTRAINT client_documents_esign_envelope_contact_key UNIQUE (esign_envelope_id, contact_id);
 
 -- ---------------------------------------------------------------------------
 -- Triggers
@@ -375,6 +398,88 @@ $$;
 CREATE TRIGGER trg_esign_freeze_completed
   BEFORE UPDATE ON public.esign_envelopes
   FOR EACH ROW EXECUTE FUNCTION public.esign_freeze_completed_envelope();
+
+-- An envelope's shape (its documents, pages, signers and fields) changes only while it is
+-- a draft, for every writer. Each change takes the envelope row lock (the lock send's
+-- claim and a signature also take), refuses unless the envelope is still a draft, and
+-- bumps draft_revision, so a send that assembled an older revision loses its claim
+-- instead of sending a PDF that no longer matches the fields. Passed through: a signer's
+-- lifecycle after send (status past pending, link token, timestamps, the signed_*
+-- evidence), a contact deleted under a signer (contact_id SET NULL), and rows leaving
+-- with their envelope (the cascade, when the envelope row is already gone).
+CREATE FUNCTION public.esign_guard_draft_edit()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_envelope uuid;
+BEGIN
+  -- A write that changes nothing changes no shape.
+  IF TG_OP = 'UPDATE' AND NEW IS NOT DISTINCT FROM OLD THEN
+    RETURN NEW;
+  END IF;
+  IF TG_TABLE_NAME = 'esign_envelope_signers' AND TG_OP = 'UPDATE' THEN
+    IF NOT (
+      NEW.envelope_id IS DISTINCT FROM OLD.envelope_id
+      OR NEW.email IS DISTINCT FROM OLD.email
+      OR NEW.role IS DISTINCT FROM OLD.role
+      OR NEW."order" IS DISTINCT FROM OLD."order"
+      OR (NEW.contact_id IS DISTINCT FROM OLD.contact_id AND NEW.contact_id IS NOT NULL)
+      OR NEW.phone_ciphertext IS DISTINCT FROM OLD.phone_ciphertext
+      OR NEW.phone_iv IS DISTINCT FROM OLD.phone_iv
+      OR NEW.phone_last_four IS DISTINCT FROM OLD.phone_last_four
+      OR (NEW.status = 'pending' AND OLD.status IS DISTINCT FROM 'pending')
+    ) THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+
+  v_envelope := CASE WHEN TG_OP = 'DELETE' THEN OLD.envelope_id ELSE NEW.envelope_id END;
+  UPDATE public.esign_envelopes e
+     SET draft_revision = e.draft_revision + 1
+   WHERE e.id = v_envelope AND e.status = 'draft';
+  IF NOT FOUND THEN
+    IF TG_OP = 'DELETE' AND NOT EXISTS (SELECT 1 FROM public.esign_envelopes e WHERE e.id = v_envelope) THEN
+      RETURN OLD;
+    END IF;
+    RAISE EXCEPTION 'envelope is not a draft' USING ERRCODE = '55000';
+  END IF;
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+CREATE TRIGGER trg_esign_documents_draft_only
+  BEFORE INSERT OR UPDATE OR DELETE ON public.esign_envelope_documents
+  FOR EACH ROW EXECUTE FUNCTION public.esign_guard_draft_edit();
+CREATE TRIGGER trg_esign_pages_draft_only
+  BEFORE INSERT OR UPDATE OR DELETE ON public.esign_envelope_pages
+  FOR EACH ROW EXECUTE FUNCTION public.esign_guard_draft_edit();
+CREATE TRIGGER trg_esign_signers_draft_only
+  BEFORE INSERT OR UPDATE OR DELETE ON public.esign_envelope_signers
+  FOR EACH ROW EXECUTE FUNCTION public.esign_guard_draft_edit();
+CREATE TRIGGER trg_esign_fields_draft_only
+  BEFORE INSERT OR UPDATE OR DELETE ON public.esign_envelope_fields
+  FOR EACH ROW EXECUTE FUNCTION public.esign_guard_draft_edit();
+
+-- A new SMS code supersedes every older one for that signer: issuing it consumes the
+-- earlier unconsumed codes, so only the newest can ever match, before or after it is used.
+CREATE FUNCTION public.esign_supersede_sms_codes()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  UPDATE public.esign_sms_verifications v
+     SET consumed_at = now()
+   WHERE v.signer_id = NEW.signer_id AND v.consumed_at IS NULL AND v.id <> NEW.id;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_esign_sms_supersede
+  AFTER INSERT ON public.esign_sms_verifications
+  FOR EACH ROW EXECUTE FUNCTION public.esign_supersede_sms_codes();
 
 -- ---------------------------------------------------------------------------
 -- Server functions (EXECUTE to service_role only; each runs as the caller)
@@ -739,6 +844,10 @@ BEGIN
     UPDATE public.esign_sms_verifications v
        SET consumed_at = now(), attempt_count = v.attempt_count + 1
      WHERE v.id = v_row.id;
+    -- And any other code still outstanding: an approval leaves none usable.
+    UPDATE public.esign_sms_verifications v
+       SET consumed_at = now()
+     WHERE v.signer_id = p_signer_id AND v.consumed_at IS NULL;
     INSERT INTO public.esign_signer_sessions (signer_id, session_token_hash, expires_at, ip)
     VALUES (p_signer_id, p_session_token_hash, now() + make_interval(mins => p_session_minutes), p_ip);
     RETURN jsonb_build_object('status', 'approved', 'attempts', v_row.attempt_count + 1);
@@ -813,6 +922,49 @@ BEGIN
   )
   SELECT count(*) INTO v_deleted FROM gone;
   RETURN v_deleted;
+END;
+$$;
+
+-- One live envelope past its deadline, decided under the envelope row lock a signature
+-- also takes (esign_claim_signer_signature locks it FOR UPDATE), so no signature commits
+-- between the count and the flip. Still live and still past its deadline (a resend may
+-- have moved it), with everyone signed: nothing changes and the answer is all_signed, so
+-- the caller re-drives finalize. Otherwise the waiting signers expire and the envelope
+-- flips to expired in this one transaction.
+-- Answers { status: not_due | all_signed | expired, signers_expired, task_ids }.
+CREATE FUNCTION public.esign_expire_envelope(p_envelope_id uuid, p_at timestamptz)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_status text;
+  v_expires timestamptz;
+  v_total integer;
+  v_waiting integer;
+  v_expired integer;
+  v_tasks jsonb;
+BEGIN
+  SELECT e.status, e.expires_at INTO v_status, v_expires
+    FROM public.esign_envelopes e WHERE e.id = p_envelope_id FOR UPDATE;
+  IF v_status IS NULL OR v_status NOT IN ('sent', 'partially_signed') OR v_expires IS NULL OR v_expires >= p_at THEN
+    RETURN jsonb_build_object('status', 'not_due', 'signers_expired', 0, 'task_ids', '[]'::jsonb);
+  END IF;
+
+  SELECT count(*), count(*) FILTER (WHERE s.status <> 'signed') INTO v_total, v_waiting
+    FROM public.esign_envelope_signers s WHERE s.envelope_id = p_envelope_id;
+  IF v_total > 0 AND v_waiting = 0 THEN
+    RETURN jsonb_build_object('status', 'all_signed', 'signers_expired', 0, 'task_ids', '[]'::jsonb);
+  END IF;
+
+  SELECT COALESCE(jsonb_agg(s.client_task_id) FILTER (WHERE s.client_task_id IS NOT NULL), '[]'::jsonb) INTO v_tasks
+    FROM public.esign_envelope_signers s WHERE s.envelope_id = p_envelope_id AND s.status <> 'signed';
+  UPDATE public.esign_envelope_signers s
+     SET status = 'expired', token_expires_at = p_at
+   WHERE s.envelope_id = p_envelope_id AND s.status IN ('pending', 'invited', 'viewed');
+  GET DIAGNOSTICS v_expired = ROW_COUNT;
+  UPDATE public.esign_envelopes e SET status = 'expired' WHERE e.id = p_envelope_id;
+  RETURN jsonb_build_object('status', 'expired', 'signers_expired', v_expired, 'task_ids', v_tasks);
 END;
 $$;
 
@@ -954,6 +1106,9 @@ GRANT SELECT (
 
 REVOKE ALL ON FUNCTION
   public.esign_freeze_completed_envelope(),
+  public.esign_guard_draft_edit(),
+  public.esign_supersede_sms_codes(),
+  public.esign_expire_envelope(uuid, timestamptz),
   public.esign_insert_document_with_pages(uuid, uuid, text, text, bigint, integer),
   public.esign_set_signer_fields(uuid, uuid, jsonb),
   public.esign_apply_page_reorder(uuid, jsonb, jsonb, uuid[]),
@@ -974,5 +1129,6 @@ GRANT EXECUTE ON FUNCTION
   public.esign_check_sms_code(uuid, text, integer, text, inet, integer),
   public.esign_delete_signature_images_for_envelope(uuid),
   public.esign_purge_terminal_signature_images(timestamptz, integer),
-  public.esign_prune_operational()
+  public.esign_prune_operational(),
+  public.esign_expire_envelope(uuid, timestamptz)
   TO service_role;

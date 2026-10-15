@@ -38,6 +38,7 @@ import { EsignContactBadge } from '../badges';
 import { DeleteEnvelopeDialog } from '../components/EnvelopeDialogs';
 import { ReviewSend } from '../components/ReviewSend';
 import type { EnvelopeWithContact } from '../api';
+import { esignKeys } from '../keys';
 
 function wrap(ui: React.ReactNode) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
@@ -114,6 +115,28 @@ describe('ReviewSend', () => {
     expect(await screen.findByText('ada@example.com has no field to sign.')).toBeInTheDocument();
     expect(screen.getByText('ada@example.com has no phone, which High verification needs.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Send envelope' })).toBeDisabled();
+  });
+
+  it('rereads the fields on arrival and keeps Send off until they are back', async () => {
+    state.getPages.mockResolvedValue([{ id: 'p', deleted: false, order: 0 }]);
+    state.getSigners.mockResolvedValue([signer('ada', '0001')]);
+    let answer!: (rows: unknown[]) => void;
+    state.getFields.mockReturnValue(new Promise((r) => (answer = r)));
+    // A cache that still holds a ready layout, and would never refetch on its own.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    client.setQueryData(esignKeys.fields('env-1'), [{ id: 'f', signer_id: 'ada', required: true }]);
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReviewSend envelope={envelope} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const send = await screen.findByRole('button', { name: 'Send envelope' });
+    await waitFor(() => expect(state.getFields).toHaveBeenCalled());
+    expect(send).toBeDisabled();
+    answer([{ id: 'f2', signer_id: 'ada', required: true }]);
+    await waitFor(() => expect(send).toBeEnabled());
   });
 
   it('sends after the confirmation and reports invitations that did not go out', async () => {

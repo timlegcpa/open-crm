@@ -86,7 +86,7 @@ function PageView({
       <canvas ref={canvasRef} className={meta ? 'block' : 'hidden'} aria-label={`Page ${index + 1}`} role="img" />
       {meta &&
         fields.map((f) => {
-          const r = pdfToCanvas(f, meta.pageWidthPt, meta.pageHeightPt, meta.canvasWidthPx, meta.canvasHeightPx);
+          const r = pdfToCanvas(f, meta.geometry);
           const style: CSSProperties = { position: 'absolute', left: r.x, top: r.y, width: r.w, height: r.h };
           if (f.field_type === 'signature') {
             return (

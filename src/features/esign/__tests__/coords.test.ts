@@ -1,95 +1,51 @@
-import { describe, it, expect } from 'vitest';
-import { canvasToPdf, pdfToCanvas } from '../lib/coords';
+import { describe, expect, it } from 'vitest';
+import { canvasToPdf, pdfToCanvas, viewportTransform, type PageGeometry } from '../lib/coords';
 
 /**
- * canvasToPdf converts a canvas-space rect (top-left origin, pixels) to
- * PDF-space coords (bottom-left origin, points).
- *
- * pdfToCanvas is the inverse, used at render time to position existing
- * field overlays back onto the rendered page canvas.
+ * Field coordinates are user-space points on the UNROTATED page, which is where the server
+ * stamps them. The expected transforms below were read from real pdf.js
+ * (`page.getViewport({ scale }).transform`) on pages pdf-lib built with these sizes,
+ * rotations and CropBoxes, so the rebuilt transform is held to pdf.js itself.
  */
+const PDFJS: Array<{ geometry: PageGeometry; transform: number[] }> = [
+  { geometry: { viewBox: [0, 0, 612, 792], rotation: 90, scale: 1 }, transform: [0, 1, 1, 0, 0, 0] },
+  { geometry: { viewBox: [50, 40, 562, 742], rotation: 0, scale: 1.5 }, transform: [1.5, 0, 0, -1.5, -75, 1113] },
+  { geometry: { viewBox: [50, 40, 562, 742], rotation: 270, scale: 2 }, transform: [0, -2, -2, 0, 1484, 1124] },
+  { geometry: { viewBox: [10, 20, 300, 400], rotation: 180, scale: 1.2 }, transform: [-1.2, 0, 0, 1.2, 360, -24] },
+];
 
-describe('canvasToPdf', () => {
-  it('identity: 1:1 scale and aligned page sizes returns y-flipped coords with same dimensions', () => {
-    // Page is 100x100 pt, canvas is 100x100 px. Rect at top-left (y=0) of canvas
-    // (height 10) maps to PDF y = 100 - (0 + 10) = 90 (near top in PDF coords).
-    const result = canvasToPdf(
-      { x: 10, y: 0, w: 20, h: 10 },
-      100, 100, 100, 100,
-    );
-    expect(result.x).toBe(10);
-    expect(result.y).toBe(90);
-    expect(result.width).toBe(20);
-    expect(result.height).toBe(10);
-  });
+const round = (o: Record<string, number>) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Math.round(v * 1e6) / 1e6 + 0]));
 
-  it('pure scale: canvas 200x200 → page 100x100 halves all dimensions', () => {
-    const result = canvasToPdf(
-      { x: 40, y: 60, w: 20, h: 10 },
-      100, 100, 200, 200,
-    );
-    expect(result.x).toBe(20); // 40 * 0.5
-    expect(result.width).toBe(10); // 20 * 0.5
-    expect(result.height).toBe(5); // 10 * 0.5
-    // y-flip: pageHeight - (rect.y + rect.h) * scaleY = 100 - (60+10)*0.5 = 100 - 35 = 65
-    expect(result.y).toBe(65);
-  });
-
-  it('y-flip at top edge: canvas y=0 → PDF y = pageHeight - h*scaleY', () => {
-    const result = canvasToPdf(
-      { x: 0, y: 0, w: 50, h: 25 },
-      400, 600, 800, 1200,
-    );
-    // scaleY = 600/1200 = 0.5; PDF y = 600 - (0+25)*0.5 = 600 - 12.5 = 587.5
-    expect(result.y).toBe(587.5);
-    expect(result.height).toBe(12.5);
-  });
-
-  it('y-flip at bottom edge: a rect flush with the canvas bottom maps to PDF y = 0', () => {
-    // canvas height 1200 px, rect bottom at y+h = 1200 → PDF y = 600 - 1200*0.5 = 0
-    const result = canvasToPdf(
-      { x: 0, y: 1100, w: 100, h: 100 },
-      400, 600, 800, 1200,
-    );
-    expect(result.y).toBe(0);
-    expect(result.height).toBe(50);
-  });
-
-  it('non-square aspect ratios use independent x/y scales', () => {
-    const result = canvasToPdf(
-      { x: 100, y: 50, w: 40, h: 20 },
-      400, 800, 800, 1600,
-    );
-    // scaleX = 400/800 = 0.5; scaleY = 800/1600 = 0.5
-    expect(result.x).toBe(50);
-    expect(result.width).toBe(20);
-    expect(result.height).toBe(10);
-    // y = 800 - (50 + 20) * 0.5 = 800 - 35 = 765
-    expect(result.y).toBe(765);
+describe('the viewport transform', () => {
+  it.each(PDFJS)('equals pdf.js for $geometry.rotation degrees, viewBox $geometry.viewBox', ({ geometry, transform }) => {
+    expect(viewportTransform(geometry).map((n) => Math.round(n * 1e6) / 1e6 + 0)).toEqual(transform);
   });
 });
 
-describe('pdfToCanvas', () => {
-  it('inverts canvasToPdf: round-trip yields the original rect', () => {
-    const original = { x: 100, y: 200, w: 60, h: 30 };
-    const pdf = canvasToPdf(original, 612, 792, 800, 1035);
-    const back = pdfToCanvas(
-      { x: pdf.x, y: pdf.y, width: pdf.width, height: pdf.height },
-      612, 792, 800, 1035,
-    );
-    expect(back.x).toBeCloseTo(original.x, 6);
-    expect(back.y).toBeCloseTo(original.y, 6);
-    expect(back.w).toBeCloseTo(original.w, 6);
-    expect(back.h).toBeCloseTo(original.h, 6);
+describe('canvas to user space', () => {
+  it('an unrotated letter page at 1x is the plain y-flip', () => {
+    const g: PageGeometry = { viewBox: [0, 0, 612, 792], rotation: 0, scale: 1 };
+    expect(canvasToPdf({ x: 10, y: 0, w: 20, h: 10 }, g)).toEqual({ x: 10, y: 782, width: 20, height: 10 });
   });
 
-  it('places a field at PDF y=0 (bottom of page) flush against the canvas bottom', () => {
-    const back = pdfToCanvas(
-      { x: 0, y: 0, width: 50, height: 25 },
-      400, 600, 800, 1200,
-    );
-    // canvas y = (pageHeight - pdf.y - pdf.height) / scaleY = (600 - 0 - 25) / 0.5 = 1150
-    expect(back.y).toBe(1150);
-    expect(back.h).toBe(50);
+  it('a page rotated 90 degrees: the preview box lands on the same spot, width and height swapped', () => {
+    // The review case: 612x792 rotated 90, preview box (650, 10, 100, 30). The old
+    // size-only scaling stored (650, 572, ...), which the stamp put somewhere else.
+    const g: PageGeometry = { viewBox: [0, 0, 612, 792], rotation: 90, scale: 1 };
+    const stored = canvasToPdf({ x: 650, y: 10, w: 100, h: 30 }, g);
+    expect(stored).toEqual({ x: 10, y: 650, width: 30, height: 100 });
+    expect(stored.x + stored.width).toBeLessThanOrEqual(612);
+    expect(stored.y + stored.height).toBeLessThanOrEqual(792);
+  });
+
+  it('a CropBox that does not start at 0,0 offsets the stored point', () => {
+    const g: PageGeometry = { viewBox: [50, 40, 562, 742], rotation: 0, scale: 1 };
+    // The crop's top-left corner on screen is user space (50, 742).
+    expect(round({ ...canvasToPdf({ x: 0, y: 0, w: 100, h: 20 }, g) })).toEqual({ x: 50, y: 722, width: 100, height: 20 });
+  });
+
+  it.each(PDFJS)('round-trips at $geometry.rotation degrees', ({ geometry }) => {
+    const rect = { x: 37, y: 112, w: 140, h: 34 };
+    expect(round({ ...pdfToCanvas(canvasToPdf(rect, geometry), geometry) })).toEqual(rect);
   });
 });

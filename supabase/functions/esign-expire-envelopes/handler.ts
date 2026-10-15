@@ -1,11 +1,15 @@
 // esign-expire-envelopes: the daily e-signature sweep. The job runner calls it with the
 // cron secret (schedule `esign:expire_envelopes`); the owner may run it by hand.
 //
-//   1. Live envelopes past their deadline. One everyone signed is NOT expired: finalize
-//      is re-driven for it (one per run, so the run stays inside the runner's timeout;
-//      the rest wait for the next run, still live). The others have their waiting
-//      signers expired and pending portal tasks dismissed first, then the envelope flips
-//      to expired with a status guard (a signature landing meanwhile wins).
+//   1. Live envelopes past their deadline, each decided in ONE locked transaction
+//      (esign_expire_envelope, under the envelope row lock a signature also takes): one
+//      everyone signed is NOT expired, and finalize is re-driven for it (one per run, so
+//      the run stays inside the runner's timeout; the rest wait for the next run, still
+//      live). Otherwise the waiting signers expire and the envelope flips to expired
+//      together; their pending portal tasks are dismissed after.
+//   1b. Completed envelopes whose deliverables (filing, the completion event, each
+//      party's email) did not all go out: finalize re-drives the delivery alone, a few
+//      per run, until it is done or has been tried MAX_DELIVERY_ATTEMPTS times.
 //   2. Retention: 90 days after an envelope ended (each status aged by its own moment),
 //      its working files go (after a COMPLETE listing), then its drawn images, then the
 //      source path is cleared, which takes it out of every later sweep. The executed
@@ -19,7 +23,7 @@ import { sha256Hex } from '../_shared/crypto.ts';
 import type { AuthOutcome, OwnerPrincipal } from '../_shared/auth.ts';
 import { createHandler } from '../_shared/handler.ts';
 import type { Logger, LogSink } from '../_shared/log.ts';
-import { call, countOf, rows, run } from '../esign-finalize-envelope/lib/db.ts';
+import { call, rows, run } from '../esign-finalize-envelope/lib/db.ts';
 import { expirySummaryEmail } from '../esign-finalize-envelope/lib/emails.ts';
 import { recordEvent } from '../esign-finalize-envelope/lib/events.ts';
 import { createMailer, type MailDeps } from '../esign-finalize-envelope/lib/mail.ts';
@@ -36,6 +40,7 @@ export interface ExpireEnvelopesResponse {
   tasks_dismissed: number;
   finalize_redriven: number;
   finalize_deferred: number;
+  delivery_redriven: number;
   working_envelopes_purged: number;
   working_objects_removed: number;
   signature_images_purged: number;
@@ -47,6 +52,10 @@ export const WORKING_RETENTION_DAYS = 90;
 const MAX_EXPIRE_PER_RUN = 200;
 const MAX_PURGE_PER_RUN = 50;
 const MAX_FINALIZE_PER_RUN = 1;
+const MAX_DELIVERY_PER_RUN = 3;
+export const MAX_DELIVERY_ATTEMPTS = 5;
+/** A completed envelope younger than this is still in its own finalize call. */
+const DELIVERY_GRACE_MINUTES = 15;
 
 /** Each terminal status, aged by its own moment. */
 const TERMINAL_AGE: ReadonlyArray<{ status: string; column: string }> = [
@@ -89,6 +98,7 @@ export function createExpireEnvelopesHandler(deps: ExpireEnvelopesDeps): (req: R
         tasks_dismissed: 0,
         finalize_redriven: 0,
         finalize_deferred: 0,
+        delivery_redriven: 0,
         working_envelopes_purged: 0,
         working_objects_removed: 0,
         signature_images_purged: 0,
@@ -105,12 +115,12 @@ export function createExpireEnvelopesHandler(deps: ExpireEnvelopesDeps): (req: R
       const summaryIds: string[] = [];
       for (const env of due) {
         try {
-          const outstanding = await countOf(
-            'outstanding count',
-            db.from('esign_envelope_signers').select('id', { count: 'exact', head: true }).eq('envelope_id', env.id).neq('status', 'signed'),
+          const decided = await call<{ status: 'not_due' | 'all_signed' | 'expired'; signers_expired: number; task_ids: string[] }>(
+            db,
+            'esign_expire_envelope',
+            { p_envelope_id: env.id, p_at: atIso },
           );
-          const total = await countOf('signer count', db.from('esign_envelope_signers').select('id', { count: 'exact', head: true }).eq('envelope_id', env.id));
-          if (total > 0 && outstanding === 0) {
+          if (decided.status === 'all_signed') {
             if (out.finalize_redriven < MAX_FINALIZE_PER_RUN) {
               out.finalize_redriven += 1;
               if (!(await deps.finalize(env.id))) log.warn('finalize re-drive did not complete', { envelope_id: env.id });
@@ -119,8 +129,8 @@ export function createExpireEnvelopesHandler(deps: ExpireEnvelopesDeps): (req: R
             }
             continue;
           }
-          const result = await expireOne(env.id, atIso);
-          if (!result) continue;
+          if (decided.status !== 'expired') continue;
+          const result = { signers: decided.signers_expired, tasks: await dismissTasks(decided.task_ids) };
           out.expired += 1;
           out.signers_expired += result.signers;
           out.tasks_dismissed += result.tasks;
@@ -134,6 +144,28 @@ export function createExpireEnvelopesHandler(deps: ExpireEnvelopesDeps): (req: R
         } catch (err) {
           log.error('envelope not expired; the next run retries', err, { envelope_id: env.id });
         }
+      }
+
+      // 1b. Completed envelopes whose delivery is unfinished.
+      try {
+        const undelivered = await rows<{ id: string }>(
+          'undelivered read',
+          db
+            .from('esign_envelopes')
+            .select('id')
+            .eq('status', 'completed')
+            .is('delivered_at', null)
+            .lt('delivery_attempts', MAX_DELIVERY_ATTEMPTS)
+            .lt('completed_at', new Date(at.getTime() - DELIVERY_GRACE_MINUTES * 60_000).toISOString())
+            .order('completed_at')
+            .limit(MAX_DELIVERY_PER_RUN),
+        );
+        for (const env of undelivered) {
+          out.delivery_redriven += 1;
+          if (!(await deps.finalize(env.id))) log.warn('delivery re-drive did not complete', { envelope_id: env.id });
+        }
+      } catch (err) {
+        log.error('delivery re-drive failed; the next run retries', err);
       }
 
       // 2. Working files of envelopes that ended long ago.
@@ -188,31 +220,10 @@ export function createExpireEnvelopesHandler(deps: ExpireEnvelopesDeps): (req: R
     },
   });
 
-  /** Children first, then the envelope; null when the flip lost to a signature. */
-  async function expireOne(envelopeId: string, atIso: string): Promise<{ signers: number; tasks: number } | null> {
-    const signers = await rows<{ id: string; status: string; client_task_id: string | null }>(
-      'signer read',
-      db.from('esign_envelope_signers').select('id, status, client_task_id').eq('envelope_id', envelopeId),
-    );
-    const expired = await rows(
-      'signer expiry',
-      db
-        .from('esign_envelope_signers')
-        .update({ status: 'expired', token_expires_at: atIso })
-        .eq('envelope_id', envelopeId)
-        .in('status', ['pending', 'invited', 'viewed'])
-        .select('id'),
-    );
-    const taskIds = signers.filter((s) => s.status !== 'signed').map((s) => s.client_task_id).filter((id): id is string => !!id);
-    let tasks = 0;
-    if (taskIds.length > 0) {
-      tasks = (await rows('task dismiss', db.from('client_tasks').update({ status: 'dismissed' }).in('id', taskIds).eq('status', 'pending').select('id'))).length;
-    }
-    const flipped = await rows(
-      'envelope expiry',
-      db.from('esign_envelopes').update({ status: 'expired' }).eq('id', envelopeId).in('status', [...LIVE_ENVELOPE]).select('id'),
-    );
-    return flipped.length > 0 ? { signers: expired.length, tasks } : null;
+  /** The expired signers' pending portal tasks, dismissed after the flip. */
+  async function dismissTasks(taskIds: readonly string[]): Promise<number> {
+    if (taskIds.length === 0) return 0;
+    return (await rows('task dismiss', db.from('client_tasks').update({ status: 'dismissed' }).in('id', [...taskIds]).eq('status', 'pending').select('id'))).length;
   }
 
   async function purgeWorking(envelopeId: string): Promise<number> {

@@ -14,10 +14,14 @@
 //   4. completed is CLAIMED with a status guard, setting all four frozen fields at once
 //      (the database refuses any later change to them). Losing the claim means another
 //      call completed it: answered as already completed.
-//   5. Deliverables, idempotent: the filing folder (from settings) for each signer's
-//      contact, one documents row per contact over the ONE object, the completion event
-//      once, and the copy emailed to every signer and the owner. A completed envelope
-//      that comes back here (a crash after the claim) re-drives this step alone.
+//   5. Deliverables, each idempotent and recorded on the envelope: the filing folder
+//      (from settings) for each signer's contact and one documents row per contact over
+//      the ONE object (unique per envelope and contact, so racing runs file once), the
+//      completion event once, and the copy emailed to every signer and the owner, each
+//      party recorded in `delivery` once sent (and sent with a per-party idempotency key).
+//      delivered_at is set when all of it is done. A completed envelope that comes back
+//      here (a crash, a failed email) re-drives this step alone, skipping what is done;
+//      the daily expiry run brings back any completed envelope still undelivered.
 
 import { sha256Hex } from '../_shared/crypto.ts';
 import { createHandler, HttpError } from '../_shared/handler.ts';
@@ -26,7 +30,7 @@ import type { Logger, LogSink } from '../_shared/log.ts';
 import { allRows, byTimeThenId, maybeOne, rows, run, type Row } from './lib/db.ts';
 import { completedEmail } from './lib/emails.ts';
 import { badRequest, envelopeNotFound, objectBody } from './lib/errors.ts';
-import { auditPhrase } from './lib/events.ts';
+import { auditTrail } from './lib/events.ts';
 import { createMailer, type MailDeps } from './lib/mail.ts';
 import { sha256Bytes, type PdfTools, type SignerFontKey, type SignerStamp, type StampField } from './lib/pdf.ts';
 import { consentLine, identityCheckLine } from './lib/phone.ts';
@@ -44,7 +48,7 @@ export interface FinalizeEnvelopeRequest {
 export type FinalizeEnvelopeResponse =
   | { ok: true; signed_pdf_path: string; sha256: string }
   | { ok: true; already_completed: true; signed_pdf_path: string | null }
-  | { ok: true; recovered: true; signed_pdf_path: string };
+  | { ok: true; recovered: true; delivered: boolean; signed_pdf_path: string };
 
 export const FINALIZE_ENVELOPE_ERRORS = ['bad_request', 'not_found', 'not_finalizable', 'not_all_signed', 'no_owner_contact', 'site_url_missing'] as const;
 
@@ -67,6 +71,9 @@ interface EnvelopeRow {
   source_pdf_path: string | null;
   signed_pdf_path: string | null;
   signed_pdf_sha256: string | null;
+  delivery: { emails?: Record<string, string> } | null;
+  delivery_attempts: number;
+  delivered_at: string | null;
 }
 
 interface SignerRow {
@@ -115,7 +122,7 @@ export function createFinalizeEnvelopeHandler(deps: FinalizeEnvelopeDeps): (req:
         'envelope read',
         db
           .from('esign_envelopes')
-          .select('id, title, status, primary_contact_id, source_pdf_path, signed_pdf_path, signed_pdf_sha256')
+          .select('id, title, status, primary_contact_id, source_pdf_path, signed_pdf_path, signed_pdf_sha256, delivery, delivery_attempts, delivered_at')
           .eq('id', envelopeId)
           .maybeSingle(),
       );
@@ -126,17 +133,14 @@ export function createFinalizeEnvelopeHandler(deps: FinalizeEnvelopeDeps): (req:
       const contacts = await contactsOf(signers);
       const nameOf = (s: SignerRow) => resolveSignerName({ email: s.email, role: s.role, contact: s.contact_id ? contacts.get(s.contact_id) ?? null : null });
 
-      // A completed envelope: re-drive the deliverables a crash may have cut short.
+      // A completed envelope: re-drive whatever of the delivery is not done yet.
       if (envelope.status === 'completed') {
-        if (!envelope.signed_pdf_path || !envelope.signed_pdf_sha256) {
+        if (!envelope.signed_pdf_path || !envelope.signed_pdf_sha256 || envelope.delivered_at) {
           return json(200, { ok: true, already_completed: true, signed_pdf_path: envelope.signed_pdf_path } satisfies FinalizeEnvelopeResponse);
         }
         const stored = await deps.storage.getDocument(envelope.signed_pdf_path);
-        const created = await deliver(log, envelope, signers, nameOf, envelope.signed_pdf_path, envelope.signed_pdf_sha256, stored);
-        const response: FinalizeEnvelopeResponse = created
-          ? { ok: true, recovered: true, signed_pdf_path: envelope.signed_pdf_path }
-          : { ok: true, already_completed: true, signed_pdf_path: envelope.signed_pdf_path };
-        return json(200, response);
+        const delivered = await deliver(log, envelope, signers, nameOf, envelope.signed_pdf_path, envelope.signed_pdf_sha256, stored);
+        return json(200, { ok: true, recovered: true, delivered, signed_pdf_path: envelope.signed_pdf_path } satisfies FinalizeEnvelopeResponse);
       }
       if (!(LIVE_ENVELOPE as readonly string[]).includes(envelope.status)) {
         throw new HttpError(409, 'This envelope is not waiting for signatures.', 'not_finalizable');
@@ -213,11 +217,10 @@ export function createFinalizeEnvelopeHandler(deps: FinalizeEnvelopeDeps): (req:
           consent: consentLine(s),
           signature_type: s.signed_signature_kind === 'drawn' ? 'Drawn' : 'Typed',
         })),
-        events: events.sort(byTimeThenId).flatMap((e) => {
-          const s = e.signer_id ? byId.get(e.signer_id) : undefined;
+        events: auditTrail(events.sort(byTimeThenId), (signerId) => {
+          const s = signerId ? byId.get(signerId) : undefined;
           const contact = s?.contact_id ? contacts.get(s.contact_id) ?? null : null;
-          const phrase = auditPhrase(e.event_type, s ? { email: s.email, role: s.role, contact } : undefined, e.metadata);
-          return phrase ? [{ created_at: e.created_at, phrase, ip: e.ip }] : [];
+          return s ? { email: s.email, role: s.role, contact } : undefined;
         }),
       });
 
@@ -253,7 +256,10 @@ export function createFinalizeEnvelopeHandler(deps: FinalizeEnvelopeDeps): (req:
     return new Map(found.map((c) => [c.id, c]));
   }
 
-  /** Files the executed copy and sends it. True when anything new was filed. */
+  /**
+   * Files the executed copy and sends it, skipping whatever an earlier run finished, and
+   * records the outcome on the envelope. True when everything is now delivered.
+   */
   async function deliver(
     log: Logger,
     envelope: EnvelopeRow,
@@ -263,79 +269,107 @@ export function createFinalizeEnvelopeHandler(deps: FinalizeEnvelopeDeps): (req:
     sha256: string,
     pdf: Uint8Array,
   ): Promise<boolean> {
-    // Contacts that were deleted since (contact_id SET NULL) are skipped: a documents row needs one.
-    const contactIds = [...new Set(signers.map((s) => s.contact_id).filter((id): id is string => !!id))];
-    const existing = await rows<{ contact_id: string }>(
-      'filed copy read',
-      db.from('client_documents').select('contact_id').eq('esign_envelope_id', envelope.id),
-    );
-    const filed = new Set(existing.map((r) => r.contact_id));
-    const needing = contactIds.filter((id) => !filed.has(id));
-    if (needing.length === 0) return false;
-
-    const settings = await loadEsignSettings(db);
-    const chain = settings.filingFolder;
-    const folderRows: Row[] = [];
-    for (const contactId of needing) {
-      chain.forEach((name, i) => {
-        folderRows.push({ contact_id: contactId, parent_path: i === 0 ? '/' : `/${chain.slice(0, i).join('/')}/`, name, held_by: 'owner' });
-      });
-    }
-    await run(
-      'filing folder upsert',
-      db.from('client_folders').upsert(folderRows, { onConflict: 'contact_id,parent_path,name,held_by', ignoreDuplicates: true }),
-    );
-
     const fileTitle = executedFileTitle(envelope.title);
-    await run(
-      'filed copy insert',
-      db.from('client_documents').insert(
-        needing.map((contactId) => ({
-          contact_id: contactId,
-          uploaded_by: null,
-          filename: `${envelope.id}.pdf`,
-          original_filename: `${fileTitle}.pdf`,
-          storage_path: signedPath,
-          file_size: pdf.byteLength,
-          mime_type: 'application/pdf',
-          folder_path: `/${chain.join('/')}/`,
-          held_by: 'owner',
-          // Honest: the executed copy is plaintext, served by a short signed URL.
-          encryption_status: 'none',
-          esign_envelope_id: envelope.id,
-        })),
-      ),
-    );
+    let complete = true;
 
-    const done = await rows(
-      'completion event read',
-      db.from('esign_envelope_events').select('id').eq('envelope_id', envelope.id).eq('event_type', 'envelope_completed').limit(1),
-    );
-    if (done.length === 0) {
-      const ev = await db.from('esign_envelope_events').insert({
-        envelope_id: envelope.id,
-        event_type: 'envelope_completed',
-        metadata: { signed_pdf_path: signedPath, sha256 },
-      });
-      if (ev.error) log.error('completion event failed', ev.error, { envelope_id: envelope.id });
+    // a. Filing. Contacts deleted since (contact_id SET NULL) are skipped: a documents row
+    // needs one. The unique (esign_envelope_id, contact_id) makes a racing run's row a no-op.
+    try {
+      const contactIds = [...new Set(signers.map((s) => s.contact_id).filter((id): id is string => !!id))];
+      if (contactIds.length > 0) {
+        const chain = (await loadEsignSettings(db)).filingFolder;
+        const folderRows: Row[] = [];
+        for (const contactId of contactIds) {
+          chain.forEach((name, i) => {
+            folderRows.push({ contact_id: contactId, parent_path: i === 0 ? '/' : `/${chain.slice(0, i).join('/')}/`, name, held_by: 'owner' });
+          });
+        }
+        await run(
+          'filing folder upsert',
+          db.from('client_folders').upsert(folderRows, { onConflict: 'contact_id,parent_path,name,held_by', ignoreDuplicates: true }),
+        );
+        await run(
+          'filed copy insert',
+          db.from('client_documents').upsert(
+            contactIds.map((contactId) => ({
+              contact_id: contactId,
+              uploaded_by: null,
+              filename: `${envelope.id}.pdf`,
+              original_filename: `${fileTitle}.pdf`,
+              storage_path: signedPath,
+              file_size: pdf.byteLength,
+              mime_type: 'application/pdf',
+              folder_path: `/${chain.join('/')}/`,
+              held_by: 'owner',
+              // Honest: the executed copy is plaintext, served by a short signed URL.
+              encryption_status: 'none',
+              esign_envelope_id: envelope.id,
+            })),
+            { onConflict: 'esign_envelope_id,contact_id', ignoreDuplicates: true },
+          ),
+        );
+      }
+    } catch (err) {
+      complete = false;
+      log.error('executed copy not filed; the expiry run retries', err, { envelope_id: envelope.id });
     }
 
+    // b. The completion event, once.
+    try {
+      const done = await rows(
+        'completion event read',
+        db.from('esign_envelope_events').select('id').eq('envelope_id', envelope.id).eq('event_type', 'envelope_completed').limit(1),
+      );
+      if (done.length === 0) {
+        await run(
+          'completion event insert',
+          db.from('esign_envelope_events').insert({ envelope_id: envelope.id, event_type: 'envelope_completed', metadata: { signed_pdf_path: signedPath, sha256 } }),
+        );
+      }
+    } catch (err) {
+      complete = false;
+      log.error('completion event failed', err, { envelope_id: envelope.id });
+    }
+
+    // c. Each party's email, once: a party already recorded is skipped.
+    const sent: Record<string, string> = { ...(envelope.delivery?.emails ?? {}) };
     try {
       const mailer = await createMailer(deps, log);
       const recipients = signers.map((s) => ({ email: s.email, name: nameOf(s) as string | null }));
       const owner = await deps.ownerEmail();
       if (owner && !recipients.some((r) => r.email === owner.toLowerCase())) recipients.push({ email: owner, name: null });
       for (const r of recipients) {
+        const party = await sha256Hex(r.email.trim().toLowerCase());
+        if (sent[party]) continue;
         const status = await mailer.send(r.email, completedEmail({ org: mailer.org, recipientName: r.name === r.email ? null : r.name, title: envelope.title }), {
           attachments: [{ filename: `${fileTitle}_signed.pdf`, content: pdf }],
           tags: { envelope_id: envelope.id, kind: 'esign_completed' },
           idempotencyKey: `esign_completed:${envelope.id}:${await sha256Hex(r.email)}`,
         });
-        if (status !== 'sent') log.warn('completion email not sent', { envelope_id: envelope.id });
+        if (status === 'sent') {
+          sent[party] = now().toISOString();
+        } else {
+          complete = false;
+          log.warn('completion email not sent', { envelope_id: envelope.id });
+        }
       }
     } catch (err) {
+      complete = false;
       log.error('completion emails not sent', err, { envelope_id: envelope.id });
     }
-    return true;
+
+    // d. The record the expiry run reads.
+    try {
+      await run(
+        'delivery record',
+        db
+          .from('esign_envelopes')
+          .update({ delivery: { emails: sent }, delivery_attempts: envelope.delivery_attempts + 1, delivered_at: complete ? now().toISOString() : null })
+          .eq('id', envelope.id),
+      );
+    } catch (err) {
+      log.error('delivery record not written; the expiry run re-checks', err, { envelope_id: envelope.id });
+    }
+    return complete;
   }
 }

@@ -67,7 +67,7 @@ describe('esign-send-envelope', () => {
       [draft.envelopeId],
     );
     expect(env.status).toBe('sent');
-    expect(env.source_pdf_path).toBe(`${draft.envelopeId}/source.pdf`);
+    expect(env.source_pdf_path).toMatch(new RegExp(`^${draft.envelopeId}/source-[0-9a-f-]{36}\\.pdf$`));
     const assembled = w.storage.working.get(env.source_pdf_path) as Uint8Array;
     expect(env.source_pdf_sha256).toBe(await sha256Bytes(assembled));
     expect((await pdfLib.PDFDocument.load(assembled)).getPageCount()).toBe(3);
@@ -111,7 +111,7 @@ describe('esign-send-envelope', () => {
     ]);
     const [env] = await w.q<{ status: string }>(`SELECT status FROM public.esign_envelopes WHERE id = $1`, [draft.envelopeId]);
     expect(env.status).toBe('draft');
-    expect(w.storage.working.has(`${draft.envelopeId}/source.pdf`)).toBe(false);
+    expect([...w.storage.working.keys()].filter((k) => k.startsWith(`${draft.envelopeId}/source-`))).toEqual([]);
   });
 
   it('refuses a draft with no pages or no signers, with one problem as the sentence', async () => {
@@ -141,6 +141,25 @@ describe('esign-send-envelope', () => {
     expect(res.status).toBe(409);
     const [s] = await w.q<{ status: string }>(`SELECT status FROM public.esign_envelope_signers WHERE envelope_id = $1`, [draft.envelopeId]);
     expect(s.status).toBe('pending');
+  });
+
+  it('an edit landing mid-send makes the send lose; the stored file is never overwritten', async () => {
+    const draft = await readyDraft();
+    // The edit commits after the send read the draft and assembled it, before its claim.
+    const racing = withRace(w, 'esign_envelopes', (v) => v.status === 'sent', `UPDATE public.esign_envelope_signers SET role = 'primary' WHERE envelope_id = $1`, [draft.envelopeId]);
+    const res = await send(draft.envelopeId, deps({ db: racing }));
+    expect([res.status, (await res.json()).code]).toEqual([409, 'draft_changed']);
+    const [env] = await w.q<{ status: string; source_pdf_path: string | null }>(`SELECT status, source_pdf_path FROM public.esign_envelopes WHERE id = $1`, [draft.envelopeId]);
+    expect(env).toEqual({ status: 'draft', source_pdf_path: null });
+    expect([...w.storage.working.keys()].filter((k) => k.startsWith(`${draft.envelopeId}/source-`))).toEqual([]);
+
+    // A second send wins, and a third (a double click) never touches the winner's file.
+    expect((await send(draft.envelopeId)).status).toBe(200);
+    const [sent] = await w.q<{ source_pdf_path: string; source_pdf_sha256: string }>(`SELECT source_pdf_path, source_pdf_sha256 FROM public.esign_envelopes WHERE id = $1`, [draft.envelopeId]);
+    const stored = w.storage.working.get(sent.source_pdf_path) as Uint8Array;
+    expect(await sha256Bytes(stored)).toBe(sent.source_pdf_sha256);
+    expect((await send(draft.envelopeId)).status).toBe(409);
+    expect(await sha256Bytes(w.storage.working.get(sent.source_pdf_path) as Uint8Array)).toBe(sent.source_pdf_sha256);
   });
 
   it("refuses 'high' when no code can be texted", async () => {

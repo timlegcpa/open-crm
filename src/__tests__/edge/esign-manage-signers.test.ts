@@ -7,7 +7,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { decryptPiiSplit, fromBytea } from '../../../supabase/functions/_shared/crypto';
 import { createManageSignersHandler, exactIlike, type ManageSignersDeps } from '../../../supabase/functions/esign-manage-signers/handler';
 import { CREDENTIALS, describeEdgeContract, edgeRequest, fakeOwnerAuth, OWNER_ID } from './contract';
-import { createWorld, ORIGINS, PII_KEY, seedContact, type World } from './esign-world';
+import { createWorld, landsBeforeFirst, ORIGINS, PII_KEY, SEND_SQL, seedContact, withRace, type World } from './esign-world';
 
 let w: World;
 
@@ -149,6 +149,59 @@ describe('esign-manage-signers', () => {
     const res = await add(env, { email: 'late@example.com' });
     expect(res.status).toBe(409);
     expect((await res.json()).code).toBe('not_draft');
+  });
+
+  it('a late edit never touches a signer of an envelope sent meanwhile', async () => {
+    const env = await draft();
+    const { signer_id } = await (await add(env, { email: 'late-edit@example.com' })).json();
+    // The send and a signature land after the edit read the draft, before its write.
+    const racing = withRace(w, 'esign_envelope_signers', (v) => 'role' in v, `
+      WITH sent AS (UPDATE public.esign_envelopes SET status = 'sent', expires_at = now() + interval '1 day' WHERE id = $1 RETURNING id)
+      UPDATE public.esign_envelope_signers SET status = 'signed', signed_at = now() WHERE id = $2`, [env, signer_id]);
+    const res = await manage({ envelope_id: env, action: 'update', signer: { signer_id, role: 'primary' } }, deps({ db: racing }));
+    expect([res.status, (await res.json()).code]).toEqual([409, 'not_draft']);
+    const [row] = await w.q<{ status: string; role: string }>(`SELECT status, role FROM public.esign_envelope_signers WHERE id = $1`, [signer_id]);
+    expect(row).toEqual({ status: 'signed', role: 'other' });
+    expect((await manage({ envelope_id: env, action: 'remove', signer: { signer_id } })).status).toBe(409);
+  });
+
+  it('a removal that lands after a send is refused by the database, as not_draft', async () => {
+    const env = await draft();
+    const { signer_id } = await (await add(env, { email: 'late-remove@example.com' })).json();
+    const db = landsBeforeFirst(w, 'esign_envelope_signers', SEND_SQL, [env]);
+    const res = await manage({ envelope_id: env, action: 'remove', signer: { signer_id } }, deps({ db }));
+    expect([res.status, (await res.json()).code]).toEqual([409, 'not_draft']);
+    expect(await w.q(`SELECT 1 FROM public.esign_envelope_signers WHERE id = $1`, [signer_id])).toHaveLength(1);
+  });
+
+  it('a changed email links the signer to the contact of the new address', async () => {
+    const grace = await seedContact(w, { email: 'grace.relink@example.com', first_name: 'Grace', last_name: 'Hopper' });
+    const env = await draft();
+    const added = await (await add(env, { email: 'nobody.relink@example.com' })).json();
+    expect(added.contact_id).not.toBe(grace);
+    const upd = await manage({ envelope_id: env, action: 'update', signer: { signer_id: added.signer_id, email: 'Grace.Relink@example.com', first_name: 'Ada', last_name: 'Lovelace' } });
+    expect(upd.status).toBe(200);
+    const [row] = await w.q<{ contact_id: string; email: string }>(`SELECT contact_id, email FROM public.esign_envelope_signers WHERE id = $1`, [added.signer_id]);
+    expect(row).toEqual({ contact_id: grace, email: 'grace.relink@example.com' });
+  });
+
+  it('a name change is saved on a signer-only contact, and refused on a contact the owner keeps', async () => {
+    const env = await draft();
+    const stub = await (await add(env, { email: 'rename.stub@example.com' })).json();
+    const renamed = await manage({ envelope_id: env, action: 'update', signer: { signer_id: stub.signer_id, first_name: 'Augusta', last_name: 'King' } });
+    expect(renamed.status).toBe(200);
+    const [c] = await w.q<{ first_name: string; last_name: string }>(`SELECT first_name, last_name FROM public.contacts WHERE id = $1`, [stub.contact_id]);
+    expect(c).toEqual({ first_name: 'Augusta', last_name: 'King' });
+
+    const kept = await seedContact(w, { email: 'rename.kept@example.com', first_name: 'Charles', last_name: 'Babbage' });
+    const linked = await (await add(env, { email: 'rename.kept@example.com', order: 1, first_name: 'Charles', last_name: 'Babbage' })).json();
+    expect(linked.contact_id).toBe(kept);
+    // The same names, sent back by the form, are not a change.
+    expect((await manage({ envelope_id: env, action: 'update', signer: { signer_id: linked.signer_id, first_name: 'Charles', last_name: 'Babbage', order: 2 } })).status).toBe(200);
+    const refused = await manage({ envelope_id: env, action: 'update', signer: { signer_id: linked.signer_id, first_name: 'Chuck', last_name: 'Babbage' } });
+    expect([refused.status, (await refused.json()).code]).toEqual([409, 'name_on_contact']);
+    const [k] = await w.q<{ first_name: string }>(`SELECT first_name FROM public.contacts WHERE id = $1`, [kept]);
+    expect(k.first_name).toBe('Charles');
   });
 
   it('validates the request before reading the envelope', async () => {

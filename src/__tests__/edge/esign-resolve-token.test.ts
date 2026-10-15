@@ -1,10 +1,11 @@
 // @vitest-environment node
 // esign-resolve-token: an unknown token is one 404; a token its holder owns answers its
-// state; a usable one answers the fields and page count and is logged every time.
+// state; a usable one answers the fields and page count, and its opening is logged at
+// most once per signer per hour.
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createResolveTokenHandler, type ResolveTokenDeps } from '../../../supabase/functions/esign-resolve-token/handler';
 import { describeEdgeContract, edgeRequest, throwInternal } from './contract';
-import { createWorld, ORIGINS, seedContact, seedSentEnvelope, type World } from './esign-world';
+import { createWorld, leaveSignerPending, ORIGINS, seedContact, seedSentEnvelope, type World } from './esign-world';
 
 let w: World;
 
@@ -33,7 +34,7 @@ describe('esign-resolve-token', () => {
     body: { kind: 'json', valid: { token: 'tok0xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }, maxBytes: 4_096 },
   });
 
-  it('answers the signer, fields and page count, stamps the first open and logs every open', async () => {
+  it('answers the signer, fields and page count, stamps the first open and logs an open once an hour', async () => {
     const contactId = await seedContact(w, { email: 'ada@example.com', first_name: 'Ada', last_name: 'Lovelace', spouse_email: 'byron@example.com', spouse_first_name: 'Byron', spouse_last_name: 'Lord' });
     const { envelopeId, signers } = await seedSentEnvelope(w, {
       title: 'Lease',
@@ -56,10 +57,17 @@ describe('esign-resolve-token', () => {
     const [again] = await w.q<{ opened_email_at: string }>(`SELECT opened_email_at::text FROM public.esign_envelope_signers WHERE id = $1`, [signers[1].id]);
     expect(again.opened_email_at).toBe(first.opened_email_at);
     const events = await w.q<{ event_type: string; user_agent: string }>(`SELECT event_type, user_agent FROM public.esign_envelope_events WHERE signer_id = $1`, [signers[1].id]);
-    expect(events).toEqual([
-      { event_type: 'signer_opened_link', user_agent: 'Test agent' },
-      { event_type: 'signer_opened_link', user_agent: 'Test agent' },
-    ]);
+    // The second open, within the hour, wrote no row.
+    expect(events).toEqual([{ event_type: 'signer_opened_link', user_agent: 'Test agent' }]);
+
+    // An hour on, the next open is logged again.
+    await w.q(`UPDATE public.esign_envelope_events SET created_at = now() - interval '61 minutes' WHERE signer_id = $1`, [signers[1].id]);
+    await resolve(signers[1].token);
+    const later = await w.q(`SELECT 1 FROM public.esign_envelope_events WHERE signer_id = $1 AND event_type = 'signer_opened_link'`, [signers[1].id]);
+    expect(later).toHaveLength(2);
+    // One signer's open does not silence another's.
+    await resolve(signers[0].token);
+    expect(await w.q(`SELECT 1 FROM public.esign_envelope_events WHERE signer_id = $1`, [signers[0].id])).toHaveLength(1);
   });
 
   it('answers a signer with no linked contact, by address alone', async () => {
@@ -95,8 +103,8 @@ describe('esign-resolve-token', () => {
   });
 
   it('answers one 404 for an unknown token, a malformed one, and a pending signer', async () => {
-    const { signers } = await seedSentEnvelope(w, { signers: [{ email: 'ada@example.com' }] });
-    await w.q(`UPDATE public.esign_envelope_signers SET status = 'pending' WHERE id = $1`, [signers[0].id]);
+    const { envelopeId, signers } = await seedSentEnvelope(w, { signers: [{ email: 'ada@example.com' }] });
+    await leaveSignerPending(w, envelopeId, signers[0].id);
     for (const token of ['unknown-token-0123456789abcdef', 'short', 42, signers[0].token]) {
       const res = await resolve(token);
       expect(res.status).toBe(404);

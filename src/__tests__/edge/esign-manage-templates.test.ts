@@ -5,14 +5,14 @@ import { randomUUID } from 'node:crypto';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { createManageTemplatesHandler, type ManageTemplatesDeps } from '../../../supabase/functions/esign-manage-templates/handler';
 import { CREDENTIALS, describeEdgeContract, edgeRequest, fakeOwnerAuth, OWNER_ID } from './contract';
-import { addField, createWorld, ORIGINS, seedDraft, type World } from './esign-world';
+import { addField, createWorld, landsBeforeFirst, ORIGINS, seedDraft, SEND_SQL, type World } from './esign-world';
 
 let w: World;
 
 function deps(over: Partial<ManageTemplatesDeps> = {}): ManageTemplatesDeps {
   return { allowedOrigins: ORIGINS, authorizeOwner: fakeOwnerAuth(), db: w.db, logSink: w.logSink, ...over };
 }
-const manage = (body: unknown) => createManageTemplatesHandler(deps())(edgeRequest({ headers: CREDENTIALS.owner, body }));
+const manage = (body: unknown, d = deps()) => createManageTemplatesHandler(d)(edgeRequest({ headers: CREDENTIALS.owner, body }));
 
 beforeAll(async () => {
   w = await createWorld();
@@ -87,6 +87,17 @@ describe('esign-manage-templates', () => {
     await w.q(`UPDATE public.esign_envelopes SET status = 'sent', expires_at = now() + interval '1 day' WHERE id = $1`, [base.envelopeId]);
     const sent = await manage({ action: 'apply_to_envelope', envelope_id: base.envelopeId, template_id });
     expect([sent.status, (await sent.json()).code]).toEqual([409, 'not_draft']);
+  });
+
+  it('an apply that lands after a send is refused by the database, as not_draft', async () => {
+    const base = await seedDraft(w, { signers: [{ email: 'late@example.com', role: 'primary' }] });
+    await addField(w, base.envelopeId, base.signerIds[0], 0);
+    const { template_id } = await (await manage({ action: 'save_from_envelope', envelope_id: base.envelopeId, name: 'Applied late' })).json();
+    const dst = await seedDraft(w, { signers: [{ email: 'late2@example.com', role: 'primary' }] });
+    const db = landsBeforeFirst(w, 'esign_envelope_fields', SEND_SQL, [dst.envelopeId]);
+    const res = await manage({ action: 'apply_to_envelope', envelope_id: dst.envelopeId, template_id }, deps({ db }));
+    expect([res.status, (await res.json()).code]).toEqual([409, 'not_draft']);
+    expect(await w.q(`SELECT 1 FROM public.esign_envelope_fields WHERE envelope_id = $1`, [dst.envelopeId])).toEqual([]);
   });
 
   it('refuses a missing name and an unknown action', async () => {

@@ -15,5 +15,6 @@ export const allowlist: DomainAllowlist = {
     'esign_delete_signature_images_for_envelope(uuid)',
     'esign_purge_terminal_signature_images(timestamp with time zone,integer)',
     'esign_prune_operational()',
+    'esign_expire_envelope(uuid,timestamp with time zone)',
   ],
 };

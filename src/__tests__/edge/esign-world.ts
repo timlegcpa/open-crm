@@ -172,7 +172,8 @@ export interface SeededSigner {
 
 /**
  * A sent envelope straight in SQL: one 2-page document assembled into source.pdf, the
- * given signers invited with live links and one required signature field each.
+ * given signers invited with live links and one required signature field each. Built as
+ * a draft and then flipped, as send does: the database takes shape changes from drafts only.
  */
 export async function seedSentEnvelope(
   w: World,
@@ -186,8 +187,8 @@ export async function seedSentEnvelope(
 ): Promise<{ envelopeId: string; signers: SeededSigner[] }> {
   const [env] = await w.q<{ id: string }>(
     `INSERT INTO public.esign_envelopes (created_by, primary_contact_id, title, status, verification_level, expires_at, sent_at, source_pdf_path)
-     VALUES ($1, $2, $3, $4, $5, now() + interval '14 days', now(), 'placeholder') RETURNING id`,
-    [OWNER_ID, opts.primaryContactId ?? null, opts.title ?? 'Engagement letter', opts.status ?? 'sent', opts.level ?? 'standard'],
+     VALUES ($1, $2, $3, 'draft', $4, now() + interval '14 days', now(), 'placeholder') RETURNING id`,
+    [OWNER_ID, opts.primaryContactId ?? null, opts.title ?? 'Engagement letter', opts.level ?? 'standard'],
   );
   const envelopeId = env.id;
   const pdf = await makePdf(2);
@@ -226,7 +227,42 @@ export async function seedSentEnvelope(
     signers.push({ id: row.id, email: s.email, token });
     order += 1;
   }
+  await w.q(`UPDATE public.esign_envelopes SET status = $2 WHERE id = $1`, [envelopeId, opts.status ?? 'sent']);
   return { envelopeId, signers };
+}
+
+/**
+ * The database with `sql` queued just before the handler first touches `table`, as if a
+ * send committed after the handler's own draft check. PGlite runs statements in the order
+ * they are submitted, so the queued one lands before the handler's query.
+ */
+export function landsBeforeFirst(w: World, table: string, sql: string, params: unknown[] = []): EsignDb {
+  let fired = false;
+  return {
+    from(name: string) {
+      if (name === table && !fired) {
+        fired = true;
+        void w.q(sql, params);
+      }
+      return w.db.from(name);
+    },
+    rpc: (...args: Parameters<EsignDb['rpc']>) => w.db.rpc(...args),
+  } as EsignDb;
+}
+
+/** The SQL that sends an envelope, for landsBeforeFirst. */
+export const SEND_SQL = `UPDATE public.esign_envelopes SET status = 'sent', expires_at = now() + interval '1 day' WHERE id = $1`;
+
+/**
+ * A signer of a sent envelope left pending, as a send whose token write failed leaves one.
+ * The database refuses moving a signer back to pending once the envelope left draft, so
+ * the fixture builds that state the way it arises: while the envelope is still a draft.
+ */
+export async function leaveSignerPending(w: World, envelopeId: string, signerId: string, alsoSet = ''): Promise<void> {
+  const [env] = await w.q<{ status: string }>(`SELECT status FROM public.esign_envelopes WHERE id = $1`, [envelopeId]);
+  await w.q(`UPDATE public.esign_envelopes SET status = 'draft' WHERE id = $1`, [envelopeId]);
+  await w.q(`UPDATE public.esign_envelope_signers SET status = 'pending'${alsoSet ? `, ${alsoSet}` : ''} WHERE id = $1`, [signerId]);
+  await w.q(`UPDATE public.esign_envelopes SET status = $2 WHERE id = $1`, [envelopeId, env.status]);
 }
 
 /** A small valid drawn signature: an 8-bit RGBA PNG with a dark stroke. */

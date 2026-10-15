@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowLeft, ArrowRight } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { getFields, getPages, getSigners, type EnvelopeWithContact } from '../api';
 import { esignKeys } from '../keys';
@@ -29,6 +29,29 @@ export function Composer({ envelope }: { envelope: EnvelopeWithContact }) {
   const signers = useQuery({ queryKey: esignKeys.signers(envelope.id), queryFn: () => getSigners(envelope.id) });
   const fields = useQuery({ queryKey: esignKeys.fields(envelope.id), queryFn: () => getFields(envelope.id) });
 
+  // Leaving the field step waits for every field save, then rereads the fields, so the
+  // review never judges (or sends) a layout the server has not got. A failed save stays put.
+  const flushRef = useRef<(() => Promise<void>) | null>(null);
+  const registerFlush = useCallback((flush: (() => Promise<void>) | null) => {
+    flushRef.current = flush;
+  }, []);
+  const [leaving, setLeaving] = useState(false);
+  const goTo = async (index: number) => {
+    if (leaving) return;
+    if (current === 2 && flushRef.current) {
+      setLeaving(true);
+      try {
+        await flushRef.current();
+        await fields.refetch();
+      } catch {
+        return; // the save already said why
+      } finally {
+        setLeaving(false);
+      }
+    }
+    setCurrent(index);
+  };
+
   const ready = readiness({
     pages: pages.data ?? [],
     signers: signers.data ?? [],
@@ -50,25 +73,25 @@ export function Composer({ envelope }: { envelope: EnvelopeWithContact }) {
 
   return (
     <div className="flex w-full min-w-0 flex-col">
-      <StepProgress steps={STEPS} currentIndex={current} isReachable={isReachable} onJump={(i) => isReachable(i) && setCurrent(i)} />
+      <StepProgress steps={STEPS} currentIndex={current} isReachable={isReachable} onJump={(i) => isReachable(i) && void goTo(i)} />
 
       {current === 0 && <DocumentsStep envelopeId={envelope.id} />}
       {current === 1 && (
         <SignersStep envelopeId={envelope.id} verificationLevel={envelope.verification_level} primaryContact={envelope.primary_contact} />
       )}
-      {current === 2 && <FieldPlacer envelopeId={envelope.id} />}
+      {current === 2 && <FieldPlacer envelopeId={envelope.id} registerFlush={registerFlush} />}
       {current === 3 && <ReviewSend envelope={envelope} />}
 
       <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
-        <Button type="button" variant="outline" onClick={() => setCurrent((c) => Math.max(0, c - 1))} disabled={current === 0}>
+        <Button type="button" variant="outline" onClick={() => void goTo(Math.max(0, current - 1))} disabled={current === 0 || leaving}>
           <ArrowLeft aria-hidden="true" />
           Back
         </Button>
         {current < STEPS.length - 1 ? (
           <div className="flex min-w-0 flex-col items-end gap-1">
-            <Button type="button" onClick={() => canProceed && setCurrent((c) => c + 1)} disabled={!canProceed}>
-              Next
-              <ArrowRight aria-hidden="true" />
+            <Button type="button" onClick={() => canProceed && void goTo(current + 1)} disabled={!canProceed || leaving}>
+              {leaving ? 'Saving fields...' : 'Next'}
+              {leaving ? <Loader2 className="animate-spin" aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
             </Button>
             {help && <span className="text-right text-xs text-muted-foreground">{help}</span>}
           </div>

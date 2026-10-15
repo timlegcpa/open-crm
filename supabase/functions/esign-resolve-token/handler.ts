@@ -3,8 +3,9 @@
 // The token is the capability. An unknown token is one 404. A token its holder really
 // owns but can no longer use answers 200 with the reason (`state`) and the minimum to
 // say it: the title and the signer's own name. A usable one answers the signer's fields
-// and the page count. Every resolve logs signer_opened_link (by design: each open is
-// evidence); the first stamps opened_email_at. The organization's name and logo come
+// and the page count. A resolve logs signer_opened_link at most once per signer per
+// hour (OPEN_EVENT_GAP_MINUTES), so a link holder cannot grow the event log, and with it
+// the executed PDF's audit trail, without bound; the first stamps opened_email_at. The organization's name and logo come
 // from get_org_branding() on the page, not from here.
 
 import { createHandler } from '../_shared/handler.ts';
@@ -62,10 +63,13 @@ export type ResolveTokenResponse =
 
 export const RESOLVE_TOKEN_ERRORS = ['not_found', 'rate_limited'] as const;
 
+/** One signer_opened_link row per signer in this many minutes. */
+export const OPEN_EVENT_GAP_MINUTES = 60;
+
 export interface ResolveTokenDeps {
   allowedOrigins: string[];
   db: EsignDb;
-  /** Default: 30 per address and 300 in all per 10 minutes. */
+  /** Default: 30 per address and 3000 in all per 10 minutes. */
   rateLimit?: RateLimit;
   now?: () => Date;
   logSink?: LogSink;
@@ -78,7 +82,7 @@ export function createResolveTokenHandler(deps: ResolveTokenDeps): (req: Request
     name: 'esign-resolve-token',
     allowedOrigins: deps.allowedOrigins,
     auth: { public: true },
-    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_resolve_token', { max: 30, windowMinutes: 10 }, { max: 300, windowMinutes: 10 }),
+    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_resolve_token', { max: 30, windowMinutes: 10 }, { max: 3000, windowMinutes: 10 }),
     maxBodyBytes: 4_096,
     logSink: deps.logSink,
     async handle({ body, json, log, ip, userAgent }) {
@@ -127,7 +131,23 @@ export function createResolveTokenHandler(deps: ResolveTokenDeps): (req: Request
           log.error('opened stamp failed', err, { signer_id: signer.id });
         }
       }
-      await recordEvent(db, log, { envelope_id: envelope.id, signer_id: signer.id, event_type: 'signer_opened_link', ip, user_agent: userAgent });
+      try {
+        const since = new Date(at.getTime() - OPEN_EVENT_GAP_MINUTES * 60_000).toISOString();
+        const recent = await countOf(
+          'open event read',
+          db
+            .from('esign_envelope_events')
+            .select('id', { count: 'exact', head: true })
+            .eq('signer_id', signer.id)
+            .eq('event_type', 'signer_opened_link')
+            .gte('created_at', since),
+        );
+        if (recent === 0) {
+          await recordEvent(db, log, { envelope_id: envelope.id, signer_id: signer.id, event_type: 'signer_opened_link', ip, user_agent: userAgent });
+        }
+      } catch (err) {
+        log.error('open event check failed', err, { signer_id: signer.id });
+      }
 
       const response: ResolveTokenResponse = {
         state: 'ok',

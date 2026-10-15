@@ -14,7 +14,7 @@ import { createHandler, HttpError } from '../_shared/handler.ts';
 import { isUuid } from '../_shared/http.ts';
 import type { LogSink } from '../_shared/log.ts';
 import { maybeOne, pgCode, rows, run, type EsignDb } from '../esign-finalize-envelope/lib/db.ts';
-import { badRequest, envelopeNotFound, notDraft, objectBody } from '../esign-finalize-envelope/lib/errors.ts';
+import { badRequest, draftWrite, envelopeNotFound, notDraft, objectBody } from '../esign-finalize-envelope/lib/errors.ts';
 import { stripControl } from '../esign-finalize-envelope/lib/text.ts';
 
 export type ManageTemplatesRequest =
@@ -182,7 +182,7 @@ export function createManageTemplatesHandler(deps: ManageTemplatesDeps): (req: R
     if (toInsert.length === 0) {
       throw badRequest(`The template has no fields for this scope and these pages (${skipped} skipped).`, 'nothing_to_apply');
     }
-    await run('field insert', db.from('esign_envelope_fields').insert(toInsert));
+    await draftWrite(run('field insert', db.from('esign_envelope_fields').insert(toInsert)));
     return {
       success: true as const,
       inserted_count: toInsert.length,

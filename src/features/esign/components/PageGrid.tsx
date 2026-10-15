@@ -10,6 +10,7 @@ import { getErrorMessage } from '@/lib/errors';
 import { getDocuments, getPages, reorderPages } from '../api';
 import type { PageRow, ReorderOp } from '../contract';
 import { esignKeys } from '../keys';
+import { reorderOperations } from '../lib/pageOrder';
 import { openPdf } from '../lib/pdfRender';
 import { useWorkingUrls } from './useWorkingUrls';
 
@@ -115,8 +116,7 @@ export function PageGrid({ envelopeId }: { envelopeId: string }) {
     const to = visible.findIndex((p) => p.id === over.id);
     if (from === -1 || to === -1) return;
     const moved = arrayMove(visible, from, to);
-    // Only the pages whose position changed: one request carries at most a few hundred ops.
-    const operations = moved.map((p, idx) => ({ page_id: p.id, order: idx })).filter((op, idx) => visible[idx].id !== op.page_id);
+    const operations = reorderOperations(moved);
     void apply(operations, [...moved.map((p, idx) => ({ ...p, order: idx })), ...all.filter((p) => p.deleted)]);
   }
 

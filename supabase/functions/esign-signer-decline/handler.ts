@@ -42,7 +42,7 @@ export interface SignerDeclineDeps extends MailDeps {
   allowedOrigins: string[];
   ownerEmail(): Promise<string | null>;
   siteUrl: string | null;
-  /** Default: 30 per address and 300 in all per 10 minutes. */
+  /** Default: 30 per address and 3000 in all per 10 minutes. */
   rateLimit?: RateLimit;
   now?: () => Date;
   logSink?: LogSink;
@@ -55,7 +55,7 @@ export function createSignerDeclineHandler(deps: SignerDeclineDeps): (req: Reque
     name: 'esign-signer-decline',
     allowedOrigins: deps.allowedOrigins,
     auth: { public: true },
-    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_signer_decline', { max: 30, windowMinutes: 10 }, { max: 300, windowMinutes: 10 }),
+    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_signer_decline', { max: 30, windowMinutes: 10 }, { max: 3000, windowMinutes: 10 }),
     maxBodyBytes: 8_192,
     logSink: deps.logSink,
     async handle({ body, json, log, ip, userAgent }) {

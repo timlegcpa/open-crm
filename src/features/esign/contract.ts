@@ -124,8 +124,16 @@ export const PENDING_ENVELOPE_STATUSES: readonly EnvelopeStatus[] = ['draft', 's
 /** An envelope that is out for signature: void and resend apply, the detail polls. */
 export const LIVE_ENVELOPE_STATUSES: readonly EnvelopeStatus[] = ['sent', 'partially_signed'];
 
-/** A signer whose link is live: resend applies. */
-export const RESENDABLE_SIGNER_STATUSES: readonly SignerStatus[] = ['invited', 'viewed'];
+/**
+ * A signer the owner can resend to on a sent envelope: a live link, or 'pending' (the first
+ * link was never written; the resend function recovers it to invited).
+ */
+export const RESENDABLE_SIGNER_STATUSES: readonly SignerStatus[] = ['pending', 'invited', 'viewed'];
+
+/** How often an envelope's own row is reread: while out for signature only, never once terminal. */
+export function envelopeRefetchInterval(status: EnvelopeStatus | undefined): number | false {
+  return status && LIVE_ENVELOPE_STATUSES.includes(status) ? 30_000 : false;
+}
 
 export const ENVELOPE_STATUS_LABELS: Record<EnvelopeStatus, string> = {
   draft: 'Draft',

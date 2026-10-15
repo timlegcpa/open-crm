@@ -36,7 +36,7 @@ export interface SignerVerifySmsDeps {
   allowedOrigins: string[];
   db: EsignDb;
   smsCodeKey: string | null;
-  /** Default: 20 per address and 500 in all per 10 minutes. */
+  /** Default: 20 per address and 5000 in all per 10 minutes. */
   rateLimit?: RateLimit;
   now?: () => Date;
   logSink?: LogSink;
@@ -49,7 +49,7 @@ export function createSignerVerifySmsHandler(deps: SignerVerifySmsDeps): (req: R
     name: 'esign-signer-verify-sms',
     allowedOrigins: deps.allowedOrigins,
     auth: { public: true },
-    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_signer_verify_sms', { max: 20, windowMinutes: 10 }, { max: 500, windowMinutes: 10 }),
+    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_signer_verify_sms', { max: 20, windowMinutes: 10 }, { max: 5000, windowMinutes: 10 }),
     maxBodyBytes: 8_192,
     logSink: deps.logSink,
     async handle({ body, json, log, ip, userAgent }) {

@@ -12,6 +12,15 @@
 //   3. No match: a signer-only contact (source 'esign', status 'esign_signer').
 // A spouse_email match makes the default role co_signer.
 //
+// Update: a changed email links again by the same rules (the executed copy is filed to the
+// contact the signer is linked to when finalize runs). A name lives on the contact: a
+// change is written to a signer-only contact, or to an empty co-signer slot; a contact
+// the owner keeps names its own people, so a different name there is refused
+// (409 name_on_contact) rather than silently dropped.
+//
+// Every write to the signer row is a draft edit: the database refuses it once the
+// envelope has left draft (409 not_draft), however late it lands.
+//
 // Phones are E.164 only, encrypted with PII_ENCRYPTION_KEY into two bytea columns, with
 // the last four digits kept apart for display.
 
@@ -22,7 +31,7 @@ import { isUuid } from '../_shared/http.ts';
 import type { LogSink } from '../_shared/log.ts';
 import { isValidEmail } from '../_shared/outbound.ts';
 import { maybeOne, pgCode, rows, run, type EsignDb, type Row } from '../esign-finalize-envelope/lib/db.ts';
-import { badRequest, envelopeNotFound, notDraft, objectBody, signerNotFound } from '../esign-finalize-envelope/lib/errors.ts';
+import { badRequest, draftWrite, envelopeNotFound, notDraft, objectBody, signerNotFound } from '../esign-finalize-envelope/lib/errors.ts';
 import { isE164, lastFour } from '../esign-finalize-envelope/lib/phone.ts';
 import { stripControl } from '../esign-finalize-envelope/lib/text.ts';
 
@@ -63,6 +72,7 @@ export const MANAGE_SIGNERS_ERRORS = [
   'signer_not_found',
   'not_found',
   'not_draft',
+  'name_on_contact',
 ] as const;
 
 export interface ManageSignersDeps {
@@ -80,6 +90,18 @@ const CAPS = { email: 254, name: 100, phone: 30 } as const;
 const duplicateSigner = () => new HttpError(409, 'A signer with this email is already on the envelope.', 'duplicate_signer');
 const ambiguousEmail = () =>
   new HttpError(409, 'More than one contact uses this email. Pick the contact for this signer.', 'ambiguous_email');
+const nameOnContact = () =>
+  new HttpError(409, 'This signer\'s name comes from their contact record. Change it on the contact.', 'name_on_contact');
+
+interface NameContact {
+  id: string;
+  status: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  spouse_email: string | null;
+  spouse_first_name: string | null;
+  spouse_last_name: string | null;
+}
 
 /** An escaped ILIKE pattern that matches exactly this address, any case. */
 export function exactIlike(email: string): string {
@@ -145,6 +167,40 @@ export function createManageSignersHandler(deps: ManageSignersDeps): (req: Reque
     return { contactId: created.id, asCoSigner: false };
   }
 
+  async function nameContact(id: string): Promise<NameContact | null> {
+    return await maybeOne<NameContact>(
+      'contact name read',
+      deps.db.from('contacts').select('id, status, first_name, last_name, spouse_email, spouse_first_name, spouse_last_name').eq('id', id).maybeSingle(),
+    );
+  }
+
+  /** Whether this signer is the contact's second person (the co-signer rule of signer-name.ts). */
+  function isSecondPerson(c: NameContact, email: string, role: SignerRole): boolean {
+    return role === 'co_signer' && !!c.spouse_email && c.spouse_email.trim().toLowerCase() === email;
+  }
+
+  function namesOf(c: NameContact, email: string, role: SignerRole): { first: string; last: string } {
+    return isSecondPerson(c, email, role)
+      ? { first: c.spouse_first_name ?? '', last: c.spouse_last_name ?? '' }
+      : { first: c.first_name ?? '', last: c.last_name ?? '' };
+  }
+
+  /** A name change, where the name lives: see the header. */
+  async function applyName(c: NameContact | null, email: string, role: SignerRole, names: { firstName: string; lastName: string }) {
+    if (!c) return;
+    const second = isSecondPerson(c, email, role);
+    const have = namesOf(c, email, role);
+    if (have.first === names.firstName && have.last === names.lastName) return;
+    if (!names.firstName || !names.lastName) throw badRequest('Enter the signer\'s first and last name.', 'invalid_name');
+    const stub = c.status === 'esign_signer';
+    const emptySlot = second && !have.first && !have.last;
+    if (!stub && !emptySlot) throw nameOnContact();
+    const write: Row = second
+      ? { spouse_first_name: names.firstName, spouse_last_name: names.lastName }
+      : { first_name: names.firstName, last_name: names.lastName };
+    await run('signer name write', deps.db.from('contacts').update(write).eq('id', c.id));
+  }
+
   return createHandler({
     name: 'esign-manage-signers',
     allowedOrigins: deps.allowedOrigins,
@@ -207,6 +263,7 @@ export function createManageSignersHandler(deps: ManageSignersDeps): (req: Reque
         const res = await deps.db.from('esign_envelope_signers').insert(row).select('id').single();
         if (res.error) {
           if (pgCode(res.error) === '23505') throw duplicateSigner();
+          if (pgCode(res.error) === '55000') throw notDraft();
           throw res.error;
         }
         const signerId = (res.data as { id: string }).id;
@@ -214,34 +271,63 @@ export function createManageSignersHandler(deps: ManageSignersDeps): (req: Reque
       }
 
       if (!isUuid(s.signer_id)) throw badRequest();
-      const existing = await maybeOne<{ envelope_id: string }>(
+      const existing = await maybeOne<{ envelope_id: string; email: string; role: SignerRole; contact_id: string | null }>(
         'signer read',
-        deps.db.from('esign_envelope_signers').select('id, envelope_id').eq('id', s.signer_id).maybeSingle(),
+        deps.db.from('esign_envelope_signers').select('id, envelope_id, email, role, contact_id').eq('id', s.signer_id).maybeSingle(),
       );
       if (!existing || existing.envelope_id !== envelopeId) throw signerNotFound();
 
       if (action === 'remove') {
-        await run('signer delete', deps.db.from('esign_envelope_signers').delete().eq('id', s.signer_id).eq('envelope_id', envelopeId));
+        await draftWrite(run('signer delete', deps.db.from('esign_envelope_signers').delete().eq('id', s.signer_id).eq('envelope_id', envelopeId)));
         return json(200, { success: true } satisfies ManageSignersResponse);
       }
 
-      const updates: Row = { status: 'pending' };
+      // No status here: a draft's signers are pending until send, and an update never
+      // moves a signer back (the database refuses that past draft in any case).
+      const updates: Row = {};
       if (s.order !== undefined) updates.order = s.order;
       if (s.role !== undefined) updates.role = role ?? 'other';
+      const nextRole: SignerRole = (updates.role as SignerRole | undefined) ?? existing.role;
+      let nextEmail = existing.email;
       if (s.email !== undefined) {
         const email = typeof s.email === 'string' ? s.email.trim().toLowerCase() : '';
         if (!isValidEmail(email) || email.length > CAPS.email) throw badRequest('Enter a valid email address.', 'invalid_email');
         updates.email = email;
+        nextEmail = email;
       }
       if (s.phone === null || s.phone === '') {
         Object.assign(updates, { phone_ciphertext: null, phone_iv: null, phone_last_four: null });
       } else if (typeof s.phone === 'string') {
         Object.assign(updates, await encryptPhone(s.phone));
       }
-      const res = await deps.db.from('esign_envelope_signers').update(updates).eq('id', s.signer_id).eq('envelope_id', envelopeId);
-      if (res.error) {
-        if (pgCode(res.error) === '23505') throw duplicateSigner();
-        throw res.error;
+
+      const current = existing.contact_id ? await nameContact(existing.contact_id) : null;
+      const before = current ? namesOf(current, existing.email, existing.role) : { first: '', last: '' };
+      // Only a name the owner actually changed is written: the form sends the names back
+      // with every update, and an unchanged one must not trip the contact's own rule.
+      const sent = s.first_name !== undefined || s.last_name !== undefined;
+      const names = sent && (firstName !== before.first || lastName !== before.last) ? { firstName, lastName } : null;
+      // A new address links again; the signer's name carries over unless a new one came.
+      if (nextEmail !== existing.email) {
+        const link = await linkContact({
+          email: nextEmail,
+          firstName: names?.firstName || before.first,
+          lastName: names?.lastName || before.last,
+          role: nextRole,
+          contactId: null,
+        });
+        updates.contact_id = link.contactId;
+      }
+      const target = (updates.contact_id as string | undefined) ?? existing.contact_id;
+      if (names && target) await applyName(target === existing.contact_id && current ? current : await nameContact(target), nextEmail, nextRole, names);
+
+      if (Object.keys(updates).length > 0) {
+        const res = await deps.db.from('esign_envelope_signers').update(updates).eq('id', s.signer_id).eq('envelope_id', envelopeId);
+        if (res.error) {
+          if (pgCode(res.error) === '23505') throw duplicateSigner();
+          if (pgCode(res.error) === '55000') throw notDraft();
+          throw res.error;
+        }
       }
       return json(200, { success: true, signer_id: s.signer_id } satisfies ManageSignersResponse);
     },

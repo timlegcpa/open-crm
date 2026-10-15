@@ -1,6 +1,9 @@
 // esign-resend-webhook: the email provider's delivery and open notices for invitations.
-// Public (the provider sends no Authorization at all), with a shared ceiling; every call
-// proves itself with the Svix signature instead.
+// Public (the provider sends no Authorization at all), with a per-address ceiling under a
+// shared one, like the other public functions; every call proves itself with the Svix
+// signature instead. The per-address ceiling is a third of the shared one: the provider
+// posts from a small pool of addresses, so one of them may carry a burst of notices, but
+// no single address (a forger's included) can use up the whole shared minute.
 //
 // Signed content: `${svix-id}.${svix-timestamp}.${raw body}`, HMAC-SHA256 under the
 // base64 key after `whsec_`, compared in constant time against every `v1,` signature in
@@ -14,10 +17,9 @@ import { bytesToBase64, base64ToBytes } from '../_shared/crypto.ts';
 import { createHandler, HttpError, REFUSALS } from '../_shared/handler.ts';
 import { isUuid } from '../_shared/http.ts';
 import type { LogSink } from '../_shared/log.ts';
-import { checkGlobalLimit } from '../_shared/rate-limit.ts';
 import { timingSafeEqual } from '../_shared/secrets.ts';
 import { pgCode, type EsignDb } from '../esign-finalize-envelope/lib/db.ts';
-import type { RateLimit } from '../esign-finalize-envelope/lib/signer-flow.ts';
+import { publicLimits, type RateLimit } from '../esign-finalize-envelope/lib/signer-flow.ts';
 
 export type ResendWebhookResponse =
   | { ok: true }
@@ -33,7 +35,7 @@ export interface ResendWebhookDeps {
   allowedOrigins: string[];
   db: EsignDb;
   webhookSecret: string | null;
-  /** Default: 600 notices a minute in all. */
+  /** Default: 200 notices a minute per address and 600 in all. */
   rateLimit?: RateLimit;
   now?: () => Date;
   logSink?: LogSink;
@@ -94,7 +96,7 @@ export function createResendWebhookHandler(deps: ResendWebhookDeps): (req: Reque
     name: 'esign-resend-webhook',
     allowedOrigins: deps.allowedOrigins,
     auth: { public: true },
-    rateLimit: deps.rateLimit ?? (() => checkGlobalLimit(db, { action: 'esign_resend_webhook', max: 600, windowMinutes: 1 })),
+    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_resend_webhook', { max: 200, windowMinutes: 1 }, { max: 600, windowMinutes: 1 }),
     allowHeaders: ['svix-id', 'svix-timestamp', 'svix-signature'],
     body: 'bytes',
     maxBodyBytes: 65_536,

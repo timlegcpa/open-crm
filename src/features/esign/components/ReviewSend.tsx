@@ -31,7 +31,8 @@ export function ReviewSend({ envelope }: { envelope: EnvelopeWithContact }) {
   const [serverProblems, setServerProblems] = useState<string[]>([]);
   const pages = useQuery({ queryKey: esignKeys.pages(envelope.id), queryFn: () => getPages(envelope.id) });
   const signersQuery = useQuery({ queryKey: esignKeys.signers(envelope.id), queryFn: () => getSigners(envelope.id) });
-  const fieldsQuery = useQuery({ queryKey: esignKeys.fields(envelope.id), queryFn: () => getFields(envelope.id) });
+  // Always reread on arrival: the field step's last save may have landed after the cache.
+  const fieldsQuery = useQuery({ queryKey: esignKeys.fields(envelope.id), queryFn: () => getFields(envelope.id), refetchOnMount: 'always' });
 
   const signers = useMemo(() => signersQuery.data ?? [], [signersQuery.data]);
   const fields = useMemo(() => fieldsQuery.data ?? [], [fieldsQuery.data]);
@@ -40,7 +41,7 @@ export function ReviewSend({ envelope }: { envelope: EnvelopeWithContact }) {
 
   const ready = readiness({ pages: pages.data ?? [], signers, fields, verificationLevel: envelope.verification_level });
   const problems = loaded ? sendProblems(ready, resolveSignerName) : [];
-  const canSend = loaded && problems.length === 0;
+  const canSend = loaded && !fieldsQuery.isFetching && problems.length === 0;
 
   const counts = useMemo(() => {
     const map = new Map<string, { total: number; required: number }>();

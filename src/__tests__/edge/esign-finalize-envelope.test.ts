@@ -5,12 +5,12 @@
 // executed copy, and the tamper check that verifies it.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import fontkit from '@pdf-lib/fontkit';
 import * as pdfLib from 'pdf-lib';
 import { sha256Hex } from '../../../supabase/functions/_shared/crypto';
 import { createFinalizeEnvelopeHandler, executedFileTitle, type FinalizeEnvelopeDeps } from '../../../supabase/functions/esign-finalize-envelope/handler';
-import { planMerge, sha256Bytes } from '../../../supabase/functions/esign-finalize-envelope/lib/pdf';
+import { planMerge, sha256Bytes, type SignerStamp } from '../../../supabase/functions/esign-finalize-envelope/lib/pdf';
 import { SIGNATURE_FONT_FILES, TYPED_SIGNATURE_PATTERN } from '../../../supabase/functions/esign-finalize-envelope/lib/typed-signature';
 import { createCreateEnvelopeHandler } from '../../../supabase/functions/esign-create-envelope/handler';
 import { createUploadDocumentHandler } from '../../../supabase/functions/esign-upload-document/handler';
@@ -82,7 +82,10 @@ async function allSigned(opts: { drawnSecond?: boolean; title?: string } = {}) {
       [seeded.signers[1].id],
     );
   }
+  // A date field too, placed while the envelope was a draft (the database takes shape changes from drafts only).
+  await w.q(`UPDATE public.esign_envelopes SET status = 'draft' WHERE id = $1`, [seeded.envelopeId]);
   await w.q(`INSERT INTO public.esign_envelope_fields (envelope_id, signer_id, page_index, field_type, x, y, width, height) VALUES ($1, $2, 1, 'date', 300, 100, 100, 20)`, [seeded.envelopeId, seeded.signers[0].id]);
+  await w.q(`UPDATE public.esign_envelopes SET status = 'sent' WHERE id = $1`, [seeded.envelopeId]);
   return { ...seeded, contactId: ada };
 }
 
@@ -255,17 +258,56 @@ describe('esign-finalize-envelope', () => {
     expect(await w.q(`SELECT 1 FROM public.client_documents WHERE esign_envelope_id = $1`, [envelopeId])).toEqual([]);
   });
 
-  it('re-drives the deliverables of a completed envelope a crash cut short, once', async () => {
+  it('re-drives the deliverables of a completed envelope a crash cut short, skipping what is done', async () => {
     const { envelopeId } = await allSigned();
     expect((await finalize(envelopeId)).status).toBe(200);
+    const [first] = await w.q<{ delivered_at: string | null; n: number }>(
+      `SELECT delivered_at::text, (SELECT count(*)::int FROM jsonb_object_keys(delivery->'emails')) AS n FROM public.esign_envelopes WHERE id = $1`,
+      [envelopeId],
+    );
+    expect(first.delivered_at).not.toBeNull();
+    expect(first.n).toBe(3);
+    // A crash after the emails went out, before the filing landed.
     await w.q(`DELETE FROM public.client_documents WHERE esign_envelope_id = $1`, [envelopeId]);
-    const recovered = await (await finalize(envelopeId)).json();
-    expect(recovered.recovered).toBe(true);
-    expect(await w.q(`SELECT 1 FROM public.client_documents WHERE esign_envelope_id = $1`, [envelopeId])).toHaveLength(1);
+    await w.q(`UPDATE public.esign_envelopes SET delivered_at = NULL WHERE id = $1`, [envelopeId]);
     const before = w.emails.length;
+    const recovered = await (await finalize(envelopeId)).json();
+    expect(recovered).toMatchObject({ recovered: true, delivered: true });
+    expect(await w.q(`SELECT 1 FROM public.client_documents WHERE esign_envelope_id = $1`, [envelopeId])).toHaveLength(1);
+    expect(w.emails.length).toBe(before);
     expect((await (await finalize(envelopeId)).json()).already_completed).toBe(true);
     expect(w.emails.length).toBe(before);
     expect(await w.q(`SELECT 1 FROM public.esign_envelope_events WHERE envelope_id = $1 AND event_type = 'envelope_completed'`, [envelopeId])).toHaveLength(1);
+  });
+
+  it('a failed completion email is retried later for that party alone, and the envelope stays undelivered until it goes', async () => {
+    const { envelopeId } = await allSigned();
+    let refuse = 'byron@example.com';
+    const sendEmail: FinalizeEnvelopeDeps['sendEmail'] = async (m) => {
+      if (m.to === refuse) return { status: 'failed', channel: 'local', reason: 'rejected', httpStatus: 422 };
+      return w.sendEmail(m);
+    };
+    const res = await (await finalize(envelopeId, deps({ sendEmail }))).json();
+    expect(res.sha256).toBeDefined();
+    const [env] = await w.q<{ delivered_at: string | null; delivery_attempts: number }>(
+      `SELECT delivered_at::text, delivery_attempts FROM public.esign_envelopes WHERE id = $1`,
+      [envelopeId],
+    );
+    expect(env).toEqual({ delivered_at: null, delivery_attempts: 1 });
+    refuse = '';
+    const before = w.emails.length;
+    expect(await (await finalize(envelopeId, deps({ sendEmail }))).json()).toMatchObject({ recovered: true, delivered: true });
+    expect(w.emails.slice(before).map((m) => m.to)).toEqual(['byron@example.com']);
+  });
+
+  it('two delivery runs at once file one copy per contact', async () => {
+    const { envelopeId } = await allSigned();
+    expect((await finalize(envelopeId)).status).toBe(200);
+    await w.q(`DELETE FROM public.client_documents WHERE esign_envelope_id = $1`, [envelopeId]);
+    await w.q(`UPDATE public.esign_envelopes SET delivered_at = NULL WHERE id = $1`, [envelopeId]);
+    const answers = await Promise.all([finalize(envelopeId), finalize(envelopeId)]);
+    expect(answers.map((r) => r.status)).toEqual([200, 200]);
+    expect(await w.q(`SELECT 1 FROM public.client_documents WHERE esign_envelope_id = $1`, [envelopeId])).toHaveLength(1);
   });
 
   it('refuses an envelope no contact can hold, and one that is not live', async () => {
@@ -336,4 +378,101 @@ describe('the whole flow', () => {
     tampered[tampered.length - 10] ^= 1;
     expect((await (await call(createVerifyDocumentHandler(publicDeps), { sha256: await sha256Bytes(tampered) }, {})).json()).verified).toBe(false);
   });
+});
+
+describe('the executed audit trail', () => {
+  it('collapses a signer’s many link opens into one line with the count, first and last time', async () => {
+    const { envelopeId, signers } = await allSigned();
+    for (let i = 0; i < 50; i += 1) {
+      await w.q(
+        `INSERT INTO public.esign_envelope_events (envelope_id, signer_id, event_type, created_at) VALUES ($1, $2, 'signer_opened_link', now() - make_interval(mins => $3))`,
+        [envelopeId, signers[0].id, 60 - i],
+      );
+    }
+    await w.q(`INSERT INTO public.esign_envelope_events (envelope_id, signer_id, event_type) VALUES ($1, $2, 'signer_opened_link')`, [envelopeId, signers[1].id]);
+    const tools = pdfTools(true);
+    let trail: ReadonlyArray<{ phrase: string }> = [];
+    const res = await finalize(envelopeId, deps({
+      pdf: { ...tools, stampAndAudit: async (o) => { trail = o.events; return tools.stampAndAudit(o); } },
+    }));
+    expect(res.status).toBe(200);
+    const opens = trail.map((e) => e.phrase).filter((p) => p.includes('opened the sign link'));
+    expect(opens).toHaveLength(2);
+    expect(opens[0]).toMatch(/^Ada Lovelace \(ada@example\.com\) opened the sign link 50 times, first at .+, last at .+\.$/);
+    expect(opens[1]).toBe('Byron Lord (byron@example.com) opened the sign link.');
+  });
+});
+
+describe('stamping on a rotated page', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  interface Drawn {
+    label: string;
+    angle: number;
+    corners: Array<[number, number]>;
+  }
+
+  /** What one stampAndAudit drew, each item as the four corners of its rectangle in user space. */
+  async function stampOnce(rotation: number, kind: 'typed' | 'drawn', sig: StampBox, date: StampBox): Promise<Drawn[]> {
+    const doc = await pdfLib.PDFDocument.create();
+    doc.addPage([612, 792]).setRotation(pdfLib.degrees(rotation));
+    const sourcePdf = await doc.save();
+    const text = vi.spyOn(pdfLib.PDFPage.prototype, 'drawText');
+    const image = vi.spyOn(pdfLib.PDFPage.prototype, 'drawImage');
+    const base = { signer_id: 's1', signer_name: 'Ada Lovelace', signed_at: new Date('2026-10-15T12:00:00Z'), tz: 'UTC',
+      fields: [{ page_index: 0, field_type: 'signature' as const, ...sig }, { page_index: 0, field_type: 'date' as const, ...date }] };
+    const signer: SignerStamp = kind === 'typed'
+      ? { ...base, kind: 'typed', signature_text: 'Ada Lovelace', font_key: 'great_vibes' }
+      : { ...base, kind: 'drawn', image_base64: await drawnSignaturePng() };
+    await pdfTools(true).stampAndAudit({
+      orgName: 'Acme LLC', siteUrl: SITE_URL, sourcePdf, envelopeIdShort: 'abcd1234', completedAtIso: '2026-10-15T12:00:00Z',
+      signers: [signer], signerSummaries: [], events: [],
+    });
+    const corners = (x: number, y: number, w: number, h: number, deg: number): Array<[number, number]> => {
+      const t = (deg * Math.PI) / 180;
+      return ([[0, 0], [w, 0], [0, h], [w, h]] as Array<[number, number]>).map(([u, v]) => [x + u * Math.cos(t) - v * Math.sin(t), y + u * Math.sin(t) + v * Math.cos(t)]);
+    };
+    const out: Drawn[] = [];
+    for (const [t, o] of text.mock.calls as unknown as Array<[string, { x: number; y: number; size: number; font: { widthOfTextAtSize(t: string, s: number): number }; rotate?: { angle: number }; maxWidth?: number }]>) {
+      const label = t === 'Ada Lovelace' ? 'signature' : t.startsWith('e-Signed by') ? 'caption' : /^\d\d\/\d\d\/\d{4}$/.test(t) ? 'date' : '';
+      if (!label) continue;
+      const w = Math.min(o.font.widthOfTextAtSize(t, o.size), o.maxWidth ?? Infinity);
+      out.push({ label, angle: o.rotate?.angle ?? 0, corners: corners(o.x, o.y, w, o.size, o.rotate?.angle ?? 0) });
+    }
+    for (const [, o] of image.mock.calls as unknown as Array<[unknown, { x: number; y: number; width: number; height: number; rotate?: { angle: number } }]>) {
+      out.push({ label: 'signature', angle: o.rotate?.angle ?? 0, corners: corners(o.x, o.y, o.width, o.height, o.rotate?.angle ?? 0) });
+    }
+    return out;
+  }
+
+  type StampBox = { x: number; y: number; width: number; height: number };
+  /** The same boxes as a reader sees them (wide), stored unrotated: tall on a sideways page. */
+  const stored = (b: StampBox, rotation: number): StampBox => (rotation % 180 === 0 ? b : { x: b.x, y: b.y, width: b.height, height: b.width });
+
+  for (const rotation of [0, 90, 180, 270]) {
+    for (const kind of ['typed', 'drawn'] as const) {
+      it(`a ${kind} signature and its date read upright inside their boxes at /Rotate ${rotation}`, async () => {
+        const sig = stored({ x: 100, y: 200, width: 180, height: 50 }, rotation);
+        const date = stored({ x: 300, y: 500, width: 100, height: 20 }, rotation);
+        const drawn = await stampOnce(rotation, kind, sig, date);
+        expect(drawn.map((d) => d.label).sort()).toEqual(['caption', 'date', 'signature']);
+        for (const d of drawn) {
+          const b = d.label === 'date' ? date : sig;
+          // Turned with the page, so it cancels the viewer's turn.
+          expect([d.label, d.angle]).toEqual([d.label, rotation]);
+          for (const [x, y] of d.corners) {
+            expect([d.label, x >= b.x - 0.5 && x <= b.x + b.width + 0.5, y >= b.y - 0.5 && y <= b.y + b.height + 0.5]).toEqual([d.label, true, true]);
+          }
+        }
+        // The signature and caption fill the box, not a corner of it.
+        const all = drawn.filter((d) => d.label !== 'date').flatMap((d) => d.corners);
+        const spanX = Math.max(...all.map((c) => c[0])) - Math.min(...all.map((c) => c[0]));
+        const spanY = Math.max(...all.map((c) => c[1])) - Math.min(...all.map((c) => c[1]));
+        expect(spanX).toBeGreaterThan(sig.width * 0.6);
+        expect(spanY).toBeGreaterThan(sig.height * 0.6);
+      });
+    }
+  }
 });

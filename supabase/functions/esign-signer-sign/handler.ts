@@ -60,7 +60,7 @@ export interface SignerSignDeps {
   db: EsignDb;
   pdf: Pick<PdfTools, 'trialEmbedPng'>;
   finalize: FinalizeTrigger;
-  /** Default: 30 per address and 300 in all per 10 minutes. */
+  /** Default: 30 per address and 3000 in all per 10 minutes. */
   rateLimit?: RateLimit;
   now?: () => Date;
   logSink?: LogSink;
@@ -75,7 +75,7 @@ export function createSignerSignHandler(deps: SignerSignDeps): (req: Request) =>
     name: 'esign-signer-sign',
     allowedOrigins: deps.allowedOrigins,
     auth: { public: true },
-    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_signer_sign', { max: 30, windowMinutes: 10 }, { max: 300, windowMinutes: 10 }),
+    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_signer_sign', { max: 30, windowMinutes: 10 }, { max: 3000, windowMinutes: 10 }),
     // A drawn signature is up to 320,000 base64 characters.
     maxBodyBytes: 400_000,
     logSink: deps.logSink,

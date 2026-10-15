@@ -115,14 +115,60 @@ describe('esign-expire-envelopes', () => {
     expect(env.status).toBe('sent');
   });
 
+  /** The database with `sql` run just before the expiry decision, as if it landed mid-sweep. */
+  function beforeDecision(sql: string, params: unknown[]) {
+    return {
+      from: (t: string) => w.db.from(t),
+      rpc: async (name: string, args: Record<string, unknown>) => {
+        if (name === 'esign_expire_envelope') await w.q(sql, params);
+        return w.db.rpc(name, args);
+      },
+    } as unknown as typeof w.db;
+  }
+
   it('does not overwrite an envelope that ended another way meanwhile', async () => {
     const { envelopeId } = await seedSentEnvelope(w, { signers: [{ email: 'ada@example.com' }] });
     await pastDeadline(envelopeId);
-    // A decline lands between the read and the flip (a completion is also refused by the freeze trigger).
-    const racing = withRace(w, 'esign_envelopes', (v) => v.status === 'expired', `UPDATE public.esign_envelopes SET status = 'declined' WHERE id = $1`, [envelopeId]);
-    expect(await run(deps({ db: racing }))).toMatchObject({ expired: 0 });
+    // A decline lands after the due read (a completion is also refused by the freeze trigger).
+    const db = beforeDecision(`UPDATE public.esign_envelopes SET status = 'declined' WHERE id = $1`, [envelopeId]);
+    expect(await run(deps({ db }))).toMatchObject({ expired: 0 });
     const [env] = await w.q<{ status: string }>(`SELECT status FROM public.esign_envelopes WHERE id = $1`, [envelopeId]);
     expect(env.status).toBe('declined');
+  });
+
+  it('a signature landing mid-sweep makes the envelope finalize, never an expired envelope with a signed signer', async () => {
+    const { envelopeId, signers } = await seedSentEnvelope(w, { signers: [{ email: 'ada@example.com' }, { email: 'alan@example.com' }] });
+    await w.q(`UPDATE public.esign_envelope_signers SET status = 'signed', signed_at = now() WHERE id = $1`, [signers[0].id]);
+    await pastDeadline(envelopeId);
+    const db = beforeDecision(`UPDATE public.esign_envelope_signers SET status = 'signed', signed_at = now() WHERE id = $1`, [signers[1].id]);
+    expect(await run(deps({ db }))).toMatchObject({ expired: 0, finalize_redriven: 1 });
+    expect(finalized).toEqual([envelopeId]);
+    const [env] = await w.q<{ status: string }>(`SELECT status FROM public.esign_envelopes WHERE id = $1`, [envelopeId]);
+    expect(env.status).toBe('sent');
+    const states = await w.q<{ status: string }>(`SELECT status FROM public.esign_envelope_signers WHERE envelope_id = $1`, [envelopeId]);
+    expect(states.map((r) => r.status)).toEqual(['signed', 'signed']);
+  });
+
+  it('re-drives delivery of a completed envelope until it is delivered, a few per run, never a young one', async () => {
+    const make = async (completedAgo: string, attempts = 0, delivered = false) => {
+      const { envelopeId } = await seedSentEnvelope(w, { signers: [{ email: 'ada@example.com' }] });
+      await w.q(`UPDATE public.esign_envelope_signers SET status = 'signed', signed_at = now() WHERE envelope_id = $1`, [envelopeId]);
+      await w.q(
+        `UPDATE public.esign_envelopes SET status = 'completed', completed_at = now() - $2::interval, signed_pdf_path = 'x', signed_pdf_sha256 = $3,
+           delivery_attempts = $4, delivered_at = CASE WHEN $5 THEN now() END WHERE id = $1`,
+        [envelopeId, completedAgo, 'a'.repeat(64), attempts, delivered],
+      );
+      return envelopeId;
+    };
+    const due = await make('1 hour');
+    const young = await make('1 minute');
+    const done = await make('1 hour', 1, true);
+    const spent = await make('1 hour', 5);
+    const out = await run();
+    expect(finalized).toContain(due);
+    for (const id of [young, done, spent]) expect(finalized).not.toContain(id);
+    expect(out.delivery_redriven).toBeGreaterThanOrEqual(1);
+    expect(out.delivery_redriven).toBeLessThanOrEqual(3);
   });
 
   it('purges working files and drawn images 90 days after each kind of end, and only then', async () => {

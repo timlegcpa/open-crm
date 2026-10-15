@@ -38,7 +38,7 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 export interface VerifyDocumentDeps {
   allowedOrigins: string[];
   db: EsignDb;
-  /** Default: 30 per address and 600 in all per hour. */
+  /** Default: 30 per address and 6000 in all per hour. */
   rateLimit?: RateLimit;
   logSink?: LogSink;
 }
@@ -49,7 +49,7 @@ export function createVerifyDocumentHandler(deps: VerifyDocumentDeps): (req: Req
     name: 'esign-verify-document',
     allowedOrigins: deps.allowedOrigins,
     auth: { public: true },
-    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_verify_document', { max: 30, windowMinutes: 60 }, { max: 600, windowMinutes: 60 }),
+    rateLimit: deps.rateLimit ?? publicLimits(db, 'esign_verify_document', { max: 30, windowMinutes: 60 }, { max: 6000, windowMinutes: 60 }),
     maxBodyBytes: 4_096,
     logSink: deps.logSink,
     async handle({ req, body, json }) {

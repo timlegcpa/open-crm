@@ -11,6 +11,7 @@ import type { ContactTabProps } from '@/features/types';
 import { getErrorMessage } from '@/lib/errors';
 import { formatDate, NO_VALUE_TEXT } from '@/lib/format';
 import { getEnvelope, listEnvelopesForContact } from './api';
+import { envelopeRefetchInterval } from './contract';
 import { Composer } from './components/Composer';
 import { EnvelopeDetail } from './components/EnvelopeDetail';
 import { EnvelopeList } from './components/EnvelopeList';
@@ -68,7 +69,14 @@ export function NewEnvelopePage() {
 export function EnvelopePage() {
   const { id = '' } = useParams();
   const valid = isUuid(id);
-  const envelope = useQuery({ queryKey: esignKeys.envelope(id), queryFn: () => getEnvelope(id), enabled: valid });
+  // Polled while sent, so a signature or decline moves the page to its new status unaided.
+  const envelope = useQuery({
+    queryKey: esignKeys.envelope(id),
+    queryFn: () => getEnvelope(id),
+    enabled: valid,
+    refetchInterval: (q) => envelopeRefetchInterval(q.state.data?.status),
+    refetchOnWindowFocus: (q) => envelopeRefetchInterval(q.state.data?.status) !== false,
+  });
 
   let body;
   if (!valid || envelope.data === null) {

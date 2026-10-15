@@ -13,7 +13,7 @@ import { createHandler, HttpError } from '../_shared/handler.ts';
 import { isUuid } from '../_shared/http.ts';
 import type { LogSink } from '../_shared/log.ts';
 import { call, maybeOne, rows, type EsignDb } from '../esign-finalize-envelope/lib/db.ts';
-import { badRequest, envelopeNotFound, notDraft, objectBody, rpcRefusal, signerNotFound } from '../esign-finalize-envelope/lib/errors.ts';
+import { badRequest, draftWrite, envelopeNotFound, notDraft, objectBody, rpcRefusal, signerNotFound } from '../esign-finalize-envelope/lib/errors.ts';
 
 export interface FieldInput {
   page_index: number;
@@ -99,10 +99,10 @@ export function createManageFieldsHandler(deps: ManageFieldsDeps): (req: Request
       if (envelope.status !== 'draft') throw notDraft();
 
       if (b.action === 'remove') {
-        const deleted = await rows(
+        const deleted = await draftWrite(rows(
           'field delete',
           deps.db.from('esign_envelope_fields').delete().eq('id', b.field_id).eq('envelope_id', envelopeId).select('id'),
-        );
+        ));
         if (deleted.length === 0) throw new HttpError(404, 'That field is not on this envelope.', 'field_not_found');
         return json(200, { success: true, ok: true } satisfies ManageFieldsResponse);
       }

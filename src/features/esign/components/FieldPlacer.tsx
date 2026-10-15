@@ -47,7 +47,14 @@ const HANDLES: { key: Handle; style: CSSProperties; cursor: string }[] = [
  * would overwrite a newer one), an edit made during a save keeps the signer dirty (a
  * revision counter, not a flag), and leaving the step flushes whatever is unsaved.
  */
-export function FieldPlacer({ envelopeId }: { envelopeId: string }) {
+export function FieldPlacer({
+  envelopeId,
+  registerFlush,
+}: {
+  envelopeId: string;
+  /** The composer awaits this before leaving the step, so nothing unsaved is left behind. */
+  registerFlush?: (flush: (() => Promise<void>) | null) => void;
+}) {
   const queryClient = useQueryClient();
   const documents = useQuery({ queryKey: esignKeys.documents(envelopeId), queryFn: () => getDocuments(envelopeId) });
   const pages = useQuery({ queryKey: esignKeys.pages(envelopeId), queryFn: () => getPages(envelopeId) });
@@ -118,6 +125,10 @@ export function FieldPlacer({ envelopeId }: { envelopeId: string }) {
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
   const revisionRef = useRef<Record<string, number>>({});
+  // A deleted field must never come back from a refetch. Its saved id is dead at once; the
+  // id a save still in flight gives it is dead once that save returns (ids rotate per save).
+  const removedLocalRef = useRef(new Set<string>());
+  const deadIdsRef = useRef(new Set<string>());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [interacting, setInteracting] = useState(false);
   const [saving, setSaving] = useState(0);
@@ -132,7 +143,7 @@ export function FieldPlacer({ envelopeId }: { envelopeId: string }) {
   useEffect(() => {
     if (!serverFields.data) return;
     const local = Object.values(fieldsRef.current).flat();
-    const additions = newServerFields(serverFields.data, local, visiblePages);
+    const additions = newServerFields(serverFields.data, local, visiblePages, deadIdsRef.current);
     if (additions.length === 0) return;
     setFields((prev) => {
       const next = { ...prev };
@@ -158,6 +169,11 @@ export function FieldPlacer({ envelopeId }: { envelopeId: string }) {
       setSaving((n) => n + 1);
       try {
         const result = await setSignerFields(envelopeId, signerId, inputs);
+        // A field deleted while this save ran was in its snapshot: its new id is dead too.
+        localIds.forEach((id, i) => {
+          const inserted = result.inserted_ids[i];
+          if (inserted && removedLocalRef.current.has(id)) deadIdsRef.current.add(inserted);
+        });
         // A save rotates every id: rebind them, or the next refetch reads as new fields.
         if (result.inserted_ids.length === localIds.length) {
           const remote = new Map(localIds.map((id, i) => [id, result.inserted_ids[i]] as const));
@@ -229,20 +245,24 @@ export function FieldPlacer({ envelopeId }: { envelopeId: string }) {
   const flushRef = useRef(flushAll);
   flushRef.current = flushAll;
   useEffect(() => () => void flushRef.current().catch(() => undefined), []);
+  useEffect(() => {
+    registerFlush?.(() => flushRef.current());
+    return () => registerFlush?.(null);
+  }, [registerFlush]);
 
   // ── Editing ─────────────────────────────────────────────────
   const canvasSize = rendered ? { width: rendered.canvasWidthPx, height: rendered.canvasHeightPx } : null;
 
   const toCanvas = useCallback(
     (f: PlacedField): CanvasRect | null =>
-      rendered ? pdfToCanvas(f.pdf, rendered.pageWidthPt, rendered.pageHeightPt, rendered.canvasWidthPx, rendered.canvasHeightPx) : null,
+      rendered ? pdfToCanvas(f.pdf, rendered.geometry) : null,
     [rendered],
   );
 
   const setRect = useCallback(
     (signerId: string, localId: string, rect: CanvasRect) => {
       if (!rendered) return;
-      const pdf = canvasToPdf(rect, rendered.pageWidthPt, rendered.pageHeightPt, rendered.canvasWidthPx, rendered.canvasHeightPx);
+      const pdf = canvasToPdf(rect, rendered.geometry);
       setFields((prev) => ({ ...prev, [signerId]: (prev[signerId] ?? []).map((f) => (f.localId === localId ? { ...f, pdf } : f)) }));
       markDirty(signerId);
     },
@@ -251,6 +271,9 @@ export function FieldPlacer({ envelopeId }: { envelopeId: string }) {
 
   const removeField = useCallback(
     (signerId: string, localId: string) => {
+      removedLocalRef.current.add(localId);
+      const gone = (fieldsRef.current[signerId] ?? []).find((f) => f.localId === localId);
+      if (gone?.remoteId) deadIdsRef.current.add(gone.remoteId);
       setFields((prev) => ({ ...prev, [signerId]: (prev[signerId] ?? []).filter((f) => f.localId !== localId) }));
       markDirty(signerId);
       setSelectedId((cur) => (cur === localId ? null : cur));
@@ -266,7 +289,7 @@ export function FieldPlacer({ envelopeId }: { envelopeId: string }) {
     if (!activeSignerId || !activePage || !rendered || !canvasSize || !overlayRef.current) return;
     const box = overlayRef.current.getBoundingClientRect();
     const rect = placeAt(mode, e.clientX - box.left, e.clientY - box.top, canvasSize);
-    const pdf = canvasToPdf(rect, rendered.pageWidthPt, rendered.pageHeightPt, rendered.canvasWidthPx, rendered.canvasHeightPx);
+    const pdf = canvasToPdf(rect, rendered.geometry);
     const field: PlacedField = {
       localId: makeLocalId(),
       signerId: activeSignerId,

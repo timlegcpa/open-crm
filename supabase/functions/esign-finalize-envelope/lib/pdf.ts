@@ -25,7 +25,7 @@ type PdfFont = PdfLib.PDFFont;
 type Fontkit = Parameters<PdfDocument['registerFontkit']>[0];
 
 export interface PdfToolsDeps {
-  pdfLib: Pick<typeof PdfLib, 'PDFDocument' | 'StandardFonts' | 'rgb'>;
+  pdfLib: Pick<typeof PdfLib, 'PDFDocument' | 'StandardFonts' | 'rgb' | 'degrees'>;
   fontkit?: Fontkit;
   /** The script fonts' bytes. Only finalize stamps typed signatures, so only it passes them. */
   fontBytes?: Partial<Record<SignerFontKey, Uint8Array>>;
@@ -59,10 +59,36 @@ export function planMerge(pages: readonly PlanPage[]): MergeStep[] {
 export interface StampField {
   page_index: number;
   field_type: 'signature' | 'date';
+  /** The box in UNROTATED page user space (CropBox offset included), as the editor stores it. */
   x: number;
   y: number;
   width: number;
   height: number;
+}
+
+/**
+ * A box as a reader sees it on a page shown with /Rotate `rotation` (clockwise, a multiple
+ * of 90): its width and height as read, and where a point (u along the reading direction,
+ * v up the reading direction, both from the box's visual bottom-left) lands in unrotated
+ * user space. Drawing at at(u, v) with rotate = `rotation` degrees (counter-clockwise in
+ * user space) cancels the viewer's turn, so the content reads upright inside the same box.
+ */
+export function uprightBox(box: { x: number; y: number; width: number; height: number }, rotation: number) {
+  const r = ((Math.round(rotation / 90) * 90) % 360 + 360) % 360;
+  const sideways = r === 90 || r === 270;
+  const at = (u: number, v: number): { x: number; y: number } => {
+    switch (r) {
+      case 90:
+        return { x: box.x + box.width - v, y: box.y + u };
+      case 180:
+        return { x: box.x + box.width - u, y: box.y + box.height - v };
+      case 270:
+        return { x: box.x + v, y: box.y + box.height - u };
+      default:
+        return { x: box.x + u, y: box.y + v };
+    }
+  };
+  return { rotation: r, width: sideways ? box.height : box.width, height: sideways ? box.width : box.height, at };
 }
 
 interface SignerStampBase {
@@ -127,7 +153,7 @@ function shortUtc(d: Date): string {
 }
 
 export function createPdfTools(deps: PdfToolsDeps) {
-  const { PDFDocument, StandardFonts, rgb } = deps.pdfLib;
+  const { PDFDocument, StandardFonts, rgb, degrees } = deps.pdfLib;
 
   /** Page count of an upload; throws for an encrypted or unreadable PDF. */
   async function pageCount(bytes: Uint8Array): Promise<number> {
@@ -169,9 +195,12 @@ export function createPdfTools(deps: PdfToolsDeps) {
     const safe = (t: string) => toEncodableText(t, fontCanEncode(helv));
     const pages = pdf.getPages();
     pages.forEach((page, i) => {
-      const { width } = page.getSize();
+      // Along the bottom of the page as it is shown, whatever its /Rotate.
+      const { width, height } = page.getSize();
+      const shown = uprightBox({ x: 0, y: 0, width, height }, page.getRotation().angle);
       const text = safe(`Page ${i + 1} of ${pages.length} · E-Sign ID: ${envelopeIdShort} · ${stampIso}`);
-      page.drawText(text, { x: width - helv.widthOfTextAtSize(text, 7) - 18, y: 12, size: 7, font: helv, color: rgb(0.5, 0.5, 0.5) });
+      const at = shown.at(shown.width - helv.widthOfTextAtSize(text, 7) - 18, 12);
+      page.drawText(text, { ...at, rotate: degrees(shown.rotation), size: 7, font: helv, color: rgb(0.5, 0.5, 0.5) });
     });
   }
 
@@ -265,38 +294,41 @@ export function createPdfTools(deps: PdfToolsDeps) {
       for (const f of s.fields) {
         const page = pages[f.page_index];
         if (!page) continue;
+        // Laid out in the box as the reader sees it, then turned with the page, so the
+        // content reads upright on a page shown with /Rotate 90, 180 or 270.
+        const box = uprightBox(f, page.getRotation().angle);
+        const rotate = degrees(box.rotation);
         if (f.field_type === 'date') {
-          const size = Math.min(f.height * 0.6, 12);
-          page.drawText(formatMmDdYyyy(s.signed_at, s.tz), { x: f.x + 4, y: f.y + (f.height - size) / 2, size, font: helv, color: rgb(0, 0, 0) });
+          const size = Math.min(box.height * 0.6, 12);
+          page.drawText(formatMmDdYyyy(s.signed_at, s.tz), { ...box.at(4, (box.height - size) / 2), rotate, size, font: helv, color: rgb(0, 0, 0) });
           continue;
         }
         // The caption sits INSIDE the box along its bottom edge; the signature fills the
         // space above it, so neither bleeds into the form around the box.
         const captionSize = 5;
         const reserved = captionSize + 2;
-        const targetWidth = f.width * 0.92;
-        const availableHeight = f.height - reserved;
-        const bottom = f.y + reserved;
+        const targetWidth = box.width * 0.92;
+        const availableHeight = box.height - reserved;
         if (s.kind === 'drawn') {
           const img = images.get(s.signer_id) as PdfLib.PDFImage;
           const scale = Math.min(targetWidth / img.width, availableHeight / img.height);
           const w = img.width * scale;
           const h = img.height * scale;
-          page.drawImage(img, { x: f.x + (f.width - w) / 2, y: bottom + (availableHeight - h) / 2, width: w, height: h });
+          page.drawImage(img, { ...box.at((box.width - w) / 2, reserved + (availableHeight - h) / 2), rotate, width: w, height: h });
         } else {
           const font = fonts.get(s.font_key) as PdfFont;
           let size = availableHeight * 0.85;
           const width = font.widthOfTextAtSize(s.signature_text, size);
           if (width > targetWidth) size = size * (targetWidth / width);
-          page.drawText(s.signature_text, { x: f.x + 4, y: bottom + (availableHeight - size) / 2, size, font, color: rgb(0.05, 0.05, 0.5) });
+          page.drawText(s.signature_text, { ...box.at(4, reserved + (availableHeight - size) / 2), rotate, size, font, color: rgb(0.05, 0.05, 0.5) });
         }
         page.drawText(safe(`e-Signed by ${s.signer_name} · ${opts.envelopeIdShort} · ${shortUtc(s.signed_at)}`), {
-          x: f.x + 4,
-          y: f.y + 1,
+          ...box.at(4, 1),
+          rotate,
           size: captionSize,
           font: helv,
           color: rgb(0.5, 0.5, 0.5),
-          maxWidth: Math.max(f.width - 8, 1),
+          maxWidth: Math.max(box.width - 8, 1),
         });
       }
     }

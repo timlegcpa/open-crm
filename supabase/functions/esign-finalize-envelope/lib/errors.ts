@@ -24,6 +24,20 @@ export const sessionRequired = () => new HttpError(401, 'Confirm the code sent t
 export const smsUnavailable = () =>
   new HttpError(409, 'Text message codes are not available. Turn SMS on in settings or choose standard verification.', 'sms_unavailable');
 
+/**
+ * A write to a draft's shape (documents, pages, signers, fields). The database refuses it
+ * with 55000 once the envelope has left draft (trg_esign_*_draft_only, under the envelope
+ * row lock), however late the write lands: that is the 409 not_draft.
+ */
+export async function draftWrite<T>(write: PromiseLike<T>): Promise<T> {
+  try {
+    return await write;
+  } catch (err) {
+    if (pgCode(err) === '55000') throw notDraft();
+    throw err;
+  }
+}
+
 /** An RPC's own refusals: a draft check (55000) and a missing row (P0002). Anything else is rethrown. */
 export function rpcRefusal(err: unknown): HttpError | null {
   const code = pgCode(err);
