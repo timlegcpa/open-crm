@@ -50,6 +50,11 @@ CREATE TABLE public.org_profile (
   legal_name text CHECK (legal_name IS NULL OR length(legal_name) <= 200),
   sender_name text CHECK (sender_name IS NULL OR length(sender_name) <= 120),
   postal_address text CHECK (postal_address IS NULL OR length(postal_address) <= 500),
+  -- The address the organization answers at, shown on pages anyone can open (the
+  -- e-signature consent and error pages, which offer a paper copy and a way to ask a
+  -- question). Never the owner's sign-in address: that one stays private.
+  contact_email text CHECK (contact_email IS NULL OR (length(contact_email) <= 254
+    AND contact_email ~ '^[^[:space:][:cntrl:]@<>"]+@[^[:space:][:cntrl:]@<>"]+\.[^[:space:][:cntrl:]@<>"]{2,}$')),
   logo_path text CHECK (logo_path IS NULL OR length(logo_path) <= 500),
   brand jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(brand) = 'object'),
   owner_user_id uuid UNIQUE REFERENCES auth.users(id) ON DELETE RESTRICT,
@@ -174,6 +179,8 @@ SET search_path = ''
 AS $$
   SELECT jsonb_build_object(
     'display_name', o.display_name,
+    'legal_name', o.legal_name,
+    'contact_email', o.contact_email,
     'logo_path', o.logo_path,
     'brand', o.brand
   )

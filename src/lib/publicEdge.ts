@@ -117,14 +117,21 @@ export async function invokePublicEdge<T = unknown>(
 export interface PublicBranding {
   displayName: string | null;
   logoPath: string | null;
+  /** The registered name, when the owner set one (consent copy names the party with it). */
+  legalName: string | null;
+  /** The public address people may write to (org_profile.contact_email), never the owner's login. */
+  contactEmail: string | null;
 }
 
+export const NO_BRANDING: Readonly<PublicBranding> = Object.freeze({ displayName: null, logoPath: null, legalName: null, contactEmail: null });
+
 /**
- * The organization's display name and logo path for a public page header, read through the
- * anon-callable `get_org_branding()` RPC. Decoration only: any failure resolves to nulls.
+ * The organization's public identity for a page with no session (its display and legal
+ * names, logo path and contact address), read through the anon-callable
+ * `get_org_branding()` RPC. Decoration only: any failure resolves to nulls.
  */
 export async function fetchPublicBranding(signal?: AbortSignal): Promise<PublicBranding> {
-  const empty: PublicBranding = { displayName: null, logoPath: null };
+  const empty: PublicBranding = { ...NO_BRANDING };
   const config = projectConfig();
   if (!config) return empty;
   try {
@@ -142,10 +149,13 @@ export async function fetchPublicBranding(signal?: AbortSignal): Promise<PublicB
       signal,
     });
     if (!res.ok) return empty;
-    const data = (await res.json()) as { display_name?: unknown; logo_path?: unknown } | null;
+    const data = (await res.json()) as { display_name?: unknown; logo_path?: unknown; legal_name?: unknown; contact_email?: unknown } | null;
+    const text = (v: unknown) => (typeof v === 'string' ? v : null);
     return {
-      displayName: typeof data?.display_name === 'string' ? data.display_name : null,
-      logoPath: typeof data?.logo_path === 'string' ? data.logo_path : null,
+      displayName: text(data?.display_name),
+      logoPath: text(data?.logo_path),
+      legalName: text(data?.legal_name),
+      contactEmail: text(data?.contact_email),
     };
   } catch {
     return empty;

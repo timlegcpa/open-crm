@@ -1,10 +1,11 @@
 import { PublicPage } from '@/components/layout/PublicPage';
+import { SignerFlow } from './signer/SignerFlow';
 
-/** Placeholder: where a signer's link lands. The e-sign feature replaces it. */
+/** /sign#token=...: where a signer's emailed link lands. No session; the token is the capability. */
 export function SignPage() {
   return (
     <PublicPage title="Sign a document" width="wide">
-      <p className="text-[14px] text-muted-foreground">The document to sign will appear here.</p>
+      <SignerFlow />
     </PublicPage>
   );
 }

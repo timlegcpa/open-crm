@@ -425,7 +425,7 @@ enabled = true
 
 # Edge functions the Supabase gateway must not hold to a user JWT. Each one checks its own
 # caller in code (src/__tests__/edge/gatewayJwt.test.ts keeps this list equal to the functions
-# whose handler declares the public, apiKey or cron mode):
+# whose handler declares the public, apiKey, cron or internal mode):
 #   - job-runner and send-portal-digest take the cron secret (or the owner's session);
 #   - csp-report is a browser's reporting endpoint;
 #   - email-unsubscribe is opened from a link in an email;
@@ -437,7 +437,13 @@ enabled = true
 #   - mcp-oauth and mcp-crm are the AI connector's authorization server and resource server,
 #     which issue and check their own tokens. mcp-oauth's owner consent endpoint (POST /)
 #     still needs the owner's session: the handler checks it (owner mode, at aal2), since
-#     the gateway check is off for the whole function.
+#     the gateway check is off for the whole function;
+#   - the e-sign signer functions (resolve-token, signer-*, verify-document) are reached by
+#     a signer or a reader with no account: the link token or the file's digest is the
+#     capability, and each is rate limited;
+#   - esign-resend-webhook checks the provider's signature; esign-expire-envelopes takes the
+#     cron secret (or the owner's session); esign-finalize-envelope takes the internal
+#     token from the sign and expiry functions.
 [functions.job-runner]
 verify_jwt = false
 
@@ -473,3 +479,44 @@ verify_jwt = false
 
 [functions.needs-reminder-dispatcher]
 verify_jwt = false
+
+[functions.esign-resolve-token]
+verify_jwt = false
+
+[functions.esign-signer-view-pdf]
+verify_jwt = false
+
+[functions.esign-signer-sign]
+verify_jwt = false
+
+[functions.esign-signer-decline]
+verify_jwt = false
+
+[functions.esign-signer-request-sms]
+verify_jwt = false
+
+[functions.esign-signer-verify-sms]
+verify_jwt = false
+
+[functions.esign-verify-document]
+verify_jwt = false
+
+[functions.esign-resend-webhook]
+verify_jwt = false
+
+[functions.esign-expire-envelopes]
+verify_jwt = false
+
+# The six signature fonts finalize stamps typed signatures with. They deploy with the
+# function only because they are listed here (the bundler cannot see a file read at run
+# time), so test one typed-signature envelope after the first deploy.
+[functions.esign-finalize-envelope]
+verify_jwt = false
+static_files = [
+  "./functions/_shared/esign-fonts/fonts/Allison-Regular.ttf",
+  "./functions/_shared/esign-fonts/fonts/DancingScript-Regular.ttf",
+  "./functions/_shared/esign-fonts/fonts/GreatVibes-Regular.ttf",
+  "./functions/_shared/esign-fonts/fonts/HomemadeApple-Regular.ttf",
+  "./functions/_shared/esign-fonts/fonts/Pacifico-Regular.ttf",
+  "./functions/_shared/esign-fonts/fonts/Sacramento-Regular.ttf",
+]

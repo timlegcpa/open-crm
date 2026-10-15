@@ -1,13 +1,13 @@
 import { useEffect, useState } from 'react';
-import { fetchPublicBranding, type PublicBranding } from '@/lib/publicEdge';
+import { fetchPublicBranding, NO_BRANDING, type PublicBranding } from '@/lib/publicEdge';
 
 /**
- * The organization's display name and logo path on a PUBLIC page (no session, no
- * supabase-js). Both are null until known and stay null if the lookup fails: branding is
+ * The organization's public identity on a PUBLIC page (no session, no supabase-js): display
+ * and legal names, logo path, contact address. Each is null until known and stay null if the lookup fails: branding is
  * decoration, and a public page must work without it.
  */
 export function usePublicBranding(): PublicBranding {
-  const [branding, setBranding] = useState<PublicBranding>({ displayName: null, logoPath: null });
+  const [branding, setBranding] = useState<PublicBranding>(NO_BRANDING);
 
   useEffect(() => {
     const controller = new AbortController();

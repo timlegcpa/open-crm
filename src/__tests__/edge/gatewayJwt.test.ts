@@ -1,8 +1,9 @@
 // @vitest-environment node
 // The Supabase gateway checks a user JWT before a function runs unless config.toml turns it
-// off for that function. A function that authenticates itself (public, an API key, or the
-// cron secret) must have it off, or its real callers (a browser report, an email link,
-// another server, pg_cron) are refused at the gateway. A function that only takes a signed-in session keeps
+// off for that function. A function that authenticates itself (public, an API key, the
+// cron secret, or an internal function-to-function secret) must have it off, or its real
+// callers (a browser report, an email link, another server, pg_cron, another function)
+// are refused at the gateway. A function that only takes a signed-in session keeps
 // it on: the gateway check is a second lock, and turning it off without a reason removes it.
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -14,12 +15,16 @@ function functionDirs(): string[] {
   return readdirSync(ROOT).filter((d) => !d.startsWith('_') && statSync(path.join(ROOT, d)).isDirectory());
 }
 
-/** The functions whose handler declares the public, apiKey or cron mode. */
+/** The functions whose handler declares the public, apiKey, cron or internal mode. */
 function selfAuthenticating(): string[] {
   return functionDirs()
     .filter((dir) => {
       const text = readFileSync(path.join(ROOT, dir, 'handler.ts'), 'utf8');
-      return /\bauth:\s*\{\s*(public:\s*true|apiKey:)/.test(text) || /\bauth:\s*\{[^}]*\bcron:\s*\{/.test(text);
+      return (
+        /\bauth:\s*\{\s*(public:\s*true|apiKey:)/.test(text) ||
+        /\bauth:\s*\{[^}]*\bcron:\s*\{/.test(text) ||
+        /\bauth:\s*\{[^}]*\binternal:\s*\{/.test(text)
+      );
     })
     .sort();
 }
@@ -35,7 +40,7 @@ describe('gateway JWT check (supabase/config.toml)', () => {
   it('is off for exactly the functions that authenticate their own callers', () => {
     const own = selfAuthenticating();
     // The scan finds the functions it is meant to guard.
-    expect(own).toEqual(expect.arrayContaining(['csp-report', 'job-runner', 'lead-intake', 'mcp-crm']));
+    expect(own).toEqual(expect.arrayContaining(['csp-report', 'job-runner', 'lead-intake', 'mcp-crm', 'esign-finalize-envelope', 'esign-resolve-token']));
     expect(exempted(toml)).toEqual(own);
   });
 

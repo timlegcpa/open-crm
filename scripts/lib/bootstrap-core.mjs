@@ -13,6 +13,8 @@ export const FUNCTION_SECRETS = [
   { name: 'CRON_SHARED_SECRET', bytes: 32, encoding: 'hex' },
   { name: 'MCP_INTERNAL_SECRET', bytes: 32, encoding: 'hex' },
   { name: 'ESIGN_INTERNAL_TOKEN', bytes: 32, encoding: 'hex' },
+  // The HMAC key for e-sign text message codes: exactly 32 bytes as 64 hex characters.
+  { name: 'ESIGN_SMS_CODE_KEY', bytes: 32, encoding: 'hex' },
 ];
 
 /** The system actor's sign-in address. `.invalid` is reserved (RFC 2606): mail to it goes nowhere. */

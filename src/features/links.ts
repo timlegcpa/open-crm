@@ -92,7 +92,7 @@ export const links = {
  * feature.
  */
 export const PUBLIC_PATHS = {
-  /** e-sign: a signer's link, /sign/<token> */
+  /** e-sign: a signer's link, /sign#token=<token> (in the fragment, so it never reaches a server log or a Referer) */
   sign: '/sign',
   /** e-sign: check a signed document's certificate */
   esignVerify: '/esign/verify',
