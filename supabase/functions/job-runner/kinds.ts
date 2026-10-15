@@ -37,7 +37,7 @@ export const JOB_ROUTES = {
   'portal:daily_digest': { kind: 'function', name: 'send-portal-digest', payload: {} },
   'ops:maintenance': {
     kind: 'sql',
-    functions: ['cleanup_core_operational_rows', 'cleanup_aged_audit_logs', 'cleanup_aged_client_activity', 'cleanup_read_client_messages', 'auto_archive_done_work_items'],
+    functions: ['cleanup_core_operational_rows', 'cleanup_aged_audit_logs', 'cleanup_aged_client_activity', 'cleanup_read_client_messages', 'auto_archive_done_work_items', 'cleanup_stale_start_links'],
     payload: {},
   },
 } as const satisfies Record<string, JobRoute>;

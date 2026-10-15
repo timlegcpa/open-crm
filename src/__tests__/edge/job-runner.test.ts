@@ -140,7 +140,7 @@ describe('job-runner: the kinds', () => {
     expect(JOB_ROUTES['esign:expire_envelopes']).toEqual({ kind: 'function', name: 'esign-expire-envelopes', payload: {} });
     expect(JOB_ROUTES['ops:maintenance']).toEqual({
       kind: 'sql',
-      functions: ['cleanup_core_operational_rows', 'cleanup_aged_audit_logs', 'cleanup_aged_client_activity', 'cleanup_read_client_messages', 'auto_archive_done_work_items'],
+      functions: ['cleanup_core_operational_rows', 'cleanup_aged_audit_logs', 'cleanup_aged_client_activity', 'cleanup_read_client_messages', 'auto_archive_done_work_items', 'cleanup_stale_start_links'],
       payload: {},
     });
   });
@@ -193,6 +193,7 @@ describe('job-runner: a tick', () => {
       cleanup_aged_client_activity: { client_activity: 0 },
       cleanup_read_client_messages: 0,
       auto_archive_done_work_items: 0,
+      cleanup_stale_start_links: { start_links: 0 },
     });
   });
 
