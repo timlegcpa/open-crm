@@ -14,7 +14,7 @@ import { LIVE_ENVELOPE_STATUSES, RESENDABLE_SIGNER_STATUSES, SIGNER_ROLE_LABELS 
 import { esignKeys } from '../keys';
 import { resolveSignerName } from '../lib/signerName';
 import { DeleteEnvelopeDialog, ResendInviteDialog, VoidEnvelopeDialog } from './EnvelopeDialogs';
-import { DocumentList } from './DocumentsStep';
+import { DocumentList } from './DocumentList';
 import { EventLogTable } from './EventLogTable';
 import { EsignStatusBadge } from './StatusBadge';
 
