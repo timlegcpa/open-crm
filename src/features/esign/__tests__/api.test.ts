@@ -1,5 +1,7 @@
-// The owner-side reads and writes: explicit columns, keyset paging, the order of a
-// document delete, the two-bucket signed copy, the settings write.
+// The owner-side reads and writes: explicit columns, keyset paging, every call's body and
+// the answer it parses (the server's shapes), the server-side document delete, the send
+// refusal's problem list, the signed copy opened through the documents feature, the
+// settings write.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { EdgeError } from '@/lib/edgeCore';
 
@@ -19,6 +21,8 @@ const state = vi.hoisted(() => ({
   downloadBlob: vi.fn(),
   getDocument: vi.fn(),
   fetchDocument: vi.fn(),
+  downloadDocument: vi.fn(),
+  functionsInvoke: vi.fn(),
 }));
 
 vi.mock('@/lib/supabase', () => {
@@ -50,17 +54,25 @@ vi.mock('@/lib/supabase', () => {
       },
     }),
   };
-  return { getSupabase: () => ({ from: (table: string) => builder(table), storage }) };
+  const functions = { invoke: (...args: unknown[]) => state.functionsInvoke(...args) };
+  return { getSupabase: () => ({ from: (table: string) => builder(table), storage, functions }) };
 });
 
 vi.mock('@/lib/edge', async () => {
   const core = await vi.importActual<typeof import('@/lib/edgeCore')>('@/lib/edgeCore');
-  return { invokeEdge: (...args: unknown[]) => state.invokeEdge(...args), isEdgeError: core.isEdgeError, EdgeError: core.EdgeError };
+  const actual = await vi.importActual<typeof import('@/lib/edge')>('@/lib/edge');
+  return {
+    invokeEdge: (...args: unknown[]) => state.invokeEdge(...args),
+    toEdgeError: actual.toEdgeError,
+    isEdgeError: core.isEdgeError,
+    EdgeError: core.EdgeError,
+  };
 });
 vi.mock('@/lib/download', () => ({ downloadBlob: (...args: unknown[]) => state.downloadBlob(...args) }));
 vi.mock('@/features/documents/api', () => ({
   getDocument: (...args: unknown[]) => state.getDocument(...args),
   fetchDocument: (...args: unknown[]) => state.fetchDocument(...args),
+  downloadDocument: (...args: unknown[]) => state.downloadDocument(...args),
 }));
 
 import {
@@ -75,6 +87,8 @@ import {
   listEnvelopes,
   manageSigner,
   saveEsignSettings,
+  sendEnvelope,
+  SendNotReadyError,
   setSignerFields,
   uploadDocument,
 } from '../api';
@@ -92,6 +106,8 @@ beforeEach(() => {
   state.downloadBlob.mockReset();
   state.getDocument.mockReset();
   state.fetchDocument.mockReset();
+  state.downloadDocument.mockReset();
+  state.functionsInvoke.mockReset();
   vi.unstubAllGlobals();
 });
 
@@ -155,7 +171,8 @@ describe('reads', () => {
 
 describe('writes through the functions', () => {
   it('uploads a source PDF as multipart', async () => {
-    state.invokeEdge.mockResolvedValue({ document: { id: 'd', page_count: 1 }, pages: [] });
+    state.invokeEdge.mockImplementation((_name: string, _body: unknown, opts: { parse: (d: unknown) => unknown }) =>
+      opts.parse({ document: { id: 'd', file_name: 'Acme plan.pdf', page_count: 1, order: 0 }, pages: [{ id: 'p', order: 0, source_page_index: 0 }] }));
     const file = new File(['%PDF-1.7'], 'Acme plan.pdf', { type: 'application/pdf' });
     await uploadDocument('env-1', file);
     const [name, body] = state.invokeEdge.mock.calls[0];
@@ -167,17 +184,37 @@ describe('writes through the functions', () => {
     expect(form.get('file')).toBeInstanceOf(File);
   });
 
+  it('shortens a file name past the server’s 200 characters, keeping the extension', async () => {
+    state.invokeEdge.mockResolvedValue({});
+    await uploadDocument('env-1', new File(['%PDF-1.7'], `${'a'.repeat(250)}.pdf`, { type: 'application/pdf' }));
+    const name = String((state.invokeEdge.mock.calls[0][1] as FormData).get('file_name'));
+    expect(name).toHaveLength(200);
+    expect(name.endsWith('.pdf')).toBe(true);
+  });
+
+  it('parses each manage-signers action by its own answer (remove answers success only)', async () => {
+    const answers: Record<string, unknown> = {
+      add: { success: true, signer_id: 's', contact_id: 'c' },
+      update: { success: true, signer_id: 's' },
+      remove: { success: true },
+    };
+    state.invokeEdge.mockImplementation((_name: string, body: { action: string }, opts: { parse: (d: unknown) => unknown }) => Promise.resolve(opts.parse(answers[body.action])));
+    await expect(manageSigner('env-1', 'add', { email: 'ada@example.com', order: 0 })).resolves.toEqual(answers.add);
+    await expect(manageSigner('env-1', 'update', { signer_id: 's', order: 1 })).resolves.toEqual(answers.update);
+    await expect(manageSigner('env-1', 'remove', { signer_id: 's' })).resolves.toEqual(answers.remove);
+  });
+
   it('sends one signer per manage-signers call, and one signer’s fields per set', async () => {
     state.invokeEdge.mockResolvedValue({ signer_id: 's', count: 0, inserted_ids: [] });
     await manageSigner('env-1', 'add', { email: 'ada@example.com', order: 0, role: 'primary' });
-    await setSignerFields('env-1', 's1', [{ signer_id: 's1', page_index: 0, field_type: 'date', x: 1, y: 2, width: 3, height: 4 }]);
+    await setSignerFields('env-1', 's1', [{ page_index: 0, field_type: 'date', x: 1, y: 2, width: 3, height: 4 }]);
     expect(state.invokeEdge.mock.calls[0].slice(0, 2)).toEqual([
       FN.manageSigners,
       { envelope_id: 'env-1', action: 'add', signer: { email: 'ada@example.com', order: 0, role: 'primary' } },
     ]);
     expect(state.invokeEdge.mock.calls[1].slice(0, 2)).toEqual([
       FN.manageFields,
-      { envelope_id: 'env-1', action: 'set', signer_id: 's1', fields: [{ signer_id: 's1', page_index: 0, field_type: 'date', x: 1, y: 2, width: 3, height: 4 }] },
+      { envelope_id: 'env-1', action: 'set', signer_id: 's1', fields: [{ page_index: 0, field_type: 'date', x: 1, y: 2, width: 3, height: 4 }] },
     ]);
   });
 
@@ -189,28 +226,63 @@ describe('writes through the functions', () => {
 });
 
 describe('deleting a draft document', () => {
-  const pages = [
-    { id: 'p1', order: 0, source_document_id: 'doc-a', deleted: false },
-    { id: 'p2', order: 1, source_document_id: 'doc-b', deleted: false },
-    { id: 'p3', order: 2, source_document_id: 'doc-b', deleted: true },
-  ];
-
-  it('retires its live pages through the reorder FIRST, then the row, and never removes the object', async () => {
-    state.results.esign_envelope_pages = [{ data: pages, error: null }];
-    state.results.esign_envelope_documents = [{ data: [{ id: 'doc-b' }], error: null }];
-    state.invokeEdge.mockResolvedValue({});
+  it('is one server call, and the browser touches no row and no storage object', async () => {
+    state.invokeEdge.mockImplementation((_n: string, _b: unknown, opts: { parse: (d: unknown) => unknown }) => opts.parse({ ok: true }));
     await deleteEnvelopeDocument('env-1', { id: 'doc-b' });
-    expect(state.invokeEdge.mock.calls[0].slice(0, 2)).toEqual([FN.reorderPages, { envelope_id: 'env-1', operations: [{ page_id: 'p2', deleted: true }] }]);
-    expect(methodArgs(callsOn('esign_envelope_documents')[0], 'eq')).toEqual([['id', 'doc-b']]);
+    expect(state.invokeEdge.mock.calls.map((c) => c.slice(0, 2))).toEqual([
+      [FN.reorderPages, { action: 'delete_document', envelope_id: 'env-1', document_id: 'doc-b' }],
+    ]);
+    expect(state.queries).toEqual([]);
     expect(state.storage).toEqual([]);
   });
 
-  it('a refused row delete throws', async () => {
-    state.results.esign_envelope_pages = [{ data: pages, error: null }];
-    state.results.esign_envelope_documents = [{ data: [], error: null }];
-    state.invokeEdge.mockResolvedValue({});
-    await expect(deleteEnvelopeDocument('env-1', { id: 'doc-b' })).rejects.toThrow(/not removed/);
-    expect(state.storage).toEqual([]);
+  it('a refusal (the envelope was sent) is thrown as the server said it', async () => {
+    state.invokeEdge.mockRejectedValue(new EdgeError('conflict', { status: 409, code: 'not_draft' }));
+    await expect(deleteEnvelopeDocument('env-1', { id: 'doc-b' })).rejects.toMatchObject({ code: 'not_draft' });
+  });
+});
+
+describe('sending', () => {
+  /** What functions.invoke returns for a non-2xx: the Response on error.context. */
+  const httpError = (status: number, body: unknown) => ({
+    data: null,
+    error: Object.assign(new Error('Edge Function returned a non-2xx status code'), {
+      context: new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }),
+    }),
+  });
+
+  it('a draft that is not ready throws every problem the server listed, with its code and sentence', async () => {
+    state.functionsInvoke.mockResolvedValue(
+      httpError(400, {
+        error: 'This envelope has 2 problems to fix before it can be sent.',
+        code: 'validation_failed',
+        validation: ['At least one page is required.', 'Signer ada@example.com has no required fields.'],
+      }),
+    );
+    const err = await sendEnvelope('env-1').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SendNotReadyError);
+    expect(err).toMatchObject({
+      code: 'validation_failed',
+      status: 400,
+      message: 'This envelope has 2 problems to fix before it can be sent.',
+      problems: ['At least one page is required.', 'Signer ada@example.com has no required fields.'],
+    });
+    expect(state.functionsInvoke.mock.calls[0]).toEqual([FN.sendEnvelope, { body: { envelope_id: 'env-1' }, method: 'POST' }]);
+  });
+
+  it('any other refusal is a plain edge error', async () => {
+    state.functionsInvoke.mockResolvedValue(httpError(409, { error: 'Text message codes are not available.', code: 'sms_unavailable' }));
+    const err = await sendEnvelope('env-1').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EdgeError);
+    expect(err).not.toBeInstanceOf(SendNotReadyError);
+    expect(err).toMatchObject({ code: 'sms_unavailable' });
+  });
+
+  it('parses the server’s answer', async () => {
+    state.functionsInvoke.mockResolvedValue({ data: { ok: true, envelope_id: 'env-1', signers_invited: 2, failed_emails: [] }, error: null });
+    await expect(sendEnvelope('env-1')).resolves.toEqual({ ok: true, envelope_id: 'env-1', signers_invited: 2, failed_emails: [] });
+    state.functionsInvoke.mockResolvedValue({ data: { signers_invited: 2 }, error: null });
+    await expect(sendEnvelope('env-1')).rejects.toBeInstanceOf(EdgeError);
   });
 });
 
@@ -223,21 +295,21 @@ describe('downloads', () => {
     expect(state.downloadBlob.mock.calls[0][1]).toBe('Acme_ plan_audit.pdf');
   });
 
-  it('the signed copy is read from the documents bucket, else the working bucket', async () => {
-    state.signedUrl['esign-working'] = { data: { signedUrl: 'https://storage.example.com/s' }, error: null };
-    const fetchMock = vi.fn().mockResolvedValue(new Response(new Uint8Array([37, 80, 68, 70]), { status: 200 }));
-    vi.stubGlobal('fetch', fetchMock);
-    await downloadSignedCopy({ title: 'Acme plan', signed_pdf_path: 'env/signed.pdf' });
-    expect(state.storage.map((s) => s.bucket)).toEqual(['client-documents', 'esign-working']);
-    expect(fetchMock).toHaveBeenCalledWith('https://storage.example.com/s');
-    expect(state.downloadBlob.mock.calls[0][1]).toBe('Acme plan_signed.pdf');
+  it('the signed copy is the filed documents row finalize wrote, opened through the documents feature', async () => {
+    state.results.client_documents = [{ data: { id: 'doc-1', original_filename: 'Acme plan.pdf', mime_type: 'application/pdf' }, error: null }];
+    await downloadSignedCopy({ id: 'env-1', signed_pdf_path: 'c1/esign/env-1.pdf' });
+    const [calls] = callsOn('client_documents');
+    expect(methodArgs(calls, 'eq')).toEqual([['esign_envelope_id', 'env-1']]);
+    expect(state.downloadDocument).toHaveBeenCalledWith({ id: 'doc-1', filename: 'Acme plan.pdf', mimeType: 'application/pdf' });
+    // Never a guessed path in either bucket.
+    expect(state.storage).toEqual([]);
   });
 
-  it('no signed URL anywhere is an error, not a fetch', async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
-    await expect(downloadSignedCopy({ title: 't', signed_pdf_path: 'p' })).rejects.toThrow(/could not be opened/);
-    expect(fetchMock).not.toHaveBeenCalled();
+  it('no filed row yet is an error, not a guess', async () => {
+    state.results.client_documents = [{ data: null, error: null }];
+    await expect(downloadSignedCopy({ id: 'env-1', signed_pdf_path: 'c1/esign/env-1.pdf' })).rejects.toThrow(/not filed/);
+    expect(state.downloadDocument).not.toHaveBeenCalled();
+    expect(state.storage).toEqual([]);
   });
 });
 
@@ -255,6 +327,16 @@ describe('importing a stored document', () => {
     await expect(importStoredDocument('env-1', 'd')).rejects.toThrow(/could not be read/);
     expect(state.invokeEdge).not.toHaveBeenCalled();
   });
+
+  it('uploads a stored PDF under a name the server accepts', async () => {
+    state.getDocument.mockResolvedValue({ id: 'd', mime_type: 'application/pdf', original_filename: `${'n'.repeat(240)}.pdf` });
+    state.fetchDocument.mockResolvedValue({ kind: 'bytes', blob: new Blob(['%PDF-1.7']) });
+    state.invokeEdge.mockResolvedValue({});
+    await importStoredDocument('env-1', 'd');
+    const form = state.invokeEdge.mock.calls[0][1] as FormData;
+    expect(String(form.get('file_name'))).toHaveLength(200);
+    expect((form.get('file') as File).type).toBe('application/pdf');
+  });
 });
 
 describe('settings', () => {
@@ -263,10 +345,10 @@ describe('settings', () => {
       { data: [], error: null },
       { data: null, error: null },
     ];
-    await saveEsignSettings({ filing_folder: '  Signed  ', sms_enabled: false });
+    await saveEsignSettings({ filing_folder: '  Signed / Agreements ', sms_enabled: false });
     const [update, insert] = callsOn('app_settings');
-    expect(methodArgs(update, 'update')).toEqual([[{ value: { filing_folder: 'Signed', sms_enabled: false } }]]);
+    expect(methodArgs(update, 'update')).toEqual([[{ value: { filing_folder: 'Signed/Agreements', sms_enabled: false } }]]);
     expect(methodArgs(update, 'eq')).toEqual([['key', 'esign']]);
-    expect(methodArgs(insert, 'insert')).toEqual([[{ key: 'esign', value: { filing_folder: 'Signed', sms_enabled: false } }]]);
+    expect(methodArgs(insert, 'insert')).toEqual([[{ key: 'esign', value: { filing_folder: 'Signed/Agreements', sms_enabled: false } }]]);
   });
 });

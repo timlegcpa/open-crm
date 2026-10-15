@@ -2,8 +2,9 @@ import { NO_VALUE_TEXT } from '@/lib/format';
 import type { EventType } from '../contract';
 
 /**
- * What each envelope event is called in the owner's event log. The audit PDF the server
- * renders labels the same events; the two lists must agree (eventLabels.test.ts).
+ * What each envelope event is called in the owner's event log: the same words the audit
+ * PDF prints (EVENT_LABELS in supabase/functions/esign-finalize-envelope/lib/events.ts;
+ * parity.test.ts holds the two equal).
  */
 export const EVENT_LABELS: Record<EventType, string> = {
   envelope_created: 'Envelope created',
@@ -15,8 +16,8 @@ export const EVENT_LABELS: Record<EventType, string> = {
   invite_resent: 'Invite resent',
   email_delivered: 'Email delivered',
   email_opened: 'Email opened',
-  signer_opened_link: 'Opened the signing link',
-  signer_viewed_pdf: 'Viewed the document',
+  signer_opened_link: 'Opened sign link',
+  signer_viewed_pdf: 'Viewed PDF',
   consent_accepted: 'Consent accepted',
   signer_signed: 'Signed',
   signer_declined: 'Declined',
@@ -29,6 +30,14 @@ export const EVENT_LABELS: Record<EventType, string> = {
 export function eventLabel(type: string): string {
   return (EVENT_LABELS as Record<string, string>)[type] ?? type;
 }
+
+/** The `kind` tag each e-sign email carries, as the event log names it. */
+const EMAIL_KINDS: Record<string, string> = {
+  esign_invite: 'Invitation',
+  esign_completed: 'Signed copy',
+  esign_voided: 'Cancellation notice',
+  esign_declined: 'Decline notice',
+};
 
 const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -64,8 +73,13 @@ export function summarizeEvent(type: string, metadata: Record<string, unknown> |
     }
     case 'email_delivered':
     case 'email_opened': {
-      const subject = str(meta.subject);
-      return subject || NO_VALUE_TEXT;
+      // The webhook writes { resend_email_id, kind }: kind is the email's tag.
+      return EMAIL_KINDS[str(meta.kind)] ?? NO_VALUE_TEXT;
+    }
+    case 'envelope_expired': {
+      // The expiry run writes { signers_expired, tasks_dismissed }.
+      const count = num(meta.signers_expired);
+      return count !== null ? `${count} signer link${count === 1 ? '' : 's'} expired` : NO_VALUE_TEXT;
     }
     case 'signer_signed': {
       // sign writes { font_key, timezone, consent_version }: the zone is a tamper signal and

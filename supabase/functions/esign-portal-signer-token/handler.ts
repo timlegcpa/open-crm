@@ -25,7 +25,7 @@ export interface PortalSignerTokenRequest {
 
 export type PortalSignerTokenResponse = { state: 'ok'; token: string } | { state: TerminalState; envelope: { title: string } };
 
-export const PORTAL_SIGNER_TOKEN_ERRORS = ['not_found', 'wrong_addressee', 'rate_limited', 'read_only'] as const;
+export const PORTAL_SIGNER_TOKEN_ERRORS = ['not_found', 'wrong_addressee', 'rate_limited', 'impersonation_read_only'] as const;
 
 export interface PortalSignerTokenDeps {
   allowedOrigins: string[];

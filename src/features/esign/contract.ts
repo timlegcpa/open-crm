@@ -1,22 +1,75 @@
 /**
  * THE e-signature contract between this feature's screens and its edge functions and
- * tables. Every request body, every answer and every row shape the browser relies on is
+ * tables. Every request body, every answer and every error code the browser relies on is
  * declared here and nowhere else; the api modules (`api.ts` for the owner and the portal,
  * `public/signer/signerApi.ts` for the signer's public pages) send and parse only these.
  *
- * Supabase-free on purpose: the public signer pages import it.
+ * The server is the source of the function shapes: the request and answer types below are
+ * IMPORTED from each function's handler.ts (type-only imports, erased at build, so no
+ * server code reaches a bundle). The zod schemas parse an answer at runtime and are typed
+ * against those imports, so a server change the page would misread fails typecheck.
+ * Error codes come the same way: `EsignErrorCode` is the union of every function's
+ * exported *_ERRORS list and the shared handler's refusals, and `hasErrorCode` takes only
+ * a member of it. contract.test.ts reads the lists at runtime, checks every code the
+ * screens name, and checks that every function the screens call exists.
  *
- * Error codes (`EdgeError.code`) the screens branch on:
- *   requires_force            delete-envelope: the envelope is completed; send `force: true`
- *   ambiguous_email           manage-signers: more than one contact uses this address
- *   signer_exists             manage-signers: that address is already on the envelope
- *   send_validation           send-envelope: the envelope is not ready (the message says why)
- *   sms_unavailable           create/send/request-sms: SMS verification is off or not set up
- *   impersonation_read_only   portal-signer-token: the session is View as client
- *   unsupported_characters    signer-sign: the typed signature uses a character the fonts lack
- *   session_required          signer-*: a high-verification step needs a fresh SMS session (401)
+ * Supabase-free on purpose: the public signer pages import it.
  */
 import { z } from 'zod';
+import { isEdgeError } from '@/lib/edgeCore';
+import type { REFUSALS } from '../../../supabase/functions/_shared/handler';
+import type { CREATE_ENVELOPE_ERRORS, CreateEnvelopeRequest, CreateEnvelopeResponse } from '../../../supabase/functions/esign-create-envelope/handler';
+import type { DELETE_ENVELOPE_ERRORS, DeleteEnvelopeRequest, DeleteEnvelopeResponse } from '../../../supabase/functions/esign-delete-envelope/handler';
+import type { DOWNLOAD_AUDIT_ERRORS, DownloadAuditRequest } from '../../../supabase/functions/esign-download-audit/handler';
+import type { EventType } from '../../../supabase/functions/esign-finalize-envelope/lib/events';
+import type { TerminalState } from '../../../supabase/functions/esign-finalize-envelope/lib/signer-flow';
+import type {
+  FieldInput as ServerFieldInput,
+  MANAGE_FIELDS_ERRORS,
+  ManageFieldsRequest,
+  ManageFieldsResponse,
+} from '../../../supabase/functions/esign-manage-fields/handler';
+import type { MANAGE_SIGNERS_ERRORS, ManageSignersRequest } from '../../../supabase/functions/esign-manage-signers/handler';
+import type { MANAGE_TEMPLATES_ERRORS, ManageTemplatesRequest, ManageTemplatesResponse } from '../../../supabase/functions/esign-manage-templates/handler';
+import type {
+  PORTAL_SIGNER_TOKEN_ERRORS,
+  PortalSignerTokenRequest,
+  PortalSignerTokenResponse,
+} from '../../../supabase/functions/esign-portal-signer-token/handler';
+import type { REORDER_PAGES_ERRORS, ReorderPagesRequest, ReorderPagesResponse } from '../../../supabase/functions/esign-reorder-pages/handler';
+import type { RESEND_INVITE_ERRORS, ResendInviteRequest, ResendInviteResponse } from '../../../supabase/functions/esign-resend-invite/handler';
+import type { RESOLVE_TOKEN_ERRORS, ResolveTokenRequest, ResolveTokenResponse } from '../../../supabase/functions/esign-resolve-token/handler';
+import type {
+  SEND_ENVELOPE_ERRORS,
+  SendEnvelopeRequest,
+  SendEnvelopeResponse,
+  SendValidationError,
+} from '../../../supabase/functions/esign-send-envelope/handler';
+import type { SIGNER_DECLINE_ERRORS, SignerDeclineRequest, SignerDeclineResponse } from '../../../supabase/functions/esign-signer-decline/handler';
+import type {
+  SIGNER_REQUEST_SMS_ERRORS,
+  SignerRequestSmsRequest,
+  SignerRequestSmsResponse,
+} from '../../../supabase/functions/esign-signer-request-sms/handler';
+import type { SIGNER_SIGN_ERRORS, SignerSignRequest, SignerSignResponse } from '../../../supabase/functions/esign-signer-sign/handler';
+import type {
+  SIGNER_VERIFY_SMS_ERRORS,
+  SignerVerifySmsRequest,
+  SignerVerifySmsResponse,
+} from '../../../supabase/functions/esign-signer-verify-sms/handler';
+import type { SIGNER_VIEW_PDF_ERRORS, SignerViewPdfRequest } from '../../../supabase/functions/esign-signer-view-pdf/handler';
+import type { UPLOAD_DOCUMENT_ERRORS, UploadDocumentResponse } from '../../../supabase/functions/esign-upload-document/handler';
+import type { VERIFY_DOCUMENT_ERRORS, VerifyDocumentRequest, VerifyDocumentResponse } from '../../../supabase/functions/esign-verify-document/handler';
+import type { VOID_ENVELOPE_ERRORS, VoidEnvelopeRequest, VoidEnvelopeResponse } from '../../../supabase/functions/esign-void-envelope/handler';
+
+/** A zod schema whose parsed value is exactly the server's type. */
+type Answer<T> = z.ZodType<T, z.ZodTypeDef, unknown>;
+
+/** Compile time: the list names every member of the union (and, typed U[], nothing else). */
+type Covers<L extends readonly string[], U extends string> = [Exclude<U, L[number]>] extends [never] ? L : never;
+function allOf<U extends string>() {
+  return <const L extends readonly U[]>(list: Covers<L, U>): L => list;
+}
 
 // ── Enumerations (each mirrors a CHECK in 0006_esign.sql) ─────────────────────
 
@@ -42,7 +95,8 @@ export const TEMPLATE_ROLES = ['primary', 'co_signer'] as const;
 export const TEMPLATE_SCOPES = ['primary_only', 'with_co_signer'] as const;
 export type TemplateScope = (typeof TEMPLATE_SCOPES)[number];
 
-export const EVENT_TYPES = [
+/** The server's event types (lib/events.ts), every one of them: the compiler checks the list. */
+export const EVENT_TYPES = allOf<EventType>()([
   'envelope_created',
   'envelope_sent',
   'envelope_voided',
@@ -61,8 +115,8 @@ export const EVENT_TYPES = [
   'rate_limit_hit',
   'consent_accepted',
   'signer_declined',
-] as const;
-export type EventType = (typeof EVENT_TYPES)[number];
+]);
+export type { EventType };
 
 /** What is still WAITING on an envelope (the contact tab's badge counts these, never a total). */
 export const PENDING_ENVELOPE_STATUSES: readonly EnvelopeStatus[] = ['draft', 'sent', 'partially_signed'];
@@ -106,6 +160,8 @@ export const REASON_MAX = 500;
 /** Upload cap for one source PDF (the server's MAX_UPLOAD_BYTES). */
 export const MAX_PDF_BYTES = 25 * 1024 * 1024;
 export const MAX_PDF_PAGES = 200;
+/** upload-document refuses a file name longer than this. */
+export const FILE_NAME_MAX = 200;
 /** A signer phone, as manage-signers accepts it: E.164 only. */
 export const E164 = /^\+[1-9]\d{7,14}$/;
 
@@ -239,7 +295,10 @@ export interface TemplateRow {
 
 export const TEMPLATE_COLUMNS = 'id, name, description, page_count, created_at';
 
-/** app_settings key 'esign'. Absent keys read as the defaults. */
+/**
+ * app_settings key 'esign', as the server's lib/settings.ts reads it. Absent keys read as
+ * the defaults; a filing folder the server would refuse files to the default instead.
+ */
 export interface EsignSettings {
   filing_folder: string;
   sms_enabled: boolean;
@@ -247,82 +306,103 @@ export interface EsignSettings {
 
 export const ESIGN_SETTINGS_KEY = 'esign';
 export const DEFAULT_ESIGN_SETTINGS: EsignSettings = { filing_folder: 'Signed documents', sms_enabled: true };
-export const FILING_FOLDER_MAX = 100;
+/** The whole folder path's length cap (the server's folder_path limit, less its two slashes). */
+export const FILING_FOLDER_MAX = 198;
 
-// ── Owner function requests ───────────────────────────────────────────────────
+// ── Function requests (the server's types) ────────────────────────────────────
 
-export interface CreateEnvelopeRequest {
-  title: string;
-  verification_level: VerificationLevel;
-  primary_contact_id: string | null;
-}
+export type { CreateEnvelopeRequest, DeleteEnvelopeRequest, DownloadAuditRequest, ResendInviteRequest, SendEnvelopeRequest, VoidEnvelopeRequest };
+export type { ManageFieldsRequest, ManageSignersRequest, ManageTemplatesRequest, PortalSignerTokenRequest, ReorderPagesRequest };
+export type { ResolveTokenRequest, SignerDeclineRequest, SignerRequestSmsRequest, SignerSignRequest, SignerVerifySmsRequest, SignerViewPdfRequest };
+export type { VerifyDocumentRequest };
 
 /** manage-signers `signer` body. `signer_id` on update and remove; phone in E.164. */
-export interface SignerInput {
-  signer_id?: string;
-  contact_id?: string;
-  email: string;
-  first_name?: string;
-  last_name?: string;
-  phone?: string;
-  role?: SignerRole;
-  order: number;
-}
-
-export interface FieldInput {
-  signer_id: string;
-  page_index: number;
-  field_type: FieldType;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-export interface ReorderOp {
-  page_id: string;
-  order?: number;
-  deleted?: boolean;
-}
+export type SignerInput = ManageSignersRequest['signer'];
+export type FieldInput = ServerFieldInput;
+export type ReorderOp = Extract<ReorderPagesRequest, { operations: unknown }>['operations'][number];
 
 // ── Owner function answers ────────────────────────────────────────────────────
 
-export const createEnvelopeAnswer = z.object({ id: z.string() }).passthrough();
-export const uploadDocumentAnswer = z
-  .object({
-    document: z.object({ id: z.string(), page_count: z.number() }).passthrough(),
-    pages: z.array(z.object({ id: z.string() }).passthrough()),
-  })
-  .passthrough();
-export const okAnswer = z.object({}).passthrough();
-export const manageSignerAnswer = z.object({ signer_id: z.string(), contact_id: z.string().nullish() }).passthrough();
-export const setFieldsAnswer = z.object({ count: z.number(), inserted_ids: z.array(z.string()) }).passthrough();
-export const saveTemplateAnswer = z.object({ template_id: z.string(), field_count: z.number() }).passthrough();
-export const applyTemplateAnswer = z
-  .object({
-    inserted_count: z.number(),
-    skipped_count: z.number(),
-    template_page_count: z.number(),
-    envelope_page_count: z.number(),
-  })
-  .passthrough();
-/** `failed_emails`: invites the provider refused; those signers hold live links and need Resend invite. */
-export const sendEnvelopeAnswer = z
-  .object({ signers_invited: z.number(), failed_emails: z.array(z.string()).default([]) })
-  .passthrough();
-export const voidEnvelopeAnswer = z.object({ signers_voided: z.number(), tasks_dismissed: z.number() }).passthrough();
+export const createEnvelopeAnswer: Answer<CreateEnvelopeResponse> = z.object({
+  id: z.string(),
+  title: z.string(),
+  verification_level: z.enum(VERIFICATION_LEVELS),
+  status: z.literal('draft'),
+  created_at: z.string(),
+});
+
+export const uploadDocumentAnswer: Answer<UploadDocumentResponse> = z.object({
+  document: z.object({ id: z.string(), file_name: z.string(), page_count: z.number(), order: z.number() }),
+  pages: z.array(z.object({ id: z.string(), order: z.number(), source_page_index: z.number() })),
+});
+
+export const reorderPagesAnswer: Answer<ReorderPagesResponse> = z.object({ ok: z.literal(true) });
+
+/** manage-signers answers per action: add links a contact, update names the signer, remove says only success. */
+export const addSignerAnswer = z.object({ success: z.literal(true), signer_id: z.string(), contact_id: z.string() });
+export const updateSignerAnswer = z.object({ success: z.literal(true), signer_id: z.string() });
+export const removeSignerAnswer = z.object({ success: z.literal(true) });
+
+export const setFieldsAnswer: Answer<Extract<ManageFieldsResponse, { count: number }>> = z.object({
+  success: z.literal(true),
+  count: z.number(),
+  inserted_ids: z.array(z.string()),
+});
+
+export const saveTemplateAnswer: Answer<Extract<ManageTemplatesResponse, { template_id: string }>> = z.object({
+  success: z.literal(true),
+  template_id: z.string(),
+  field_count: z.number(),
+});
+
+export const applyTemplateAnswer: Answer<Extract<ManageTemplatesResponse, { inserted_count: number }>> = z.object({
+  success: z.literal(true),
+  inserted_count: z.number(),
+  skipped_count: z.number(),
+  template_page_count: z.number(),
+  envelope_page_count: z.number(),
+});
+
+/** `failed_emails`: invites that did not go out; those signers need Resend invite. */
+export const sendEnvelopeAnswer: Answer<SendEnvelopeResponse> = z.object({
+  ok: z.literal(true),
+  envelope_id: z.string(),
+  signers_invited: z.number(),
+  failed_emails: z.array(z.string()),
+});
+
+/** send-envelope's 400 when the draft is not ready: every problem, in words for the owner. */
+export const sendValidationError: Answer<SendValidationError> = z.object({
+  error: z.string(),
+  code: z.literal('validation_failed'),
+  validation: z.array(z.string()),
+});
+
+export const resendInviteAnswer: Answer<ResendInviteResponse> = z.object({ ok: z.literal(true) });
+
+export const voidEnvelopeAnswer: Answer<VoidEnvelopeResponse> = z.object({
+  ok: z.literal(true),
+  signers_voided: z.number(),
+  tasks_dismissed: z.number(),
+});
+
+export const deleteEnvelopeAnswer: Answer<DeleteEnvelopeResponse> = z.object({
+  ok: z.literal(true),
+  envelope_id: z.string(),
+  working_objects_removed: z.number(),
+});
 
 // ── Portal function ───────────────────────────────────────────────────────────
 
 /** The states a signing link (or the portal exchange) can end in before the flow starts. */
-export const TERMINAL_STATES = ['expired', 'voided', 'declined', 'co_signer_declined', 'already_signed'] as const;
-export type TerminalState = (typeof TERMINAL_STATES)[number];
+export const TERMINAL_STATES = allOf<TerminalState>()(['expired', 'voided', 'declined', 'co_signer_declined', 'already_signed']);
+export type { TerminalState };
 
-export const portalSignerTokenAnswer = z.union([
+export const portalSignerTokenAnswer: Answer<PortalSignerTokenResponse> = z.union([
   z.object({ state: z.literal('ok'), token: z.string().min(1) }),
-  z.object({ state: z.enum(TERMINAL_STATES) }),
+  z.object({ state: z.enum(TERMINAL_STATES), envelope: z.object({ title: z.string() }) }),
 ]);
-export type PortalSignerTokenAnswer = z.infer<typeof portalSignerTokenAnswer>;
+export type PortalSignerTokenAnswer = PortalSignerTokenResponse;
 
 // ── Public (signer) functions ─────────────────────────────────────────────────
 
@@ -330,40 +410,13 @@ const signerField = z.object({
   id: z.string(),
   page_index: z.number().int().min(0),
   field_type: z.enum(FIELD_TYPES),
-  x: z.coerce.number(),
-  y: z.coerce.number(),
-  width: z.coerce.number(),
-  height: z.coerce.number(),
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
 });
 
-/**
- * What the consent copy needs about the sender. Optional: until resolve-token returns it,
- * the page falls back to the public display name and leaves out every line that needs a
- * contact address (never the owner's private login address).
- */
-const orgIdentity = z
-  .object({
-    display_name: z.string().nullish(),
-    legal_name: z.string().nullish(),
-    contact_email: z.string().nullish(),
-    // The port map spells these in camelCase; either spelling is read, snake_case first.
-    displayName: z.string().nullish(),
-    legalName: z.string().nullish(),
-    contactEmail: z.string().nullish(),
-  })
-  .nullish()
-  .transform((o) =>
-    o
-      ? {
-          display_name: o.display_name ?? o.displayName ?? null,
-          legal_name: o.legal_name ?? o.legalName ?? null,
-          contact_email: o.contact_email ?? o.contactEmail ?? null,
-        }
-      : null,
-  );
-export type OrgIdentity = z.output<typeof orgIdentity>;
-
-export const resolvedSigner = z.object({
+const resolvedSignerSchema = z.object({
   state: z.literal('ok'),
   envelope: z.object({
     id: z.string(),
@@ -383,57 +436,97 @@ export const resolvedSigner = z.object({
   document: z.object({ page_count: z.number().int().min(0) }),
   fields: z.array(signerField),
   needs_sms: z.boolean(),
-  org: orgIdentity,
 });
-export type ResolvedSigner = z.infer<typeof resolvedSigner>;
 
-export const resolveTerminal = z.object({
-  state: z.enum(TERMINAL_STATES),
-  envelope: z.object({ title: z.string() }).partial().nullish(),
-  signer: z.object({ first_name: z.string().nullable(), last_name: z.string().nullable(), email: z.string() }).partial().nullish(),
-  org: orgIdentity,
-});
-export type ResolveTerminal = z.infer<typeof resolveTerminal>;
-
-export const resolveTokenAnswer = z.union([resolvedSigner, resolveTerminal]);
-export type ResolveTokenAnswer = z.infer<typeof resolveTokenAnswer>;
-
-export const requestSmsAnswer = z.object({ last_four: z.string().nullish() }).passthrough();
-
-export const verifySmsAnswer = z.union([
-  z.object({ ok: z.literal(true), session_token: z.string().min(1) }),
-  z.object({ ok: z.literal(false), attempts_left: z.number().int().min(0).nullish(), locked: z.boolean().nullish() }),
+/**
+ * resolve-token's answer. It carries no organization: the page reads the org's names and
+ * its contact address from get_org_branding() (usePublicBranding).
+ */
+export const resolveTokenAnswer: Answer<ResolveTokenResponse> = z.union([
+  resolvedSignerSchema,
+  z.object({
+    state: z.enum(TERMINAL_STATES),
+    envelope: z.object({ title: z.string() }),
+    signer: z.object({ first_name: z.string().nullable(), last_name: z.string().nullable(), email: z.string() }),
+  }),
 ]);
-export type VerifySmsAnswer = z.infer<typeof verifySmsAnswer>;
+export type ResolveTokenAnswer = ResolveTokenResponse;
+export type ResolvedSigner = Extract<ResolveTokenResponse, { state: 'ok' }>;
+export type ResolveTerminal = Exclude<ResolveTokenResponse, { state: 'ok' }>;
+
+export const requestSmsAnswer: Answer<SignerRequestSmsResponse> = z.object({ ok: z.literal(true), last_four: z.string() });
+
+/** `state` says why a code did not open a session: wrong (invalid), locked, expired, or none waiting. */
+export const verifySmsAnswer: Answer<SignerVerifySmsResponse> = z.union([
+  z.object({ ok: z.literal(true), session_token: z.string().min(1) }),
+  z.object({
+    ok: z.literal(false),
+    state: z.enum(['invalid', 'locked', 'expired', 'none']),
+    attempts_left: z.number().int().min(0),
+  }),
+]);
+export type VerifySmsAnswer = SignerVerifySmsResponse;
+
+export const signAnswer: Answer<SignerSignResponse> = z.union([
+  z.object({ ok: z.literal(true), already_signed: z.literal(true), finalized: z.literal(false) }),
+  z.object({ ok: z.literal(true), finalized: z.boolean() }),
+]);
+
+export const declineAnswer: Answer<SignerDeclineResponse> = z.union([
+  z.object({ ok: z.literal(true), already_declined: z.literal(true) }),
+  z.object({ ok: z.literal(true) }),
+]);
 
 /** What the signer adopted. A drawn signature has no text and no font. */
 export type AdoptedSignature =
   | { kind: 'typed'; signature_text: string; font_key: string }
   | { kind: 'drawn'; image_base64: string };
 
-export interface SignRequest {
-  token: string;
-  kind: 'typed' | 'drawn';
-  signature_text?: string;
-  font_key?: string;
-  signature_image?: string;
-  timezone: string;
-  consent: true;
-  consent_version: string;
-  session_token?: string;
-}
+export type SignRequest = SignerSignRequest;
 
-export const verifyDocumentAnswer = z.union([
+export const verifyDocumentAnswer: Answer<VerifyDocumentResponse> = z.union([
   z.object({
     verified: z.literal(true),
     title: z.string(),
     completed_at: z.string().nullable(),
     sha256: z.string(),
-    signers: z.array(z.object({ name: z.string(), status: z.string(), signed_at: z.string().nullable() })).default([]),
+    signers: z.array(z.object({ name: z.string(), status: z.string(), signed_at: z.string().nullable() })),
   }),
-  z.object({ verified: z.literal(false), reason: z.string().nullish(), sha256: z.string().nullish() }),
+  z.object({ verified: z.literal(false), reason: z.string(), sha256: z.string() }),
 ]);
-export type VerifyDocumentAnswer = z.infer<typeof verifyDocumentAnswer>;
+export type VerifyDocumentAnswer = VerifyDocumentResponse;
+
+// ── Error codes ───────────────────────────────────────────────────────────────
+
+type Codes<L extends readonly string[]> = L[number];
+
+/** Every machine code an e-sign function can answer with, plus the shared refusals. */
+export type EsignErrorCode =
+  | (typeof REFUSALS)[keyof typeof REFUSALS]['code']
+  | Codes<typeof CREATE_ENVELOPE_ERRORS>
+  | Codes<typeof UPLOAD_DOCUMENT_ERRORS>
+  | Codes<typeof MANAGE_SIGNERS_ERRORS>
+  | Codes<typeof MANAGE_FIELDS_ERRORS>
+  | Codes<typeof MANAGE_TEMPLATES_ERRORS>
+  | Codes<typeof REORDER_PAGES_ERRORS>
+  | Codes<typeof SEND_ENVELOPE_ERRORS>
+  | Codes<typeof RESEND_INVITE_ERRORS>
+  | Codes<typeof VOID_ENVELOPE_ERRORS>
+  | Codes<typeof DELETE_ENVELOPE_ERRORS>
+  | Codes<typeof DOWNLOAD_AUDIT_ERRORS>
+  | Codes<typeof PORTAL_SIGNER_TOKEN_ERRORS>
+  | Codes<typeof RESOLVE_TOKEN_ERRORS>
+  | Codes<typeof SIGNER_VIEW_PDF_ERRORS>
+  | Codes<typeof SIGNER_SIGN_ERRORS>
+  | Codes<typeof SIGNER_DECLINE_ERRORS>
+  | Codes<typeof SIGNER_REQUEST_SMS_ERRORS>
+  | Codes<typeof SIGNER_VERIFY_SMS_ERRORS>
+  | Codes<typeof VERIFY_DOCUMENT_ERRORS>;
+
+/** True when `err` is an edge error carrying this code. Only a code some function answers compiles. */
+export function hasErrorCode(err: unknown, code: EsignErrorCode): boolean {
+  return isEdgeError(err) && err.code === code;
+}
 
 /** The edge functions the browser calls, by name (finalize, expire and the webhook are server-only). */
 export const FN = {

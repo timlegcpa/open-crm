@@ -5,10 +5,9 @@ import { Loader2 } from 'lucide-react';
 import { isUuid } from '@/api/contacts';
 import { links } from '@/features/links';
 import { useAuth } from '@/lib/auth';
-import { isEdgeError } from '@/lib/edge';
 import { formatDate } from '@/lib/format';
 import { exchangePortalSignerToken, listMySignatureTasks, type SignatureTask } from './api';
-import type { TerminalState } from './contract';
+import { hasErrorCode, type TerminalState } from './contract';
 import { esignKeys } from './keys';
 import { SignerCompleteState, SignerErrorState, StateCard } from './public/signer/SignerStates';
 
@@ -93,8 +92,8 @@ function PortalExchange({ signerId }: { signerId: string }) {
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        if (isEdgeError(err) && err.code === 'impersonation_read_only') setExchange({ state: 'viewing_as_client' });
-        else if (isEdgeError(err) && (err.status === 403 || err.status === 404)) setExchange({ state: 'wrong_email' });
+        if (hasErrorCode(err, 'impersonation_read_only')) setExchange({ state: 'viewing_as_client' });
+        else if (hasErrorCode(err, 'wrong_addressee')) setExchange({ state: 'wrong_email' });
         else setExchange({ state: 'error' });
       });
     return () => {

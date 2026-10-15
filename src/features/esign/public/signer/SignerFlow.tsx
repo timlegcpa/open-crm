@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import { usePublicBranding } from '@/hooks/usePublicBranding';
 import { isEdgeError } from '@/lib/publicEdge';
-import type { OrgIdentity, ResolvedSigner } from '../../contract';
+import type { ResolvedSigner } from '../../contract';
 import { DeclineDialog } from './DeclineDialog';
 import { decline, resolveToken, SESSION_EXPIRED } from './signerApi';
 import { SignerCompleteState, SignerErrorState, senderName, type ErrorKind } from './SignerStates';
@@ -37,7 +37,6 @@ export function SignerFlow({ initialToken }: { initialToken?: string }) {
   const branding = usePublicBranding();
   const [phase, setPhase] = useState<Phase>(token ? { name: 'loading' } : { name: 'error', kind: 'incomplete' });
   const [resolved, setResolved] = useState<ResolvedSigner | null>(null);
-  const [org, setOrg] = useState<OrgIdentity | null>(null);
   const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [declineOpen, setDeclineOpen] = useState(false);
   const [declining, setDeclining] = useState(false);
@@ -49,7 +48,6 @@ export function SignerFlow({ initialToken }: { initialToken?: string }) {
     resolveToken(token)
       .then((answer) => {
         if (cancelled) return;
-        setOrg(answer.org ?? null);
         if (answer.state === 'ok') {
           setResolved(answer);
           setPhase({ name: 'landing' });
@@ -57,7 +55,7 @@ export function SignerFlow({ initialToken }: { initialToken?: string }) {
         }
         clearSigningToken();
         if (answer.state === 'already_signed') {
-          setPhase({ name: 'complete', alreadySigned: true, title: answer.envelope?.title ?? null });
+          setPhase({ name: 'complete', alreadySigned: true, title: answer.envelope.title });
         } else {
           setPhase({ name: 'error', kind: answer.state });
         }
@@ -73,8 +71,8 @@ export function SignerFlow({ initialToken }: { initialToken?: string }) {
     };
   }, [token]);
 
-  const sender = senderName(org, branding.displayName);
-  const contactEmail = org?.contact_email?.trim() || null;
+  const sender = senderName(branding);
+  const contactEmail = branding.contactEmail?.trim() || null;
 
   const confirmDecline = async (reason: string) => {
     if (!token) return;
@@ -134,7 +132,7 @@ export function SignerFlow({ initialToken }: { initialToken?: string }) {
       />
     );
   } else if (phase.name === 'consent') {
-    body = <ConsentStep org={org} sender={sender} declining={declining} onAgree={() => setPhase({ name: 'review' })} onDecline={openDecline} />;
+    body = <ConsentStep branding={branding} sender={sender} declining={declining} onAgree={() => setPhase({ name: 'review' })} onDecline={openDecline} />;
   } else {
     body = (
       <Suspense fallback={<Spinner label="Loading the document" />}>

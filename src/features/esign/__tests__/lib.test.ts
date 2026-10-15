@@ -156,10 +156,12 @@ describe('small rules', () => {
     expect(esignSafeFilename('x'.repeat(300))).toHaveLength(200);
   });
 
-  it('filing folder names: no slash, no control characters, bounded', () => {
+  it('filing folder: a name or a path of up to five names, no backslash, control or invisible character, bounded', () => {
     expect(filingFolderProblem('Signed documents')).toBeNull();
+    expect(filingFolderProblem('Signed/Agreements')).toBeNull();
     expect(filingFolderProblem('  ')).not.toBeNull();
-    expect(filingFolderProblem('a/b')).not.toBeNull();
+    expect(filingFolderProblem('a/b/c/d/e/f')).not.toBeNull();
+    expect(filingFolderProblem('a​b')).not.toBeNull();
     expect(filingFolderProblem('a\\b')).not.toBeNull();
     expect(filingFolderProblem('a\u0007b')).not.toBeNull();
     expect(filingFolderProblem('x'.repeat(101))).not.toBeNull();

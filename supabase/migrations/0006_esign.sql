@@ -44,10 +44,12 @@
 -- The e-signature model, and the rules this file adds:
 --   * An envelope moves draft -> sent -> partially_signed -> completed, or ends voided,
 --     expired or declined. Everything after draft happens in the e-sign edge functions,
---     as the server. The owner's session READS the e-sign tables and writes exactly two
---     things directly: a draft envelope's document row (delete) and a template's
---     deleted_at (soft delete). So a stolen owner session cannot forge an executed
---     envelope by writing rows: signing, completing and filing are server work.
+--     as the server. The owner's session READS the e-sign tables and writes exactly one
+--     thing directly: a template's deleted_at (soft delete). Even a draft's documents
+--     leave through the server (esign-reorder-pages, esign_delete_draft_document), which
+--     remaps the fields in the same transaction. So a stolen owner session cannot forge
+--     an executed envelope by writing rows: signing, completing and filing are server
+--     work.
 --   * No client session reads an e-sign table. A signer reaches the flow through a link
 --     (a token whose SHA-256 is stored, never the token) or, signed in to the portal,
 --     through esign-portal-signer-token, which trades the session for a fresh link. So no
@@ -559,6 +561,56 @@ BEGIN
 END;
 $$;
 
+-- A source document taken out of a draft, in one transaction under the envelope's row
+-- lock: the field remap the function computed for the pages that remain (fields sit on a
+-- page by POSITION, so every later field moves up by the document's live page count and
+-- the fields on its pages go), then the document row, whose pages cascade. Returns the
+-- working object's path, which the function removes after the commit (storage is not in
+-- this transaction). Draft only.
+--   p_field_updates  [{ "id", "page_index" }]
+--   p_field_deletes  field ids
+CREATE FUNCTION public.esign_delete_draft_document(
+  p_envelope_id uuid,
+  p_document_id uuid,
+  p_field_updates jsonb,
+  p_field_deletes uuid[]
+)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_status text;
+  v_path text;
+BEGIN
+  IF jsonb_typeof(p_field_updates) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'field updates must be an array' USING ERRCODE = '22023';
+  END IF;
+  SELECT e.status INTO v_status FROM public.esign_envelopes e WHERE e.id = p_envelope_id FOR UPDATE;
+  IF v_status IS NULL THEN
+    RAISE EXCEPTION 'envelope not found' USING ERRCODE = 'P0002';
+  END IF;
+  IF v_status <> 'draft' THEN
+    RAISE EXCEPTION 'envelope is not a draft' USING ERRCODE = '55000';
+  END IF;
+
+  DELETE FROM public.esign_envelope_fields f
+   WHERE f.envelope_id = p_envelope_id AND f.id = ANY (COALESCE(p_field_deletes, '{}'::uuid[]));
+  UPDATE public.esign_envelope_fields f
+     SET page_index = (u ->> 'page_index')::integer
+    FROM jsonb_array_elements(p_field_updates) u
+   WHERE f.id = (u ->> 'id')::uuid AND f.envelope_id = p_envelope_id;
+
+  DELETE FROM public.esign_envelope_documents d
+   WHERE d.id = p_document_id AND d.envelope_id = p_envelope_id
+  RETURNING d.storage_path INTO v_path;
+  IF v_path IS NULL THEN
+    RAISE EXCEPTION 'document not in this envelope' USING ERRCODE = 'P0002';
+  END IF;
+  RETURN v_path;
+END;
+$$;
+
 -- The one way a signer becomes signed. The envelope row is locked first, so a void,
 -- decline or expiry racing this either lands first (and the claim refuses) or waits.
 -- Only an invited or viewed signer on a sent or partially signed envelope is claimed;
@@ -830,13 +882,6 @@ CREATE POLICY esign_envelopes_owner_select ON public.esign_envelopes
   FOR SELECT TO authenticated USING ((SELECT public.is_owner()));
 CREATE POLICY esign_envelope_documents_owner_select ON public.esign_envelope_documents
   FOR SELECT TO authenticated USING ((SELECT public.is_owner()));
--- A document leaves a DRAFT envelope only: once sent, the assembled PDF and its digest
--- stand for exactly these documents.
-CREATE POLICY esign_envelope_documents_owner_delete_draft ON public.esign_envelope_documents
-  FOR DELETE TO authenticated
-  USING ((SELECT public.is_owner())
-         AND EXISTS (SELECT 1 FROM public.esign_envelopes e
-                      WHERE e.id = esign_envelope_documents.envelope_id AND e.status = 'draft'));
 CREATE POLICY esign_envelope_pages_owner_select ON public.esign_envelope_pages
   FOR SELECT TO authenticated USING ((SELECT public.is_owner()));
 CREATE POLICY esign_envelope_signers_owner_select ON public.esign_envelope_signers
@@ -863,23 +908,17 @@ CREATE POLICY esign_completed_tombstones_owner_select ON public.esign_completed_
 -- Storage: the private working bucket
 -- ---------------------------------------------------------------------------
 
--- Source PDFs ({envelope}/sources/{document}.pdf), the assembled PDF sent for signing
--- ({envelope}/source.pdf) and the executed PDF ({envelope}/signed.pdf). Written by the
--- e-sign functions as the server; the owner's browser reads them through short signed
--- URLs (the field placer and the page thumbnails).
+-- Source PDFs ({envelope}/sources/{document}.pdf) and the assembled PDF sent for signing
+-- ({envelope}/source.pdf). The executed PDF is not here: finalize files it in the
+-- documents bucket. Written and removed by the e-sign functions as the server; the
+-- owner's browser reads them through short signed URLs (the field placer and the page
+-- thumbnails).
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 VALUES ('esign-working', 'esign-working', false, 26214400, ARRAY['application/pdf']);
 
 CREATE POLICY esign_working_owner_select ON storage.objects
   FOR SELECT TO authenticated
   USING (bucket_id = 'esign-working' AND (SELECT public.is_owner()));
--- Only inside a draft envelope's folder; nothing of a sent envelope can be removed.
-CREATE POLICY esign_working_owner_delete_draft ON storage.objects
-  FOR DELETE TO authenticated
-  USING (bucket_id = 'esign-working'
-         AND (SELECT public.is_owner())
-         AND EXISTS (SELECT 1 FROM public.esign_envelopes e
-                      WHERE e.id::text = (storage.foldername(name))[1] AND e.status = 'draft'));
 
 -- ---------------------------------------------------------------------------
 -- Privileges
@@ -904,7 +943,6 @@ GRANT SELECT ON
   public.esign_envelope_fields, public.esign_envelope_events, public.esign_templates,
   public.esign_template_fields, public.esign_completed_tombstones
   TO authenticated;
-GRANT DELETE ON public.esign_envelope_documents TO authenticated;
 GRANT UPDATE (deleted_at) ON public.esign_templates TO authenticated;
 -- Every signer column but the link token's hash and expiry and the encrypted phone.
 GRANT SELECT (
@@ -919,6 +957,7 @@ REVOKE ALL ON FUNCTION
   public.esign_insert_document_with_pages(uuid, uuid, text, text, bigint, integer),
   public.esign_set_signer_fields(uuid, uuid, jsonb),
   public.esign_apply_page_reorder(uuid, jsonb, jsonb, uuid[]),
+  public.esign_delete_draft_document(uuid, uuid, jsonb, uuid[]),
   public.esign_claim_signer_signature(uuid, text, text, text, text, timestamptz, inet, text, text, text, text),
   public.esign_check_sms_code(uuid, text, integer, text, inet, integer),
   public.esign_delete_signature_images_for_envelope(uuid),
@@ -930,6 +969,7 @@ GRANT EXECUTE ON FUNCTION
   public.esign_insert_document_with_pages(uuid, uuid, text, text, bigint, integer),
   public.esign_set_signer_fields(uuid, uuid, jsonb),
   public.esign_apply_page_reorder(uuid, jsonb, jsonb, uuid[]),
+  public.esign_delete_draft_document(uuid, uuid, jsonb, uuid[]),
   public.esign_claim_signer_signature(uuid, text, text, text, text, timestamptz, inet, text, text, text, text),
   public.esign_check_sms_code(uuid, text, integer, text, inet, integer),
   public.esign_delete_signature_images_for_envelope(uuid),

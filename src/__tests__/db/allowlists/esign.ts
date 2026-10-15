@@ -9,6 +9,7 @@ export const allowlist: DomainAllowlist = {
     'esign_insert_document_with_pages(uuid,uuid,text,text,bigint,integer)',
     'esign_set_signer_fields(uuid,uuid,jsonb)',
     'esign_apply_page_reorder(uuid,jsonb,jsonb,uuid[])',
+    'esign_delete_draft_document(uuid,uuid,jsonb,uuid[])',
     'esign_claim_signer_signature(uuid,text,text,text,text,timestamp with time zone,inet,text,text,text,text)',
     'esign_check_sms_code(uuid,text,integer,text,inet,integer)',
     'esign_delete_signature_images_for_envelope(uuid)',

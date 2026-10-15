@@ -165,7 +165,6 @@ describe('who reads what', () => {
     for (const t of OWNER_READ) {
       expect(await asMfaOwner(`SELECT count(${key(t)})::int AS n FROM public.${t}`), t).toEqual([{ n: 0 }]);
     }
-    expect(await asMfaOwner(`DELETE FROM public.esign_envelope_documents WHERE id = '${D_DRAFT}' RETURNING id`)).toEqual([]);
   });
 
   it('View as client reads what the client reads: nothing', async () => {
@@ -235,13 +234,12 @@ describe('who writes what', () => {
     await expectDenied(as(db, owner, `UPDATE public.esign_envelopes SET status = 'completed'`));
   });
 
-  it('no signed-in session deletes, except the owner removing a draft envelope’s document', async () => {
-    for (const t of ALL.filter((x) => x !== 'esign_envelope_documents')) {
+  it('no signed-in session deletes, not even the owner removing a draft envelope’s document (that is server work)', async () => {
+    for (const t of ALL) {
       for (const who of [owner, clientA]) await expectDenied(as(db, who, `DELETE FROM public.${t}`));
     }
-    expect(await as(db, owner, `DELETE FROM public.esign_envelope_documents WHERE id = '${D_DRAFT}' RETURNING id`)).toEqual([{ id: D_DRAFT }]);
-    expect(await as(db, owner, `DELETE FROM public.esign_envelope_documents WHERE id = '${D_SENT}' RETURNING id`)).toEqual([]);
-    expect(await as(db, clientA, `DELETE FROM public.esign_envelope_documents RETURNING id`)).toEqual([]);
+    await expectDenied(as(db, owner, `DELETE FROM public.esign_envelope_documents WHERE id = '${D_DRAFT}'`));
+    expect(await as<{ n: number }>(db, service, `SELECT count(*)::int AS n FROM public.esign_envelope_documents WHERE id = '${D_DRAFT}'`)).toEqual([{ n: 1 }]);
   });
 
   it('the server writes every table', async () => {
@@ -265,11 +263,11 @@ describe('the working bucket', () => {
     expect(await objects(anon)).toEqual([]);
   });
 
-  it('the owner deletes only inside a draft envelope’s folder; nobody signed in writes', async () => {
-    expect(await as(db, owner, `DELETE FROM storage.objects WHERE bucket_id = 'esign-working' AND name LIKE '${E_SENT}/%' RETURNING id`)).toEqual([]);
-    expect(await as(db, owner, `DELETE FROM storage.objects WHERE bucket_id = 'esign-working' AND name LIKE '${E_DRAFT}/%' RETURNING name`))
-      .toEqual([{ name: `${E_DRAFT}/sources/${D_DRAFT}.pdf` }]);
-    expect(await as(db, clientA, `DELETE FROM storage.objects WHERE bucket_id = 'esign-working' RETURNING id`)).toEqual([]);
+  it('nobody signed in writes or removes an object, the owner included, even in a draft’s folder', async () => {
+    for (const who of [owner, clientA]) {
+      expect(await as(db, who, `DELETE FROM storage.objects WHERE bucket_id = 'esign-working' RETURNING id`)).toEqual([]);
+    }
+    expect((await objects(owner)).map((o) => o.name)).toContain(`${E_DRAFT}/sources/${D_DRAFT}.pdf`);
     for (const who of [owner, clientA]) {
       await expectDenied(as(db, who, `INSERT INTO storage.objects (bucket_id, name) VALUES ('esign-working', '${E_DRAFT}/x.pdf')`));
       expect(await as(db, who, `UPDATE storage.objects SET name = 'moved' WHERE bucket_id = 'esign-working' RETURNING id`)).toEqual([]);
@@ -411,6 +409,30 @@ describe('esign_apply_page_reorder', () => {
   });
 });
 
+describe('esign_delete_draft_document', () => {
+  it('applies the field remap and deletes the document with its pages; returns the object path', async () => {
+    const out = await session(db, service, async (tx) => {
+      const field = (await tx.query<{ id: string }>(`SELECT id FROM public.esign_envelope_fields WHERE signer_id = $1`, [S_DRAFT])).rows[0];
+      const r = (await tx.query<{ r: string }>(`SELECT public.esign_delete_draft_document($1, $2, '[]'::jsonb, $3::uuid[]) AS r`,
+        [E_DRAFT, D_DRAFT, [field.id]])).rows[0].r;
+      const left = (await tx.query(`SELECT 1 FROM public.esign_envelope_pages WHERE source_document_id = $1
+                                    UNION ALL SELECT 1 FROM public.esign_envelope_documents WHERE id = $1
+                                    UNION ALL SELECT 1 FROM public.esign_envelope_fields WHERE id = $2`, [D_DRAFT, field.id])).rows;
+      return { r, left };
+    });
+    expect(out).toEqual({ r: `${E_DRAFT}/sources/${D_DRAFT}.pdf`, left: [] });
+  });
+
+  it('refuses a sent envelope, and a document of another envelope', async () => {
+    expect(await errorOf(db, service, `SELECT public.esign_delete_draft_document($1, $2, '[]'::jsonb, '{}'::uuid[])`, [E_SENT, D_SENT]))
+      .toMatch(/not a draft/);
+    expect(await errorOf(db, service, `SELECT public.esign_delete_draft_document($1, $2, '[]'::jsonb, '{}'::uuid[])`, [E_DRAFT, D_SENT]))
+      .toMatch(/not in this envelope/);
+    expect(await as(db, service, `SELECT id FROM public.esign_envelope_documents WHERE id IN ('${D_DRAFT}', '${D_SENT}') ORDER BY id`))
+      .toEqual([{ id: D_DRAFT }, { id: D_SENT }]);
+  });
+});
+
 describe('esign_claim_signer_signature', () => {
   const claim = (signer: string, kind = 'typed', image: string | null = null) =>
     `SELECT public.esign_claim_signer_signature('${signer}', '${kind}', 'Ada Lovelace', 'allison', ${image === null ? 'NULL' : `'${image}'`},
@@ -540,6 +562,7 @@ describe('who may execute the e-sign functions', () => {
     'esign_insert_document_with_pages(uuid,uuid,text,text,bigint,integer)',
     'esign_set_signer_fields(uuid,uuid,jsonb)',
     'esign_apply_page_reorder(uuid,jsonb,jsonb,uuid[])',
+    'esign_delete_draft_document(uuid,uuid,jsonb,uuid[])',
     'esign_claim_signer_signature(uuid,text,text,text,text,timestamptz,inet,text,text,text,text)',
     'esign_check_sms_code(uuid,text,integer,text,inet,integer)',
     'esign_delete_signature_images_for_envelope(uuid)',

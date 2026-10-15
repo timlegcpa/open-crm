@@ -9,5 +9,6 @@ Deno.serve(
     allowedOrigins: rt.config.allowedOrigins,
     authorizeOwner: rt.authorizeOwner,
     db: rt.db,
+    storage: rt.storage,
   }),
 );

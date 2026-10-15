@@ -1,10 +1,10 @@
 import type { ReactNode } from 'react';
 import { AlertTriangle, CheckCircle2 } from 'lucide-react';
-import type { OrgIdentity } from '../../contract';
+import type { PublicBranding } from '@/lib/publicEdge';
 
 /** Who sent the request, as the signer pages name them: the org's name, else "the sender". */
-export function senderName(org: OrgIdentity | null | undefined, fallback: string | null): string {
-  return org?.display_name?.trim() || org?.legal_name?.trim() || fallback?.trim() || 'the sender';
+export function senderName(branding: Pick<PublicBranding, 'displayName' | 'legalName'>): string {
+  return branding.displayName?.trim() || branding.legalName?.trim() || 'the sender';
 }
 
 /** A centred message card: every end state of a signing link uses it. */

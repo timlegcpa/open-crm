@@ -13,10 +13,11 @@
  * token hash and the phone ciphertext, and a `*` would fail.
  */
 import { getSupabase } from '@/lib/supabase';
-import { invokeEdge, isEdgeError } from '@/lib/edge';
+import { invokeEdge, toEdgeError } from '@/lib/edge';
+import { EdgeError, edgeErrorFromBody, parseAnswer } from '@/lib/edgeCore';
 import { fetchAllPaged, PAGE_SIZE, type PageResult } from '@/lib/pagedFetch';
 import { downloadBlob } from '@/lib/download';
-import { fetchDocument, getDocument } from '@/features/documents/api';
+import { downloadDocument, fetchDocument, getDocument } from '@/features/documents/api';
 import { refOf } from '@/features/documents/types';
 import {
   DEFAULT_ESIGN_SETTINGS,
@@ -25,20 +26,27 @@ import {
   ESIGN_SETTINGS_KEY,
   EVENT_COLUMNS,
   FIELD_COLUMNS,
+  FILE_NAME_MAX,
   FN,
   PAGE_COLUMNS,
   PENDING_ENVELOPE_STATUSES,
   SIGNER_COLUMNS,
   SIGNER_CONTACT_COLUMNS,
   TEMPLATE_COLUMNS,
+  addSignerAnswer,
   applyTemplateAnswer,
   createEnvelopeAnswer,
-  manageSignerAnswer,
-  okAnswer,
+  deleteEnvelopeAnswer,
+  hasErrorCode,
   portalSignerTokenAnswer,
+  removeSignerAnswer,
+  reorderPagesAnswer,
+  resendInviteAnswer,
   saveTemplateAnswer,
   sendEnvelopeAnswer,
+  sendValidationError,
   setFieldsAnswer,
+  updateSignerAnswer,
   uploadDocumentAnswer,
   voidEnvelopeAnswer,
   type CreateEnvelopeRequest,
@@ -57,6 +65,7 @@ import {
   type TemplateRow,
   type TemplateScope,
 } from './contract';
+import { normalizeFilingFolder, parseFilingFolder } from './lib/filingFolder';
 import { esignSafeFilename } from './lib/safeFilename';
 
 // ---------------------------------------------------------------------------
@@ -239,8 +248,23 @@ export function uploadDocument(envelopeId: string, file: File) {
   const form = new FormData();
   form.append('file', file);
   form.append('envelope_id', envelopeId);
-  form.append('file_name', file.name);
+  form.append('file_name', fitFileName(file.name));
   return invokeEdge(FN.uploadDocument, form, { parse: (d) => uploadDocumentAnswer.parse(d) });
+}
+
+/**
+ * A file name upload-document accepts: control characters out (as its stripControl does),
+ * at most FILE_NAME_MAX characters, the extension kept when it has to be shortened. A
+ * stored document's name may be up to 255 characters, so one sent from the documents
+ * viewer can need this.
+ */
+export function fitFileName(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const clean = name.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim() || 'document.pdf';
+  if (clean.length <= FILE_NAME_MAX) return clean;
+  const dot = clean.lastIndexOf('.');
+  const ext = dot > 0 && clean.length - dot <= 10 ? clean.slice(dot) : '';
+  return clean.slice(0, FILE_NAME_MAX - ext.length).trimEnd() + ext;
 }
 
 /**
@@ -262,36 +286,36 @@ export async function importStoredDocument(envelopeId: string, documentId: strin
     if (!res.ok) throw new Error('The document could not be read. Try again.');
     blob = await res.blob();
   }
-  await uploadDocument(envelopeId, new File([blob], doc.original_filename, { type: 'application/pdf' }));
+  // upload-document checks the part's type, the %PDF bytes and a name of at most 200 characters.
+  await uploadDocument(envelopeId, new File([blob], fitFileName(doc.original_filename), { type: 'application/pdf' }));
 }
 
 /** Reorder or delete pages. The server remaps every field's page index in the same call. */
 export function reorderPages(envelopeId: string, operations: ReorderOp[]) {
-  return invokeEdge(FN.reorderPages, { envelope_id: envelopeId, operations }, { parse: (d) => okAnswer.parse(d) });
+  return invokeEdge(FN.reorderPages, { envelope_id: envelopeId, operations }, { parse: (d) => reorderPagesAnswer.parse(d) });
 }
 
 /**
- * Delete a draft envelope's document. Fields point at pages by POSITION, so a bare row
- * delete would cascade the pages away and leave every later field one document's worth of
- * pages off: its pages are retired through the reorder (which remaps the fields and drops
- * the ones on these pages) first. The working object stays: the browser never removes a
- * storage object (clientDocumentsStorageDeleteGuard.test.ts), and the server's purge of
- * the envelope's working files clears it.
+ * Delete a draft envelope's document. The server does all of it in one call: retires the
+ * document's pages (fields point at pages by POSITION, so every later field moves up and
+ * the ones on its pages go), deletes the row, and removes the working object. The browser
+ * never removes a storage object itself (clientDocumentsStorageDeleteGuard.test.ts).
  */
 export async function deleteEnvelopeDocument(envelopeId: string, doc: Pick<DocumentRow, 'id'>): Promise<void> {
-  const pages = await getPages(envelopeId);
-  const ops = pages.filter((p) => p.source_document_id === doc.id && !p.deleted).map((p) => ({ page_id: p.id, deleted: true }));
-  if (ops.length > 0) await reorderPages(envelopeId, ops);
-  const { data, error } = await getSupabase().from('esign_envelope_documents').delete().eq('id', doc.id).select('id');
-  if (error) throw error;
-  // Zero rows: RLS refused (the envelope is no longer a draft) or the row is gone.
-  if (!data || data.length === 0) throw new Error('The document was not removed. The envelope may already have been sent.');
+  await invokeEdge(
+    FN.reorderPages,
+    { action: 'delete_document', envelope_id: envelopeId, document_id: doc.id },
+    { parse: (d) => reorderPagesAnswer.parse(d) },
+  );
 }
 
 export type ManageSignerAction = 'add' | 'update' | 'remove';
 
+/** Each action answers its own shape: add links a contact, update names the signer, remove says only success. */
+const SIGNER_ANSWERS = { add: addSignerAnswer, update: updateSignerAnswer, remove: removeSignerAnswer } as const;
+
 export function manageSigner(envelopeId: string, action: ManageSignerAction, signer: SignerInput) {
-  return invokeEdge(FN.manageSigners, { envelope_id: envelopeId, action, signer: { ...signer } }, { parse: (d) => manageSignerAnswer.parse(d) });
+  return invokeEdge(FN.manageSigners, { envelope_id: envelopeId, action, signer: { ...signer } }, { parse: (d) => SIGNER_ANSWERS[action].parse(d) });
 }
 
 /** Replace ONE signer's fields. Every save rotates the ids; `inserted_ids` come back in input order. */
@@ -303,9 +327,45 @@ export function setSignerFields(envelopeId: string, signerId: string, fields: Fi
   );
 }
 
-/** Send: the server re-checks everything, assembles the PDF and emails each signer a link. */
-export function sendEnvelope(envelopeId: string) {
-  return invokeEdge(FN.sendEnvelope, { envelope_id: envelopeId }, { parse: (d) => sendEnvelopeAnswer.parse(d) });
+/**
+ * send-envelope's refusal when the draft is not ready: an EdgeError (code
+ * `validation_failed`) that also carries every problem the server found, for the page to list.
+ */
+export class SendNotReadyError extends EdgeError {
+  readonly problems: string[];
+  constructor(base: EdgeError, problems: string[]) {
+    super(base.kind, { status: base.status, code: base.code, message: base.message });
+    this.problems = problems;
+  }
+}
+
+/**
+ * Send: the server re-checks everything, assembles the PDF and emails each signer a link.
+ * Called through functions.invoke directly (not invokeEdge) so the 400's `validation` list,
+ * which an EdgeError does not keep, can be read from the response first.
+ */
+export async function sendEnvelope(envelopeId: string) {
+  let result: { data: unknown; error: unknown };
+  try {
+    result = await getSupabase().functions.invoke(FN.sendEnvelope, { body: { envelope_id: envelopeId }, method: 'POST' });
+  } catch (err) {
+    throw await toEdgeError(err);
+  }
+  if (result.error) {
+    const context = (result.error as { context?: unknown }).context as { status?: unknown; clone?: unknown } | undefined;
+    if (context && context.status === 400 && typeof context.clone === 'function') {
+      let body: unknown = null;
+      try {
+        body = JSON.parse(await (context.clone as () => { text(): Promise<string> })().text());
+      } catch {
+        body = null;
+      }
+      const notReady = sendValidationError.safeParse(body);
+      if (notReady.success) throw new SendNotReadyError(edgeErrorFromBody(400, body), notReady.data.validation);
+    }
+    throw await toEdgeError(result.error);
+  }
+  return parseAnswer(result.data, (d) => sendEnvelopeAnswer.parse(d));
 }
 
 export function voidEnvelope(envelopeId: string, reason: string | undefined) {
@@ -317,7 +377,7 @@ export function voidEnvelope(envelopeId: string, reason: string | undefined) {
 }
 
 export function resendInvite(envelopeId: string, signerId: string) {
-  return invokeEdge(FN.resendInvite, { envelope_id: envelopeId, signer_id: signerId }, { parse: (d) => okAnswer.parse(d) });
+  return invokeEdge(FN.resendInvite, { envelope_id: envelopeId, signer_id: signerId }, { parse: (d) => resendInviteAnswer.parse(d) });
 }
 
 /**
@@ -326,11 +386,11 @@ export function resendInvite(envelopeId: string, signerId: string) {
  * Without `force` it answers 409 `requires_force` and removes nothing.
  */
 export function deleteEnvelope(envelopeId: string, force: boolean) {
-  return invokeEdge(FN.deleteEnvelope, { envelope_id: envelopeId, force }, { parse: (d) => okAnswer.parse(d) });
+  return invokeEdge(FN.deleteEnvelope, { envelope_id: envelopeId, force }, { parse: (d) => deleteEnvelopeAnswer.parse(d) });
 }
 
 export function isRequiresForce(err: unknown): boolean {
-  return isEdgeError(err) && err.code === 'requires_force';
+  return hasErrorCode(err, 'requires_force');
 }
 
 /** The audit trail as a PDF, rendered on demand. */
@@ -341,21 +401,25 @@ export async function downloadAudit(envelope: Pick<EnvelopeRow, 'id' | 'title'>)
 }
 
 /**
- * The executed PDF, from the documents bucket where finalize filed it (stored plaintext, so
- * a short signed link serves it). Fetched to a Blob: `download` is ignored on a
- * cross-origin link, which would open a tab under a random name instead.
+ * The executed PDF, exactly where finalize put it: one object in the documents store, filed
+ * as a documents row (carrying esign_envelope_id) for each signer's contact. Any of those
+ * rows opens the same object, so the first is read through the documents feature, which
+ * logs the download and serves the plaintext copy by a short signed link.
  */
-export async function downloadSignedCopy(envelope: Pick<EnvelopeRow, 'title' | 'signed_pdf_path'>): Promise<void> {
+export async function downloadSignedCopy(envelope: Pick<EnvelopeRow, 'id' | 'signed_pdf_path'>): Promise<void> {
   if (!envelope.signed_pdf_path) throw new Error('This envelope has no signed copy yet.');
-  const storage = getSupabase().storage;
-  // Filed in the documents bucket (as the pin did); the working bucket is the fallback,
-  // because the schema's comments also place an `{envelope}/signed.pdf` there.
-  let signed = await storage.from('client-documents').createSignedUrl(envelope.signed_pdf_path, 60);
-  if (signed.error || !signed.data?.signedUrl) signed = await storage.from('esign-working').createSignedUrl(envelope.signed_pdf_path, 60);
-  if (signed.error || !signed.data?.signedUrl) throw new Error('The signed copy could not be opened. Try again.');
-  const res = await fetch(signed.data.signedUrl);
-  if (!res.ok) throw new Error('The download failed. Try again.');
-  downloadBlob(new Blob([await res.arrayBuffer()], { type: 'application/pdf' }), `${esignSafeFilename(envelope.title)}_signed.pdf`);
+  const { data, error } = await getSupabase()
+    .from('client_documents')
+    .select('id, original_filename, mime_type')
+    .eq('esign_envelope_id', envelope.id)
+    .order('created_at', { ascending: true })
+    .order('id', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  const filed = data as { id: string; original_filename: string; mime_type: string } | null;
+  if (!filed) throw new Error('The signed copy is not filed in any contact’s documents yet. Try again in a minute.');
+  await downloadDocument(refOf(filed));
 }
 
 /**
@@ -443,18 +507,18 @@ export async function getEsignSettings(): Promise<EsignSettings> {
   const { data, error } = await getSupabase().from('app_settings').select('value').eq('key', ESIGN_SETTINGS_KEY).maybeSingle();
   if (error) throw error;
   const value = (data as { value?: Record<string, unknown> } | null)?.value ?? {};
+  // Read exactly as the server reads it (lib/settings.ts): a folder it would refuse is the
+  // default there, so it shows as the default here; only an explicit false turns SMS off.
+  const folder = typeof value.filing_folder === 'string' ? parseFilingFolder(value.filing_folder) : null;
   return {
-    filing_folder:
-      typeof value.filing_folder === 'string' && value.filing_folder.trim() !== ''
-        ? value.filing_folder
-        : DEFAULT_ESIGN_SETTINGS.filing_folder,
-    sms_enabled: typeof value.sms_enabled === 'boolean' ? value.sms_enabled : DEFAULT_ESIGN_SETTINGS.sms_enabled,
+    filing_folder: folder ? folder.join('/') : DEFAULT_ESIGN_SETTINGS.filing_folder,
+    sms_enabled: value.sms_enabled !== false,
   };
 }
 
 export async function saveEsignSettings(next: EsignSettings): Promise<void> {
   const supabase = getSupabase();
-  const value = { filing_folder: next.filing_folder.trim(), sms_enabled: next.sms_enabled };
+  const value = { filing_folder: normalizeFilingFolder(next.filing_folder), sms_enabled: next.sms_enabled };
   const { data, error } = await supabase.from('app_settings').update({ value }).eq('key', ESIGN_SETTINGS_KEY).select('key');
   if (error) throw error;
   if (data && data.length > 0) return;

@@ -4,8 +4,8 @@ import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { InputOTP, InputOTPGroup, InputOTPSlot } from '@/components/ui/input-otp';
 import { Label } from '@/components/ui/label';
-import { isEdgeError } from '@/lib/publicEdge';
-import type { OrgIdentity, ResolvedSigner } from '../../contract';
+import { isEdgeError, type PublicBranding } from '@/lib/publicEdge';
+import { hasErrorCode, type ResolvedSigner } from '../../contract';
 import { requestSmsCode, verifySmsCode } from './signerApi';
 
 const CARD = 'mx-auto mt-6 w-full max-w-lg rounded-lg border border-border bg-card p-6 sm:p-8';
@@ -94,14 +94,28 @@ export function SmsStep({
     try {
       const four = await requestSmsCode(token);
       if (four) setLastFour(four);
+      // A new code supersedes a locked one on the server: start counting afresh.
+      failures.current = 0;
+      setCode('');
       setPhase('verify');
       startCooldown();
     } catch (err) {
-      setError(
-        isEdgeError(err) && err.kind === 'rate_limited'
-          ? 'Too many codes were asked for. Wait a while and try again.'
-          : 'A code could not be sent right now. Wait a minute and try again.',
-      );
+      // The per-signer caps, a missing phone and a text provider that is not set up each
+      // answer with a sentence written for the signer: show it as sent.
+      if (
+        hasErrorCode(err, 'too_many_codes') ||
+        hasErrorCode(err, 'code_limit_reached') ||
+        hasErrorCode(err, 'no_phone') ||
+        hasErrorCode(err, 'sms_unavailable')
+      ) {
+        setError((err as Error).message);
+      } else {
+        setError(
+          isEdgeError(err) && err.kind === 'rate_limited'
+            ? 'Too many codes were asked for. Wait a while and try again.'
+            : 'A code could not be sent right now. Wait a minute and try again.',
+        );
+      }
     } finally {
       setBusy(null);
     }
@@ -117,17 +131,32 @@ export function SmsStep({
         onVerified(answer.session_token);
         return;
       }
-      if (answer.locked) {
-        setPhase('locked');
-        return;
+      switch (answer.state) {
+        case 'locked':
+          setPhase('locked');
+          return;
+        case 'expired':
+          setCode('');
+          setError('That code has expired. Send a new code.');
+          return;
+        case 'none':
+          setCode('');
+          setError('No code is waiting for this document. Send a new code.');
+          return;
+        default:
+          failed(`That code is not right. ${answer.attempts_left} attempt${answer.attempts_left === 1 ? '' : 's'} left.`);
       }
-      failed(
-        typeof answer.attempts_left === 'number'
-          ? `That code is not right. ${answer.attempts_left} attempt${answer.attempts_left === 1 ? '' : 's'} left.`
-          : 'That code is not right, or it has expired.',
-      );
-    } catch {
-      failed('The code could not be checked. Try again.');
+    } catch (err) {
+      // Neither is a wrong guess: the code was malformed, or the network address a verified
+      // session is pinned to could not be read.
+      if (hasErrorCode(err, 'invalid_code')) {
+        setCode('');
+        setError('Enter the six-digit code.');
+      } else if (hasErrorCode(err, 'no_address')) {
+        setError((err as Error).message);
+      } else {
+        failed('The code could not be checked. Try again.');
+      }
     } finally {
       setBusy(null);
     }
@@ -138,7 +167,7 @@ export function SmsStep({
       <section className={CARD} role="alert">
         <h2 className="text-lg font-semibold">Too many attempts</h2>
         <p className="mt-2 text-sm text-muted-foreground">
-          For your security, this code can no longer be tried. Ask for a new code later, or reply to the email you received.
+          For your security, this code can no longer be tried. Send a new code to try again, or reply to the email you received.
           {contactEmail ? (
             <>
               {' '}
@@ -150,6 +179,13 @@ export function SmsStep({
             </>
           ) : null}
         </p>
+        {error && (
+          <p className="mt-4 rounded-md border border-destructive bg-destructive-light px-3 py-2 text-sm text-destructive-dark">{error}</p>
+        )}
+        <Button className="mt-6 w-full" size="lg" onClick={() => void request()} disabled={cooldown > 0 || busy !== null}>
+          {busy === 'request' ? <Loader2 className="animate-spin" aria-hidden="true" /> : <MessageSquare aria-hidden="true" />}
+          {busy === 'request' ? 'Sending...' : cooldown > 0 ? `Send a new code in ${cooldown}s` : 'Send a new code'}
+        </Button>
       </section>
     );
   }
@@ -242,26 +278,26 @@ export function SmsStep({
 }
 
 /**
- * The electronic-records disclosure. The sender's legal name and contact address are
- * filled in when the server supplies them; with no contact address the opt-out line points
- * to the invitation email instead (never an address the page guessed).
+ * The electronic-records disclosure. The sender's legal name and contact address come from
+ * the organization's public identity (get_org_branding); with no contact address the
+ * opt-out line points to the invitation email instead (never an address the page guessed).
  */
 export function ConsentStep({
-  org,
+  branding,
   sender,
   declining,
   onAgree,
   onDecline,
 }: {
-  org: OrgIdentity | null;
+  branding: Pick<PublicBranding, 'legalName' | 'contactEmail'>;
   sender: string;
   declining: boolean;
   onAgree: () => void;
   onDecline: () => void;
 }) {
   const [agreed, setAgreed] = useState(false);
-  const party = org?.legal_name?.trim() || sender;
-  const contactEmail = org?.contact_email?.trim() || null;
+  const party = branding.legalName?.trim() || sender;
+  const contactEmail = branding.contactEmail?.trim() || null;
   return (
     <section className={CARD} aria-labelledby="esign-consent-title">
       <h2 id="esign-consent-title" className="text-center text-lg font-semibold">

@@ -53,7 +53,7 @@ import { SignatureModal } from '../public/signer/SignatureModal';
 describe('SignatureModal', () => {
   it('refuses a typed name the fonts cannot draw, and offers drawing instead', () => {
     const onApply = vi.fn();
-    render(<SignatureModal defaultName="Łukasz Ada" initial={null} onApply={onApply} onClose={() => undefined} />);
+    render(<SignatureModal defaultName="李 Ada" initial={null} onApply={onApply} onClose={() => undefined} />);
     expect(screen.getByRole('button', { name: 'Apply' })).toBeDisabled();
     expect(screen.getByRole('alert')).toHaveTextContent(/cannot be drawn in these fonts/);
     fireEvent.click(screen.getByRole('button', { name: 'Draw instead' }));

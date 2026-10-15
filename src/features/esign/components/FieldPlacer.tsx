@@ -147,7 +147,6 @@ export function FieldPlacer({ envelopeId }: { envelopeId: string }) {
       const revisionAtStart = revisionRef.current[signerId] ?? 0;
       const list = fieldsRef.current[signerId] ?? [];
       const inputs: FieldInput[] = list.map((f) => ({
-        signer_id: signerId,
         page_index: f.pageIndex,
         field_type: f.fieldType,
         x: f.pdf.x,

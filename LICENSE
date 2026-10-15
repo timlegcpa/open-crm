@@ -20,7 +20,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Third-party fonts in supabase/functions/_shared/esign-fonts/fonts/ are not
-covered by this license. Each font ships beside its own license file: five are
-under the SIL Open Font License 1.1 and Homemade Apple is under the Apache
-License 2.0.
+Third-party fonts are not covered by this license: the six signature fonts in
+supabase/functions/_shared/esign-fonts/fonts/ (TTF, stamped into signed PDFs by
+the server) and in src/features/esign/fonts/ (WOFF2, shown in the browser).
+Each font ships beside its own license file in both places: Allison, Dancing
+Script, Great Vibes, Pacifico and Sacramento are under the SIL Open Font
+License 1.1, and Homemade Apple is under the Apache License 2.0.

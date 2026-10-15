@@ -55,10 +55,16 @@ describe('PortalSignPage', () => {
     expect(await screen.findByText('Signing is off while viewing as client')).toBeInTheDocument();
   });
 
-  it('any other refusal means the request is someone else’s', async () => {
-    state.exchange.mockRejectedValue(new EdgeError('forbidden', { status: 403 }));
+  it('a request addressed to another login says so (wrong_addressee)', async () => {
+    state.exchange.mockRejectedValue(new EdgeError('forbidden', { status: 403, code: 'wrong_addressee' }));
     renderAt(`/portal/sign?signer=${SIGNER}`);
     expect(await screen.findByText('This request is for someone else')).toBeInTheDocument();
+  });
+
+  it('any other refusal (an unknown or spent request) cannot be opened', async () => {
+    state.exchange.mockRejectedValue(new EdgeError('not_found', { status: 404, code: 'not_found' }));
+    renderAt(`/portal/sign?signer=${SIGNER}`);
+    expect(await screen.findByText('This request could not be opened')).toBeInTheDocument();
   });
 
   it('a fresh token opens the signer flow, never stored', async () => {
@@ -70,7 +76,7 @@ describe('PortalSignPage', () => {
   });
 
   it('end states have their own screens', async () => {
-    state.exchange.mockResolvedValue({ state: 'expired' });
+    state.exchange.mockResolvedValue({ state: 'expired', envelope: { title: 'Acme plan' } });
     renderAt(`/portal/sign?signer=${SIGNER}`);
     expect(await screen.findByText('This signing link has expired')).toBeInTheDocument();
   });

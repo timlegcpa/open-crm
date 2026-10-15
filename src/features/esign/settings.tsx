@@ -11,7 +11,7 @@ import { Switch } from '@/components/ui/switch';
 import { getErrorMessage } from '@/lib/errors';
 import { getEsignSettings, saveEsignSettings } from './api';
 import { FILING_FOLDER_MAX, type EsignSettings as Settings } from './contract';
-import { filingFolderProblem } from './lib/filingFolder';
+import { filingFolderProblem, normalizeFilingFolder } from './lib/filingFolder';
 import { esignKeys } from './keys';
 
 /** Settings > E-sign: where signed copies are filed, and whether High verification can text a code. */
@@ -37,12 +37,12 @@ export function EsignSettings() {
   });
 
   const problem = filingFolderProblem(folder);
-  const changed = !!settings.data && (folder.trim() !== settings.data.filing_folder || sms !== settings.data.sms_enabled);
+  const changed = !!settings.data && (normalizeFilingFolder(folder) !== settings.data.filing_folder || sms !== settings.data.sms_enabled);
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
     if (problem || !changed) return;
-    save.mutate({ filing_folder: folder.trim(), sms_enabled: sms });
+    save.mutate({ filing_folder: normalizeFilingFolder(folder), sms_enabled: sms });
   };
 
   return (
@@ -66,7 +66,7 @@ export function EsignSettings() {
               aria-describedby="esign-filing-folder-hint"
             />
             <p id="esign-filing-folder-hint" className={problem ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}>
-              {problem ?? 'Each signed copy is filed in this folder of the contact’s documents.'}
+              {problem ?? 'Each signed copy is filed in this folder of the contact’s documents. Use / for a folder inside another, for example Signed/Agreements.'}
             </p>
           </div>
           <div className="flex items-start justify-between gap-4">

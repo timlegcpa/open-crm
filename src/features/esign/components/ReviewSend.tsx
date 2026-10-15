@@ -16,10 +16,9 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { toast } from '@/components/ui/sonner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { isEdgeError } from '@/lib/edge';
 import { getErrorMessage } from '@/lib/errors';
-import { getFields, getPages, getSigners, sendEnvelope, type EnvelopeWithContact } from '../api';
-import { SIGNER_ROLE_LABELS } from '../contract';
+import { getFields, getPages, getSigners, sendEnvelope, SendNotReadyError, type EnvelopeWithContact } from '../api';
+import { hasErrorCode, SIGNER_ROLE_LABELS } from '../contract';
 import { esignKeys } from '../keys';
 import { readiness, sendProblems } from '../lib/sendReadiness';
 import { resolveSignerName } from '../lib/signerName';
@@ -28,6 +27,8 @@ import { resolveSignerName } from '../lib/signerName';
 export function ReviewSend({ envelope }: { envelope: EnvelopeWithContact }) {
   const queryClient = useQueryClient();
   const [confirmOpen, setConfirmOpen] = useState(false);
+  // What the server refused the last send for (send-envelope's validation list).
+  const [serverProblems, setServerProblems] = useState<string[]>([]);
   const pages = useQuery({ queryKey: esignKeys.pages(envelope.id), queryFn: () => getPages(envelope.id) });
   const signersQuery = useQuery({ queryKey: esignKeys.signers(envelope.id), queryFn: () => getSigners(envelope.id) });
   const fieldsQuery = useQuery({ queryKey: esignKeys.fields(envelope.id), queryFn: () => getFields(envelope.id) });
@@ -53,7 +54,10 @@ export function ReviewSend({ envelope }: { envelope: EnvelopeWithContact }) {
   }, [fields]);
 
   const send = useMutation({
-    mutationFn: () => sendEnvelope(envelope.id),
+    mutationFn: () => {
+      setServerProblems([]);
+      return sendEnvelope(envelope.id);
+    },
     onSuccess: (data) => {
       if (data.failed_emails.length > 0) {
         toast.error(`Sent, but some invitations did not go out. Use Resend invite for: ${data.failed_emails.join(', ')}.`);
@@ -66,13 +70,15 @@ export function ReviewSend({ envelope }: { envelope: EnvelopeWithContact }) {
     },
     onError: (err) => {
       setConfirmOpen(false);
-      if (isEdgeError(err) && err.code === 'send_validation') {
+      if (err instanceof SendNotReadyError) {
+        // Every problem the server found, listed under the summary.
+        setServerProblems(err.problems);
         toast.error(getErrorMessage(err, 'The envelope is not ready to send. Check the steps and try again.'));
-        // Something changed elsewhere: reread so the list below shows it.
+        // Something changed elsewhere: reread so the checklist shows it.
         void queryClient.invalidateQueries({ queryKey: esignKeys.envelope(envelope.id) });
         return;
       }
-      if (isEdgeError(err) && err.code === 'sms_unavailable') {
+      if (hasErrorCode(err, 'sms_unavailable')) {
         toast.error('Text messages are off, so a High verification envelope cannot be sent. Turn them on in settings, or use Standard.');
         return;
       }
@@ -138,6 +144,17 @@ export function ReviewSend({ envelope }: { envelope: EnvelopeWithContact }) {
               </TableBody>
             </Table>
           </ScrollArea>
+        </div>
+      )}
+
+      {serverProblems.length > 0 && (
+        <div role="alert" className="rounded-md border border-destructive bg-destructive-light p-4 text-sm text-destructive-dark">
+          <p className="mb-1 font-medium">The server did not send it:</p>
+          <ul className="list-disc space-y-1 pl-5">
+            {serverProblems.map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+          </ul>
         </div>
       )}
 

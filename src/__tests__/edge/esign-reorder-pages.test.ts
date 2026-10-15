@@ -1,17 +1,18 @@
 // @vitest-environment node
 // esign-reorder-pages against the real migrations, plus the pure remap it relies on:
-// every field follows its page, a deleted page takes its fields with it.
+// every field follows its page, a deleted page takes its fields with it, and a deleted
+// source document takes its pages, its fields and its working object.
 import { randomUUID } from 'node:crypto';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { remapFieldsForReorder } from '../../../supabase/functions/esign-finalize-envelope/lib/page-reorder';
 import { createReorderPagesHandler, type ReorderPagesDeps } from '../../../supabase/functions/esign-reorder-pages/handler';
 import { CREDENTIALS, describeEdgeContract, edgeRequest, fakeOwnerAuth } from './contract';
-import { addField, createWorld, ORIGINS, seedDraft, type World } from './esign-world';
+import { addField, createWorld, makePdf, ORIGINS, seedDraft, type World } from './esign-world';
 
 let w: World;
 
 function deps(over: Partial<ReorderPagesDeps> = {}): ReorderPagesDeps {
-  return { allowedOrigins: ORIGINS, authorizeOwner: fakeOwnerAuth(), db: w.db, logSink: w.logSink, ...over };
+  return { allowedOrigins: ORIGINS, authorizeOwner: fakeOwnerAuth(), db: w.db, storage: w.storage, logSink: w.logSink, ...over };
 }
 const reorder = (body: unknown) => createReorderPagesHandler(deps())(edgeRequest({ headers: CREDENTIALS.owner, body }));
 
@@ -96,5 +97,77 @@ describe('esign-reorder-pages', () => {
     await w.q(`UPDATE public.esign_envelopes SET status = 'sent', expires_at = now() + interval '1 day' WHERE id = $1`, [d.envelopeId]);
     const sent = await reorder({ envelope_id: d.envelopeId, operations: [{ page_id: d.pageIds[0], order: 9 }] });
     expect([sent.status, (await sent.json()).code]).toEqual([409, 'not_draft']);
+  });
+
+  describe('delete_document', () => {
+    /** A second source document of `pages` pages on an existing draft, stored like an upload. */
+    async function addDocument(envelopeId: string, pages: number) {
+      const documentId = randomUUID();
+      const path = `${envelopeId}/sources/${documentId}.pdf`;
+      const pdf = await makePdf(pages);
+      w.storage.working.set(path, pdf);
+      const [res] = await w.q<{ r: { pages: Array<{ id: string }> } }>(
+        `SELECT public.esign_insert_document_with_pages($1, $2, 'second.pdf', $3, $4, $5) AS r`,
+        [envelopeId, documentId, path, pdf.byteLength, pages],
+      );
+      return { documentId, path, pageIds: res.r.pages.map((p) => p.id) };
+    }
+    const del = (envelope_id: string, document_id: string) => reorder({ action: 'delete_document', envelope_id, document_id });
+
+    it('removes the document, its pages and their fields, moves later fields up, and removes the working object', async () => {
+      const d = await seedDraft(w, { pages: 2, signers: [{ email: 'a@example.com' }] });
+      const second = await addDocument(d.envelopeId, 2);
+      const third = await addDocument(d.envelopeId, 1);
+      const onFirst = await addField(w, d.envelopeId, d.signerIds[0], 1);
+      const onSecond = await addField(w, d.envelopeId, d.signerIds[0], 2);
+      const onThird = await addField(w, d.envelopeId, d.signerIds[0], 4);
+
+      const res = await del(d.envelopeId, second.documentId);
+      expect([res.status, await res.json()]).toEqual([200, { ok: true }]);
+      expect(await w.q(`SELECT 1 FROM public.esign_envelope_documents WHERE id = $1`, [second.documentId])).toEqual([]);
+      expect(await w.q(`SELECT 1 FROM public.esign_envelope_pages WHERE source_document_id = $1`, [second.documentId])).toEqual([]);
+      const fields = await w.q<{ id: string; page_index: number }>(
+        `SELECT id, page_index FROM public.esign_envelope_fields WHERE envelope_id = $1 ORDER BY page_index`, [d.envelopeId]);
+      expect(fields).toEqual([{ id: onFirst, page_index: 1 }, { id: onThird, page_index: 2 }]);
+      expect(fields.map((f) => f.id)).not.toContain(onSecond);
+      expect(w.storage.working.has(second.path)).toBe(false);
+      expect(w.storage.working.has(third.path)).toBe(true);
+    });
+
+    it('refuses a sent envelope, and a document of another envelope, touching nothing', async () => {
+      const d = await seedDraft(w, { pages: 1 });
+      const other = await seedDraft(w, { pages: 1 });
+      const foreign = await del(d.envelopeId, other.documentId);
+      expect([foreign.status, (await foreign.json()).code]).toEqual([404, 'document_not_found']);
+      expect(await w.q(`SELECT 1 FROM public.esign_envelope_documents WHERE id = $1`, [other.documentId])).toHaveLength(1);
+      expect(w.storage.working.has(`${other.envelopeId}/sources/${other.documentId}.pdf`)).toBe(true);
+
+      await w.q(`UPDATE public.esign_envelopes SET status = 'sent', expires_at = now() + interval '1 day' WHERE id = $1`, [d.envelopeId]);
+      const sent = await del(d.envelopeId, d.documentId);
+      expect([sent.status, (await sent.json()).code]).toEqual([409, 'not_draft']);
+      expect(await w.q(`SELECT 1 FROM public.esign_envelope_documents WHERE id = $1`, [d.documentId])).toHaveLength(1);
+      expect(w.storage.working.has(`${d.envelopeId}/sources/${d.documentId}.pdf`)).toBe(true);
+      expect((await del(d.envelopeId, 'not-a-uuid')).status).toBe(400);
+    });
+
+    it('the database refuses a draft that was sent after the read (the lock and the status check)', async () => {
+      const d = await seedDraft(w, { pages: 1 });
+      await w.q(`UPDATE public.esign_envelopes SET status = 'sent', expires_at = now() + interval '1 day' WHERE id = $1`, [d.envelopeId]);
+      await expect(w.q(`SELECT public.esign_delete_draft_document($1, $2, '[]'::jsonb, '{}'::uuid[])`, [d.envelopeId, d.documentId])).rejects.toThrow(/not a draft/);
+      expect(await w.q(`SELECT 1 FROM public.esign_envelope_documents WHERE id = $1`, [d.documentId])).toHaveLength(1);
+    });
+
+    it('a failed object removal still answers ok (the row is gone) and is logged', async () => {
+      const d = await seedDraft(w, { pages: 1 });
+      w.storage.fail.add('removeWorking');
+      try {
+        const res = await del(d.envelopeId, d.documentId);
+        expect(res.status).toBe(200);
+      } finally {
+        w.storage.fail.delete('removeWorking');
+      }
+      expect(await w.q(`SELECT 1 FROM public.esign_envelope_documents WHERE id = $1`, [d.documentId])).toEqual([]);
+      expect(JSON.stringify(w.logs)).toMatch(/stranded/);
+    });
   });
 });

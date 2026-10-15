@@ -146,9 +146,19 @@ describe('publicEdge (no session)', () => {
   });
 
   it('reads branding, and treats any failure as no branding', async () => {
-    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ display_name: 'Example Org', logo_path: null }), { status: 200 }));
-    await expect(fetchPublicBranding()).resolves.toEqual({ displayName: 'Example Org', logoPath: null });
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ display_name: 'Example Org', logo_path: null, legal_name: 'Example Org LLC', contact_email: 'hello@example.com', brand: {} }),
+        { status: 200 },
+      ),
+    );
+    await expect(fetchPublicBranding()).resolves.toEqual({
+      displayName: 'Example Org',
+      logoPath: null,
+      legalName: 'Example Org LLC',
+      contactEmail: 'hello@example.com',
+    });
     fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
-    await expect(fetchPublicBranding()).resolves.toEqual({ displayName: null, logoPath: null });
+    await expect(fetchPublicBranding()).resolves.toEqual({ displayName: null, logoPath: null, legalName: null, contactEmail: null });
   });
 });
