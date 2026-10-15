@@ -81,8 +81,11 @@ function pgliteStore(sent: Sent[], status: () => SendResult = () => ({ status: '
     async expireStartLink(id) {
       await q(`SELECT public.expire_start_link($1)`, [id]);
     },
-    async sendList(id, v) {
-      return (await q<{ r: never }>(`SELECT public.needs_send_list($1, $2) AS r`, [id, v]))[0].r;
+    async sendList(id, v, { contactId, email }) {
+      return (await q<{ r: never }>(`SELECT public.needs_send_list($1, $2, $3, $4) AS r`, [id, v, contactId, email]))[0].r;
+    },
+    async recipientCurrent(id, { contactId, email }) {
+      return (await q<{ r: never }>(`SELECT public.needs_recipient_current($1, $2, $3) AS r`, [id, contactId, email]))[0].r;
     },
     async claimReminder(id, n) {
       return (await q<{ r: never }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, n]))[0].r;
@@ -269,6 +272,35 @@ describe('send-needs-list: send', () => {
     expect(sent).toEqual([]);
   });
 
+  it('an address corrected while the destination is worked out publishes and emails nothing', async () => {
+    for (const contactId of [withAccount, noAccount]) {
+      const sent: Sent[] = [];
+      const id = await draft(contactId);
+      const d = deps(sent);
+      // The interleaving: the owner corrects the address inside the destination step: after
+      // the portal-account lookup, or after the start link was issued for the old address.
+      const correct = () => q(`UPDATE public.contacts SET email = $2 WHERE id = $1`, [contactId, `corrected-${n}@example.com`]);
+      const hasAccount = d.hasActivePortalAccount;
+      d.hasActivePortalAccount = async (c) => {
+        const answer = await hasAccount(c);
+        if (answer) await correct();
+        return answer;
+      };
+      const issue = d.issueStartLink;
+      d.issueStartLink = async (input) => {
+        const out = await issue(input);
+        await correct();
+        return out;
+      };
+      const res = await call(d, { list_id: id });
+      expect([res.status, (await res.json()).code], contactId).toEqual([409, 'changed']);
+      expect((await listRow(id)).status).toBe('draft');
+      expect(sent).toEqual([]);
+      const minted = await links(id);
+      expect(minted.map((r) => r.status)).toEqual(contactId === noAccount ? ['expired'] : []);
+    }
+  });
+
   it('refuses a list already sent, an empty draft, a contact without an address, a missing list', async () => {
     const id = await draft(withAccount);
     await call(deps([]), { list_id: id });
@@ -330,6 +362,42 @@ describe('send-needs-list: remind', () => {
     await q(`UPDATE public.needs_lists SET reminders_paused = true, reminder_count = 50 WHERE id = $1`, [id]);
     const res = await call(deps([]), { list_id: id, remind: true });
     expect(res.status).toBe(200);
+  });
+
+  it('an address corrected while a reminder works out its destination is not reminded', async () => {
+    for (const contactId of [withAccount, noAccount]) {
+      const sent: Sent[] = [];
+      const id = await draft(contactId);
+      let token = 0;
+      const first = deps([]);
+      first.newToken = () => `${String(++token)}`.padStart(43, contactId === withAccount ? 'A' : 'B');
+      await call(first, { list_id: id });
+      const d = deps(sent);
+      d.newToken = first.newToken;
+      const before = (await links(id)).map((r) => r.status);
+      const correct = () => q(`UPDATE public.contacts SET email = $2 WHERE id = $1`, [contactId, `moved-${n}@example.com`]);
+      const hasAccount = d.hasActivePortalAccount;
+      d.hasActivePortalAccount = async (c) => {
+        const answer = await hasAccount(c);
+        if (answer) await correct();
+        return answer;
+      };
+      const issue = d.issueStartLink;
+      d.issueStartLink = async (input) => {
+        const out = await issue(input);
+        await correct();
+        return out;
+      };
+      const res = await call(d, { list_id: id, remind: true });
+      expect([res.status, (await res.json()).code], contactId).toEqual([409, 'changed']);
+      expect(sent).toEqual([]);
+      expect((await listRow(id)).reminder_count).toBe(0);
+      // The send's link went to the old address too, so the change expired it; the
+      // reminder's own link was expired by the reminder. Nothing to the old address works.
+      const after = await links(id);
+      expect(after).toHaveLength(before.length + (contactId === noAccount ? 1 : 0));
+      expect(after.every((r) => r.status !== 'pending')).toBe(true);
+    }
   });
 
   it('a failed reminder is an error and is not counted', async () => {

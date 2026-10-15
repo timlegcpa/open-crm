@@ -47,6 +47,8 @@ function store(sent: string[], status: () => SendResult): NeedsSendStore {
       throw new Error('a scheduled reminder never mints a start link');
     },
     sendList: async () => 'not_draft',
+    recipientCurrent: async (id, { contactId, email }) =>
+      (await q<{ r: never }>(`SELECT public.needs_recipient_current($1, $2, $3) AS r`, [id, contactId, email]))[0].r,
     claimReminder: async (id, n) => (await q<{ r: never }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, n]))[0].r,
     releaseReminder: async (id, n) => {
       await q(`SELECT public.needs_release_reminder($1, $2)`, [id, n]);
