@@ -121,6 +121,11 @@ CREATE TABLE public.client_documents (
   reviewed_by uuid REFERENCES auth.users (id) ON DELETE SET NULL,
   -- Losing a share must never delete the file: SET NULL.
   shared_with_contact_id uuid REFERENCES public.contacts (id) ON DELETE SET NULL,
+  -- Set on an executed e-signature copy: the envelope it came from. One executed PDF is
+  -- filed to every signer as a row apiece over ONE object, and this column (not the
+  -- description) is how a delete path recognises such a row. Its foreign key to
+  -- esign_envelopes (ON DELETE SET NULL) is added in 0006_esign, which creates that table.
+  esign_envelope_id uuid,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT client_documents_iv_matches_status
@@ -308,7 +313,7 @@ CREATE TRIGGER trg_client_documents_column_guard
   FOR EACH ROW EXECUTE FUNCTION public.enforce_client_column_guard(
     'id', 'contact_id', 'uploaded_by', 'filename', 'storage_path', 'file_size', 'mime_type',
     'category', 'description', 'encryption_iv', 'encryption_status', 'held_by',
-    'reviewed_at', 'reviewed_by', 'created_at', 'shared_with_contact_id');
+    'reviewed_at', 'reviewed_by', 'created_at', 'shared_with_contact_id', 'esign_envelope_id');
 
 CREATE TRIGGER trg_client_documents_placement
   BEFORE INSERT OR UPDATE OF folder_path, held_by, contact_id ON public.client_documents

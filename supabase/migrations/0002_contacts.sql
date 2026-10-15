@@ -707,7 +707,10 @@ CREATE TRIGGER trg_client_tasks_column_guard
     'created_by', 'created_at');
 
 -- A client may move a pending task to completed or dismissed, and nothing else;
--- completed_at is stamped here, never taken from the client.
+-- completed_at is stamped here, never taken from the client. A signature task
+-- (type 'esign') is the exception: only the e-signature flow moves it (signing,
+-- declining, voiding and expiry, as the server), so a signer cannot hide "Signature
+-- needed" without signing.
 CREATE FUNCTION public.client_tasks_status_transition()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -722,6 +725,10 @@ BEGIN
   END IF;
 
   IF NEW.status IS DISTINCT FROM OLD.status THEN
+    IF OLD.type = 'esign' THEN
+      RAISE EXCEPTION 'a signature task changes only when the document is signed'
+        USING ERRCODE = '42501';
+    END IF;
     IF OLD.status <> 'pending' OR NEW.status NOT IN ('completed', 'dismissed') THEN
       RAISE EXCEPTION 'task status cannot change from % to %', OLD.status, NEW.status
         USING ERRCODE = '42501';
