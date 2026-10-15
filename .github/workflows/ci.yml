@@ -20,6 +20,17 @@ jobs:
       - run: npm test
       - run: npm run deno:check
       - run: npm run deno:lint
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
   secrets:
     runs-on: ubuntu-latest
     steps:

@@ -512,6 +512,7 @@ export function FieldPlacer({
             )}
             <div
               ref={overlayRef}
+              data-testid="esign-field-surface"
               onClick={onOverlayClick}
               className={cn('absolute inset-0', mode !== 'idle' ? 'cursor-crosshair' : 'cursor-default')}
               style={{ width: rendered?.canvasWidthPx, height: rendered?.canvasHeightPx, touchAction: interacting ? 'none' : undefined }}

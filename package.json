@@ -15,6 +15,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test --grep-invert @screenshots",
+    "screenshots": "playwright test --grep @screenshots",
     "deno:check": "deno check supabase/functions/**/index.ts",
     "deno:lint": "deno lint supabase/functions",
     "dev:bootstrap": "node scripts/dev-bootstrap.mjs",
@@ -76,6 +78,7 @@
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",
     "@eslint/js": "^9.19.0",
+    "@playwright/test": "1.63.0",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^22.13.5",
