@@ -34,7 +34,7 @@ export const allowlist: DomainAllowlist = {
     'mcp_update_request(uuid,uuid,integer,text,text,jsonb,uuid,text,text)',
     'mcp_delete_request(uuid,uuid,integer,uuid,text,text)',
     'mcp_claim_reminder(uuid,uuid)',
-    'mcp_release_reminder(uuid,integer,timestamp with time zone)',
+    'mcp_release_reminder(uuid,timestamp with time zone,timestamp with time zone)',
   ],
   definerWriteExempt: {
     'mcp_revoke_grant(uuid)':

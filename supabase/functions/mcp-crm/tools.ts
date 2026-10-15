@@ -512,10 +512,10 @@ async function auditDelegated(ctx: ToolContext, action: string, details: Record<
     : 'This action completed, but its audit record could not be written and the owner could not be emailed. Tell the owner.';
 }
 
-/** mcp_claim_reminder's answer: the reminder count it saw and the stamp it replaced (as text). */
+/** mcp_claim_reminder's answer: the day stamp it wrote and the one it replaced, both as text. */
 interface ReminderClaim {
   claimed: boolean;
-  count?: number;
+  stamp?: string;
   previous?: string | null;
 }
 
@@ -562,8 +562,9 @@ async function attemptRow(ctx: ToolContext, action: string, details: Record<stri
 /** Hand back a reminder claim whose reminder did not go out. A failure only leaves the day held. */
 async function releaseClaim(ctx: ToolContext, listId: string, claim: ReminderClaim): Promise<void> {
   try {
-    const { error } = await ctx.db.rpc('mcp_release_reminder', { p_list_id: listId, p_count: claim.count, p_previous: claim.previous ?? null });
+    const { data, error } = await ctx.db.rpc('mcp_release_reminder', { p_list_id: listId, p_stamp: claim.stamp, p_previous: claim.previous ?? null });
     if (error) ctx.log.error('reminder claim not released', error);
+    else if (data !== true) ctx.log.warn('reminder claim had nothing to hand back', { listId });
   } catch (err) {
     ctx.log.error('reminder claim not released', err);
   }

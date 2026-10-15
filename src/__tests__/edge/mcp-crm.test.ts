@@ -502,6 +502,9 @@ describe('the request tools', () => {
     (await audits(listId, action)).map((r) => (r.details.outcome === 'refused' ? `refused:${String(r.details.reason)}` : String(r.details.outcome)));
   const lastReminded = async (listId: string) =>
     (await q<{ at: string | null }>(`SELECT last_reminded_at::text AS at FROM public.needs_lists WHERE id = $1`, [listId]))[0].at;
+  /** The connector's own once-a-day claim. */
+  const dayClaimed = async (listId: string) =>
+    (await q<{ at: string | null }>(`SELECT mcp_reminder_claimed_at::text AS at FROM public.needs_lists WHERE id = $1`, [listId]))[0].at;
   /** The live database with one function intercepted. */
   const intercept = (fn: string, answer: (args?: Record<string, unknown>) => Promise<unknown>) => {
     const live = serviceClient(db);
@@ -798,7 +801,7 @@ describe('the request tools', () => {
     const r = await sentRequest();
     const remind = await callOn(createMcpCrmHandler(liveDeps({ db: down })), 'remind_request', go(r.listId, r.c.id, r.token));
     expect(remind.text).toMatch(/^Nothing was sent: the audit trail could not be written/);
-    expect([mail.sent, await lastReminded(r.listId)]).toEqual([[], null]);
+    expect([mail.sent, await lastReminded(r.listId), await dayClaimed(r.listId)]).toEqual([[], null, null]);
   });
 
   it('a reminder that does not go out hands its claim back, to NULL or to the earlier reminder', async () => {
@@ -832,7 +835,7 @@ describe('the request tools', () => {
       for (const prior of [null, EARLIER]) {
         mail.result = () => ({ status: 'sent', channel: 'local', id: null });
         const r = await sentRequest();
-        if (prior) await q(`UPDATE public.needs_lists SET last_reminded_at = $2 WHERE id = $1`, [r.listId, prior]);
+        if (prior) await q(`UPDATE public.needs_lists SET mcp_reminder_claimed_at = $2 WHERE id = $1`, [r.listId, prior]);
         const token = prior ? await tokenOf(r.c.id, r.listId) : r.token;
         const store = pgliteStore();
         breakIt(store, r.listId);
@@ -841,7 +844,8 @@ describe('the request tools', () => {
         // A refused provider call is recorded as a message; every other case reaches no mail at all.
         if (label !== 'the mail provider refused') expect([label, mail.sent]).toEqual([label, []]);
         const restored = (await q<{ ok: boolean | null }>(
-          `SELECT last_reminded_at IS NOT DISTINCT FROM $2::timestamptz AS ok FROM public.needs_lists WHERE id = $1`, [r.listId, prior]))[0].ok;
+          `SELECT mcp_reminder_claimed_at IS NOT DISTINCT FROM $2::timestamptz AND last_reminded_at IS NULL AND reminder_count = 0 AS ok
+             FROM public.needs_lists WHERE id = $1`, [r.listId, prior]))[0].ok;
         expect([label, prior, restored]).toEqual([label, prior, true]);
       }
     }
@@ -931,7 +935,7 @@ describe('the request tools', () => {
     const out = await callOn(createMcpCrmHandler(liveDeps({ db: answering })), 'remind_request', go(r.listId, r.c.id, r.token));
     expect([out.isError, out.text]).toEqual([true, expect.stringMatching(/^The request or its recipient changed since you read it\. Nothing was sent\./)]);
     expect(mail.sent).toEqual([]);
-    expect(await lastReminded(r.listId)).toBeNull();
+    expect([await lastReminded(r.listId), await dayClaimed(r.listId)]).toEqual([null, null]);
     expect(await trail(r.listId, 'mcp_remind_request')).toEqual(['attempt', 'changed']);
     // The same reminder, read again, goes out.
     const again = await on('remind_request', go(r.listId, r.c.id, await tokenOf(r.c.id, r.listId)));
@@ -1033,6 +1037,8 @@ describe('the request tools', () => {
     expect(await trail(r.listId, 'mcp_remind_request')).toEqual(['attempt', 'in_progress']);
     // Counted once, by the owner's claim; never by the connector's.
     expect((await q<{ n: number }>(`SELECT reminder_count AS n FROM public.needs_lists WHERE id = $1`, [r.listId]))[0].n).toBe(1);
+    // In progress is not delivered: the connector handed its day back.
+    expect(await dayClaimed(r.listId)).toBeNull();
   });
 
   it('a delegated reminder counts once, through the shared claim, and keys its email by that number', async () => {
@@ -1041,7 +1047,8 @@ describe('the request tools', () => {
     expect(out.isError, out.text).toBe(false);
     expect((await q<{ n: number }>(`SELECT reminder_count AS n FROM public.needs_lists WHERE id = $1`, [r.listId]))[0].n).toBe(1);
     expect(mail.sent.find((m) => m.to === r.c.email)?.key).toBe(`needs-remind:${r.listId}:0`);
-    expect(await lastReminded(r.listId)).not.toBeNull();
+    // Delivered: both stamps stay.
+    expect([await lastReminded(r.listId), await dayClaimed(r.listId)]).toEqual([expect.any(String), expect.any(String)]);
   });
 
   it('the outward reminder compares the reviewed version itself, whatever the recheck says', async () => {

@@ -6,6 +6,9 @@
 -- read and write functions behind the contact and request tools (mcp_* and mcp_audit_row).
 -- OAuth only: there is no static bearer token. The owner's two connector functions (mcp_list_grants,
 -- mcp_revoke_grant) back the AI connector section of Settings.
+-- One column on another file's table: needs_lists.mcp_reminder_claimed_at, the
+-- connector's own once-a-day reminder claim (server-written only; see the request tools
+-- section).
 --
 -- Depends on: 0001_core (org_profile, audit_logs, is_owner), 0002_contacts (contacts and
 -- their businesses, quotes, notes, portal accounts and pick-lists), 0005_requests (the
@@ -1234,56 +1237,60 @@ $$;
 -- The connector's reminder interval: at most one reminder a day per request, claimed with
 -- one guarded write so two concurrent calls cannot both pass a read-then-send check. A
 -- review token binds content, not a count, so without this one token would license a
--- reminder on every call. This is a different claim from needs_claim_reminder, and both
--- are taken: this one (the day, on last_reminded_at) first, in its own short transaction,
--- then the requests domain's (the reminder's number, on reminder_count) inside the shared
--- reminder, which is what makes an owner's concurrent Remind see reminder_in_progress.
--- Neither holds a lock past its own statement, so they cannot deadlock, and only the
--- second counts, so nothing is counted twice.
+-- reminder on every call.
 --
--- The claim moves last_reminded_at, the column the automatic reminders schedule from, so
--- it returns the value it replaced and the reminder count it saw: a claim whose reminder
--- did not go out is handed back with mcp_release_reminder and never delays the automatic
--- one. The owner's own reminder in the CRM is not bound by it. {"claimed": false}: not
--- this contact's sent request, or reminded within the last day.
+-- The day lives in its own column, mcp_reminder_claimed_at, written only here (the
+-- server's; no authenticated grant reaches it). It never touches last_reminded_at or
+-- reminder_count: those belong to the requests domain's claim and release
+-- (needs_claim_reminder / needs_release_reminder), which the shared reminder takes next
+-- and which is what makes an owner's concurrent Remind see reminder_in_progress. So the
+-- two claims cannot overwrite each other's hand-back, nothing is counted twice, and
+-- neither holds a lock past its own statement.
+ALTER TABLE public.needs_lists ADD COLUMN mcp_reminder_claimed_at timestamptz;
+
+-- Claims only when neither the connector nor anyone else reminded within the last day.
+-- Returns the stamp it wrote and the value it replaced, both as text (full precision for
+-- the release). {"claimed": false}: not this contact's sent request, or reminded within
+-- the last day. The owner's own reminder in the CRM is not bound by it.
 CREATE FUNCTION public.mcp_claim_reminder(p_list_id uuid, p_contact_id uuid)
 RETURNS jsonb
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
-  v_previous timestamptz;
-  v_count integer;
+  v_claimed timestamptz;
+  v_reminded timestamptz;
+  v_stamp timestamptz := now();
 BEGIN
-  SELECT l.last_reminded_at, l.reminder_count INTO v_previous, v_count
+  SELECT l.mcp_reminder_claimed_at, l.last_reminded_at INTO v_claimed, v_reminded
     FROM public.needs_lists l
    WHERE l.id = p_list_id
      AND l.contact_id = p_contact_id
      AND l.status = 'sent'
      FOR UPDATE;
-  IF NOT FOUND OR (v_previous IS NOT NULL AND v_previous >= now() - interval '24 hours') THEN
+  IF NOT FOUND
+     OR (v_claimed IS NOT NULL AND v_claimed >= v_stamp - interval '24 hours')
+     OR (v_reminded IS NOT NULL AND v_reminded >= v_stamp - interval '24 hours') THEN
     RETURN jsonb_build_object('claimed', false);
   END IF;
-  UPDATE public.needs_lists l SET last_reminded_at = now() WHERE l.id = p_list_id;
-  -- The previous stamp as text, so it comes back to the release at full precision.
-  RETURN jsonb_build_object('claimed', true, 'count', v_count, 'previous', v_previous::text);
+  UPDATE public.needs_lists l SET mcp_reminder_claimed_at = v_stamp WHERE l.id = p_list_id;
+  RETURN jsonb_build_object('claimed', true, 'stamp', v_stamp::text, 'previous', v_claimed::text);
 END;
 $$;
 
--- Hand back a claim whose reminder did not go out: last_reminded_at returns to the value
--- the claim replaced, but only while reminder_count is still the count the claim saw. A
--- reminder that was delivered since, the connector's or anyone's, keeps its count
--- (needs_claim_reminder takes it, and only a failed email gives it back), so the release
--- then changes nothing. false: nothing was handed back.
-CREATE FUNCTION public.mcp_release_reminder(p_list_id uuid, p_count integer, p_previous timestamptz)
+-- Hand back a day claim whose reminder was not delivered: mcp_reminder_claimed_at returns
+-- to the value the claim replaced, only while it still holds this claim's stamp. A
+-- delivered connector reminder is never released, so it keeps both stamps (this one and
+-- the requests claim's last_reminded_at). false: nothing was handed back.
+CREATE FUNCTION public.mcp_release_reminder(p_list_id uuid, p_stamp timestamptz, p_previous timestamptz)
 RETURNS boolean
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 BEGIN
   UPDATE public.needs_lists l
-     SET last_reminded_at = p_previous
-   WHERE l.id = p_list_id AND l.reminder_count = p_count;
+     SET mcp_reminder_claimed_at = p_previous
+   WHERE l.id = p_list_id AND l.mcp_reminder_claimed_at = p_stamp;
   RETURN FOUND;
 END;
 $$;
@@ -1375,7 +1382,7 @@ REVOKE ALL ON FUNCTION
   public.mcp_update_request(uuid, uuid, integer, text, text, jsonb, uuid, text, text),
   public.mcp_delete_request(uuid, uuid, integer, uuid, text, text),
   public.mcp_claim_reminder(uuid, uuid),
-  public.mcp_release_reminder(uuid, integer, timestamptz),
+  public.mcp_release_reminder(uuid, timestamptz, timestamptz),
   public.mcp_list_grants(),
   public.mcp_revoke_grant(uuid)
 FROM PUBLIC, anon, authenticated, service_role;
@@ -1410,7 +1417,7 @@ GRANT EXECUTE ON FUNCTION
   public.mcp_update_request(uuid, uuid, integer, text, text, jsonb, uuid, text, text),
   public.mcp_delete_request(uuid, uuid, integer, uuid, text, text),
   public.mcp_claim_reminder(uuid, uuid),
-  public.mcp_release_reminder(uuid, integer, timestamptz)
+  public.mcp_release_reminder(uuid, timestamptz, timestamptz)
 TO service_role;
 
 -- The owner's two (each refuses anyone else itself).

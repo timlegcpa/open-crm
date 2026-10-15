@@ -6,6 +6,7 @@
 import type { PGlite } from '@electric-sql/pglite';
 import { randomUUID } from 'node:crypto';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { isReminderDue } from '../../../supabase/functions/needs-reminder-dispatcher/handler';
 import {
   as,
   asAnon,
@@ -195,7 +196,7 @@ const SERVER_FUNCTIONS = [
   'mcp_update_request(uuid,uuid,integer,text,text,jsonb,uuid,text,text)',
   'mcp_delete_request(uuid,uuid,integer,uuid,text,text)',
   'mcp_claim_reminder(uuid,uuid)',
-  'mcp_release_reminder(uuid,integer,timestamp with time zone)',
+  'mcp_release_reminder(uuid,timestamp with time zone,timestamp with time zone)',
 ];
 const OWNER_FUNCTIONS = ['mcp_list_grants()', 'mcp_revoke_grant(uuid)'];
 
@@ -1308,97 +1309,131 @@ describe('mcp_delete_request', () => {
 });
 
 describe('mcp_claim_reminder and mcp_release_reminder', () => {
-  interface Claim { claimed: boolean; count?: number; previous?: string | null }
+  interface Claim { claimed: boolean; stamp?: string; previous?: string | null }
+  interface Shared { status: string; previous?: string | null }
+  interface Row { status: 'sent'; reminder_count: number; last_reminded_at: string | null; mcp: string | null; sent_at: string; reminders_paused: boolean }
   const sentList = async (tx: Tx) => {
     const { id } = await call<{ id: string }>(tx, 'mcp_create_request', { p_contact_id: contactA, p_title: 'Chase', p_intro: null, p_items: ITEMS, ...audit });
     await publish(tx, id, await versionOf(tx, id));
     return id;
   };
-  const stampOf = async (tx: Tx, id: string) =>
-    (await tx.query<{ at: string | null }>(`SELECT last_reminded_at::text AS at FROM public.needs_lists WHERE id = $1`, [id])).rows[0].at;
+  const rowOf = async (tx: Tx, id: string) =>
+    (await tx.query<Row>(
+      `SELECT status, reminder_count, last_reminded_at::text AS last_reminded_at, mcp_reminder_claimed_at::text AS mcp, sent_at::text AS sent_at, reminders_paused
+         FROM public.needs_lists WHERE id = $1`, [id])).rows[0];
+  const dayClaim = (tx: Tx, id: string, contact = contactA) => call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contact });
+  const dayRelease = (tx: Tx, id: string, c: Claim) => call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_stamp: c.stamp, p_previous: c.previous });
+  const sharedClaim = (tx: Tx, id: string, count: number) => call<Shared>(tx, 'needs_claim_reminder', { p_list_id: id, p_expected_count: count });
+  const sharedRelease = (tx: Tx, id: string, count: number, previous: string | null | undefined) =>
+    call<boolean>(tx, 'needs_release_reminder', { p_list_id: id, p_claimed_count: count, p_previous: previous ?? null });
 
   it('claims a sent request once a day, never a draft or another contact’s, and moves no content version', async () => {
     const out = await asServerTx(async (tx) => {
       const { id } = await call<{ id: string }>(tx, 'mcp_create_request', { p_contact_id: contactA, p_title: 'Chase', p_intro: null, p_items: ITEMS, ...audit });
-      const claim = async (contact = contactA) => (await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contact })).claimed;
-      const draft = await claim();
+      const draft = (await dayClaim(tx, id)).claimed;
       const v = await versionOf(tx, id);
       await publish(tx, id, v);
-      const other = await claim(contactB);
-      const first = await claim();
-      const again = await claim();
-      await tx.query(`UPDATE public.needs_lists SET last_reminded_at = now() - interval '25 hours' WHERE id = $1`, [id]);
-      const nextDay = await claim();
+      const other = (await dayClaim(tx, id, contactB)).claimed;
+      const first = (await dayClaim(tx, id)).claimed;
+      const again = (await dayClaim(tx, id)).claimed;
+      await tx.query(`UPDATE public.needs_lists SET mcp_reminder_claimed_at = now() - interval '25 hours' WHERE id = $1`, [id]);
+      const nextDay = (await dayClaim(tx, id)).claimed;
       return { draft, other, first, again, nextDay, moved: (await versionOf(tx, id)) !== v };
     });
     expect(out).toEqual({ draft: false, other: false, first: true, again: false, nextDay: true, moved: false });
   });
 
-  it('returns the count it saw and the value it replaced; a release puts the old value back, NULL included, and counts nothing', async () => {
+  it('refuses within a day of anyone’s reminder, and writes only its own column', async () => {
     const out = await asServerTx(async (tx) => {
       const id = await sentList(tx);
-      const fresh = await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contactA });
-      const held = await stampOf(tx, id);
-      const released = await call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_count: fresh.count, p_previous: fresh.previous });
-      const afterNull = await stampOf(tx, id);
-      // Microseconds included: the release restores at full precision.
-      const OLD = '2026-01-02 03:04:05.123456+00';
-      await tx.query(`UPDATE public.needs_lists SET last_reminded_at = $2 WHERE id = $1`, [id, OLD]);
-      const old = await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contactA });
-      await call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_count: old.count, p_previous: old.previous });
-      const same = async (sql: string, params: unknown[]) => (await tx.query<{ ok: boolean }>(sql, params)).rows[0].ok;
-      return {
-        fresh: { claimed: fresh.claimed, count: fresh.count, previous: fresh.previous, held: held !== null },
-        released,
-        afterNull,
-        previous: await same(`SELECT $1::timestamptz = $2::timestamptz AS ok`, [old.previous, OLD]),
-        afterOld: await same(`SELECT last_reminded_at = $2::timestamptz AS ok FROM public.needs_lists WHERE id = $1`, [id, OLD]),
-        count: (await tx.query<{ n: number }>(`SELECT reminder_count AS n FROM public.needs_lists WHERE id = $1`, [id])).rows[0].n,
-      };
+      await tx.query(`UPDATE public.needs_lists SET last_reminded_at = now() - interval '2 hours' WHERE id = $1`, [id]);
+      const recent = (await dayClaim(tx, id)).claimed;
+      await tx.query(`UPDATE public.needs_lists SET last_reminded_at = now() - interval '25 hours' WHERE id = $1`, [id]);
+      const before = await rowOf(tx, id);
+      const claim = await dayClaim(tx, id);
+      const after = await rowOf(tx, id);
+      return { recent, claimed: claim.claimed, untouched: [after.last_reminded_at, after.reminder_count], was: [before.last_reminded_at, before.reminder_count], held: after.mcp === claim.stamp };
     });
-    expect(out).toEqual({
-      fresh: { claimed: true, count: 0, previous: null, held: true },
-      released: true,
-      afterNull: null,
-      previous: true,
-      afterOld: true,
-      count: 0,
-    });
+    expect(out.recent).toBe(false);
+    expect(out.claimed).toBe(true);
+    expect(out.untouched).toEqual(out.was);
+    expect(out.held).toBe(true);
   });
 
-  it('with the requests claim: a delivered reminder keeps the day, a failed one gives it back', async () => {
+  it('a release puts the previous day stamp back, NULL included, only while it holds this claim', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await sentList(tx);
+      const fresh = await dayClaim(tx, id);
+      const released = await dayRelease(tx, id, fresh);
+      const afterNull = (await rowOf(tx, id)).mcp;
+      // Microseconds included: the release compares and restores at full precision.
+      const OLD = '2026-01-02 03:04:05.123456+00';
+      await tx.query(`UPDATE public.needs_lists SET mcp_reminder_claimed_at = $2 WHERE id = $1`, [id, OLD]);
+      const old = await dayClaim(tx, id);
+      await dayRelease(tx, id, old);
+      const restored = (await tx.query<{ ok: boolean }>(`SELECT mcp_reminder_claimed_at = $2::timestamptz AS ok FROM public.needs_lists WHERE id = $1`, [id, OLD])).rows[0].ok;
+      // A stale stamp hands back nothing.
+      const again = await dayClaim(tx, id);
+      const stale = await dayRelease(tx, id, { ...again, stamp: '2026-01-01 00:00:00+00' });
+      return { fresh: [fresh.claimed, fresh.previous], released, afterNull, restored, stale, kept: (await rowOf(tx, id)).mcp === again.stamp };
+    });
+    expect(out).toEqual({ fresh: [true, null], released: true, afterNull: null, restored: true, stale: false, kept: true });
+  });
+
+  it('with the shared claim: a delivered reminder keeps both stamps, a failed one gives both back', async () => {
     const out = await asServerTx(async (tx) => {
       const run = async (delivered: boolean) => {
         const id = await sentList(tx);
-        const claim = await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contactA });
-        // The shared reminder takes its number; a failed email gives it back.
-        const taken = await call<{ status: string; previous: string | null }>(tx, 'needs_claim_reminder', { p_list_id: id, p_expected_count: claim.count });
-        // The requests claim replaced the connector's own stamp, and its release restores that.
-        const stampedByConnector = taken.previous !== null;
-        if (!delivered) await call(tx, 'needs_release_reminder', { p_list_id: id, p_claimed_count: claim.count, p_previous: taken.previous });
-        const released = await call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_count: claim.count, p_previous: claim.previous });
-        const row = (await tx.query<{ n: number; at: string | null }>(`SELECT reminder_count AS n, last_reminded_at::text AS at FROM public.needs_lists WHERE id = $1`, [id])).rows[0];
-        return { taken: taken.status, stampedByConnector, released, count: row.n, held: row.at !== null };
+        const day = await dayClaim(tx, id);
+        const shared = await sharedClaim(tx, id, 0);
+        if (!delivered) {
+          await sharedRelease(tx, id, 0, shared.previous);
+          await dayRelease(tx, id, day);
+        }
+        const row = await rowOf(tx, id);
+        return { shared: shared.status, count: row.reminder_count, reminded: row.last_reminded_at !== null, day: row.mcp !== null };
       };
       return { delivered: await run(true), failed: await run(false) };
     });
     expect(out).toEqual({
-      delivered: { taken: 'claimed', stampedByConnector: true, released: false, count: 1, held: true },
-      failed: { taken: 'claimed', stampedByConnector: true, released: true, count: 0, held: false },
+      delivered: { shared: 'claimed', count: 1, reminded: true, day: true },
+      failed: { shared: 'claimed', count: 0, reminded: false, day: false },
     });
   });
 
-  it('a reminder delivered by anyone since the claim keeps its stamp: the release changes nothing', async () => {
+  it('the reviewer’s interleaving: an owner reminder in progress whose email fails leaves nothing postponed', async () => {
     const out = await asServerTx(async (tx) => {
       const id = await sentList(tx);
-      const claim = await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contactA });
-      // The owner's reminder went out and counted itself.
-      await call(tx, 'needs_claim_reminder', { p_list_id: id, p_expected_count: claim.count });
-      const recorded = await stampOf(tx, id);
-      const released = await call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_count: claim.count, p_previous: claim.previous });
-      return { released, kept: (await stampOf(tx, id)) === recorded };
+      const settings = { enabled: true, interval_days: 7, max_reminders: 3 };
+      const due = (row: Row) => {
+        const now = new Date(new Date(row.sent_at).getTime() + 8 * 24 * 60 * 60 * 1000);
+        return isReminderDue({ ...row, id, contact_id: contactA, title: 'Chase', intro_message: null, content_version: 0 }, settings, now);
+      };
+      const before = await rowOf(tx, id);
+      // 1. The connector claims the day.
+      const day = await dayClaim(tx, id);
+      // 2. The owner's Remind takes the shared claim.
+      const owner = await sharedClaim(tx, id, 0);
+      // 3. The connector's shared claim finds it in progress; it hands its day back.
+      const connector = await sharedClaim(tx, id, 0);
+      const dayBack = await dayRelease(tx, id, day);
+      // 4. The owner's email fails; it gives its count and stamp back.
+      const ownerBack = await sharedRelease(tx, id, 0, owner.previous);
+      const after = await rowOf(tx, id);
+      return {
+        steps: [day.claimed, owner.status, connector.status, dayBack, ownerBack],
+        after: { count: after.reminder_count, last_reminded_at: after.last_reminded_at, mcp: after.mcp },
+        due: [due(before), due(after)],
+        // Nothing went out, so the connector may remind again at once.
+        again: (await dayClaim(tx, id)).claimed,
+      };
     });
-    expect(out).toEqual({ released: false, kept: true });
+    expect(out).toEqual({
+      steps: [true, 'claimed', 'in_progress', true, true],
+      after: { count: 0, last_reminded_at: null, mcp: null },
+      due: [true, true],
+      again: true,
+    });
   });
 });
 
