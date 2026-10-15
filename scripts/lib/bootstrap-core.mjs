@@ -119,14 +119,18 @@ export function systemActorPassword(randomBytes) {
 /**
  * The owner's password must meet the rules in supabase/config.toml: at least
  * eight characters with a lower-case letter, an upper-case letter, a digit and a symbol.
+ * The same answers as the app's forms (src/lib/passwordRules.ts; bootstrap.test.ts holds
+ * them together): at most 72 UTF-8 bytes (bcrypt's limit), spaces and printable Unicode allowed, only a
+ * control character refused.
  */
 export function passwordProblem(password) {
   if (typeof password !== 'string' || password.length < 8) return 'must be at least 8 characters';
+  if (new TextEncoder().encode(password).length > 72) return 'must be at most 72 bytes; accented letters and emoji count as more than one';
+  if (/\p{Cc}/u.test(password)) return 'must not contain tabs, line breaks or other control characters';
   if (!/[a-z]/.test(password)) return 'needs a lower-case letter';
   if (!/[A-Z]/.test(password)) return 'needs an upper-case letter';
   if (!/[0-9]/.test(password)) return 'needs a digit';
   if (![...password].some((c) => AUTH_SYMBOLS.includes(c))) return `needs a symbol (one of ${AUTH_SYMBOLS})`;
-  if (/\s/.test(password)) return 'must not contain spaces';
   return null;
 }
 

@@ -11,14 +11,20 @@ export const SECURITY_HEADERS: Record<string, string> = {
   'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
 };
 
+/** The request headers every allowed origin may send. */
+export const BASE_ALLOW_HEADERS = ['authorization', 'x-client-info', 'apikey', 'content-type'] as const;
+
 /**
  * Headers for a response to `req`. An origin not on the list gets no CORS grant.
- * `methods` are the ones the function accepts; OPTIONS is always added.
+ * `methods` are the ones the function accepts; OPTIONS is always added. `extraAllowHeaders`
+ * are request headers a function's own protocol needs on top of BASE_ALLOW_HEADERS (MCP's
+ * session and protocol-version headers, say).
  */
 export function responseHeaders(
   req: Request,
   allowedOrigins: string[],
   methods: readonly string[] = ['POST'],
+  extraAllowHeaders: readonly string[] = [],
 ): Record<string, string> {
   const origin = req.headers.get('Origin');
   const headers: Record<string, string> = {
@@ -28,7 +34,7 @@ export function responseHeaders(
   };
   if (origin && allowedOrigins.includes(origin)) {
     headers['Access-Control-Allow-Origin'] = origin;
-    headers['Access-Control-Allow-Headers'] = 'authorization, x-client-info, apikey, content-type';
+    headers['Access-Control-Allow-Headers'] = [...BASE_ALLOW_HEADERS, ...extraAllowHeaders].join(', ');
     headers['Access-Control-Allow-Methods'] = [...methods.filter((m) => m !== 'OPTIONS'), 'OPTIONS'].join(', ');
   }
   return headers;
@@ -125,6 +131,20 @@ export async function readFormBody(req: Request, maxBytes: number): Promise<Form
 export function bearerToken(req: Request): string | null {
   const match = /^Bearer\s+(\S+)$/i.exec(req.headers.get('Authorization') ?? '');
   return match ? match[1] : null;
+}
+
+/** A presented API key outside these bounds is refused without being checked. */
+const MIN_API_KEY = 20;
+const MAX_API_KEY = 200;
+
+/**
+ * The API key a server-to-server request presents: x-api-key, else the Authorization value
+ * with or without "Bearer". Null when there is none, or when its length is not sane.
+ */
+export function presentedApiKey(req: Request): string | null {
+  const header = req.headers.get('x-api-key') ?? req.headers.get('authorization');
+  const value = header?.replace(/^Bearer\s+/i, '').trim() ?? '';
+  return value.length >= MIN_API_KEY && value.length <= MAX_API_KEY ? value : null;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

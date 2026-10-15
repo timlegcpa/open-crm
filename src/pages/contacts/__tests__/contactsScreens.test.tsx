@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 
 vi.mock('@/lib/supabase', async () => (await import('@/__tests__/fakeSupabase')).supabaseModule);
@@ -20,7 +20,7 @@ function contact(id: string, first: string, last: string, extra: Record<string, 
     submitted_at: null,
     first_name: first,
     last_name: last,
-    full_name: `${first} ${last}`,
+    full_name: last ? `${first} ${last}` : first,
     email: null,
     phone: null,
     business_name: null,
@@ -36,6 +36,7 @@ function contact(id: string, first: string, last: string, extra: Record<string, 
     mailing_state: null,
     mailing_zip: null,
     client_since: null,
+    contact_services: [] as unknown[],
     ...extra,
   };
 }
@@ -44,17 +45,25 @@ function seed() {
   fake.state.session = OWNER;
   fake.state.tables.contact_statuses = [
     { key: 'new_lead', label: 'New', colour: '#2563eb', sort_order: 10 },
-    { key: 'client', label: 'Client', colour: null, sort_order: 60 },
+    { key: 'hot', label: 'Hot', colour: '#dc2626', sort_order: 30 },
+    { key: 'client', label: 'Client', colour: '#16a34a', sort_order: 60 },
+    { key: 'one_time', label: 'One-time client', colour: null, sort_order: 70 },
+    { key: 'lost', label: 'Lost', colour: null, sort_order: 90 },
+    { key: 'esign_signer', label: 'Signer only', colour: null, sort_order: 100 },
   ];
   fake.state.tables.lead_sources = [
     { key: 'other', label: 'Other', colour: null, sort_order: 10, is_active: true },
     { key: 'referral', label: 'Referral', colour: null, sort_order: 20, is_active: true },
     { key: 'retired_ad', label: 'Retired ad', colour: null, sort_order: 30, is_active: false },
   ];
+  fake.state.tables.service_types = [
+    { key: 'retainer', label: 'Retainer', colour: null, sort_order: 10, is_active: true, is_system: false, revenue_family: 'recurring', default_cadence: 'monthly' },
+    { key: 'annual_plan', label: 'Annual plan', colour: null, sort_order: 20, is_active: true, is_system: false, revenue_family: 'recurring', default_cadence: 'annual' },
+  ];
   fake.state.tables.contacts = [
-    contact(ADA, 'Ada', 'Example', { email: 'ada@example.com', phone: '(555) 010-0001', business_name: 'Example Studio', source: 'referral' }),
-    contact(BO, 'Bo', 'Sample', { email: 'bo@example.org', phone: '555-010-0002', status: 'client' }),
-    contact(CY, 'Cy', 'Test', { phone: '555-010-0003' }),
+    contact(ADA, 'Ada', 'Example', { email: 'ada@example.com', phone: '(555) 010-0001', business_name: 'Example Studio', source: 'referral', spouse_first_name: 'Al' }),
+    contact(BO, 'Bo', 'Sample', { email: 'bo@example.org', phone: '555-010-0002', status: 'client', client_since: '2025-01-02' }),
+    contact(CY, 'Cy', 'Test', { phone: '555-010-0003', status: 'hot' }),
   ];
 }
 
@@ -68,72 +77,95 @@ async function choose(trigger: HTMLElement, option: string) {
   fireEvent.click(await screen.findByRole('option', { name: option }));
 }
 
-function rowNames(): string[] {
-  return screen
-    .getAllByRole('row')
-    .slice(1)
-    .map((r) => within(r).queryAllByRole('link')[0]?.textContent ?? '')
-    .filter(Boolean);
+/** The names the index shows, in order. */
+function indexNames(): string[] {
+  return screen.getAllByRole('checkbox', { name: /^Select / }).map((c) => c.getAttribute('aria-label')!.replace('Select ', ''));
 }
+
+function setWide(wide: boolean) {
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    value: (query: string) => ({
+      matches: wide && query === '(min-width: 1024px)',
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
+
+// The pages are lazy routes: load them once up front, so the first test does not spend
+// its find timeout compiling a cold chunk while the rest of the suite runs alongside.
+beforeAll(async () => {
+  await Promise.all([import('@/pages/contacts/ContactsList'), import('@/pages/contacts/ContactWorkspace'), import('@/pages/contacts/ContactIntake')]);
+}, 30_000);
 
 beforeEach(() => {
   fake.reset();
   seed();
+  localStorage.clear();
 });
 
-describe('contacts list', () => {
-  it('renders every contact with its status and source labels from the pick-lists', async () => {
+afterEach(() => setWide(false));
+
+describe('contacts index', () => {
+  it('puts every contact under its status section, titled from the table, clients as "Last, First"', async () => {
     renderAt('/contacts');
-    expect(await screen.findByText('Ada Example')).toBeInTheDocument();
-    expect(screen.getByText('Bo Sample')).toBeInTheDocument();
-    expect(screen.getByText('Cy Test')).toBeInTheDocument();
-    const ada = screen.getByText('Ada Example').closest('tr')!;
-    expect(within(ada).getByText('New')).toBeInTheDocument();
-    expect(within(ada).getByText('Referral')).toBeInTheDocument();
-    expect(within(ada).getByText('Example Studio')).toBeInTheDocument();
+    await screen.findByText('Ada Example');
+    expect(screen.getByRole('region', { name: 'New' })).toHaveTextContent('Ada Example');
+    expect(screen.getByRole('region', { name: 'Hot' })).toHaveTextContent('Cy Test');
+    expect(screen.getByRole('region', { name: 'Client' })).toHaveTextContent('Sample, Bo');
   });
 
   it('shows a renamed status label straight from the table', async () => {
     fake.state.tables.contact_statuses[0].label = 'Fresh enquiry';
-    fake.state.tables.lead_sources[1].label = 'Word of mouth';
     renderAt('/contacts');
-    const ada = (await screen.findByText('Ada Example')).closest('tr')!;
-    expect(within(ada).getByText('Fresh enquiry')).toBeInTheDocument();
-    expect(within(ada).getByText('Word of mouth')).toBeInTheDocument();
-    expect(screen.queryByText('New')).toBeNull();
+    await screen.findByText('Ada Example');
+    expect(screen.getByRole('region', { name: 'Fresh enquiry' })).toHaveTextContent('Ada Example');
   });
 
-  it('searches name, email, business and phone digits', async () => {
+  it('searches name, email, business, phone digits and the spouse', async () => {
     renderAt('/contacts');
     await screen.findByText('Ada Example');
     const search = screen.getByLabelText('Search contacts');
     fireEvent.change(search, { target: { value: 'bo@example' } });
-    expect(rowNames()).toEqual(['Bo Sample']);
+    expect(indexNames()).toEqual(['Sample, Bo']);
     fireEvent.change(search, { target: { value: 'studio' } });
-    expect(rowNames()).toEqual(['Ada Example']);
+    expect(indexNames()).toEqual(['Ada Example']);
     fireEvent.change(search, { target: { value: '0100003' } });
-    expect(rowNames()).toEqual(['Cy Test']);
+    expect(indexNames()).toEqual(['Cy Test']);
+    fireEvent.change(search, { target: { value: 'al' } });
+    expect(indexNames()).toContain('Ada Example');
     fireEvent.change(search, { target: { value: 'nobody' } });
     expect(screen.getByText('No contacts match.')).toBeInTheDocument();
   });
 
-  it('filters by a status from the table', async () => {
+  it('switches between All, Clients and Leads, remembers the choice, and clears the selection', async () => {
     renderAt('/contacts');
     await screen.findByText('Ada Example');
-    await choose(screen.getByLabelText('Filter by status'), 'Client');
-    await waitFor(() => expect(rowNames()).toEqual(['Bo Sample']));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
+    expect(screen.getByRole('region', { name: 'Selected contacts' })).toHaveTextContent('1 selected');
+    fireEvent.click(screen.getByRole('radio', { name: 'Clients' }));
+    expect(indexNames()).toEqual(['Sample, Bo']);
+    expect(screen.queryByRole('region', { name: 'Selected contacts' })).toBeNull();
+    expect(localStorage.getItem('open-crm:contacts:list')).toBe('"clients"');
+    fireEvent.click(screen.getByRole('radio', { name: 'Leads' }));
+    expect(indexNames()).toEqual(['Ada Example', 'Cy Test']);
   });
 
-  it('sorts by name', async () => {
+  it('ignores stored preferences of the wrong shape', async () => {
+    localStorage.setItem('open-crm:contacts:list', 'null');
+    localStorage.setItem('open-crm:contacts:collapsed', '3');
     renderAt('/contacts');
     await screen.findByText('Ada Example');
-    fireEvent.click(screen.getByRole('button', { name: 'Name' }));
-    expect(rowNames()).toEqual(['Ada Example', 'Bo Sample', 'Cy Test']);
-    fireEvent.click(screen.getByRole('button', { name: 'Name' }));
-    expect(rowNames()).toEqual(['Cy Test', 'Bo Sample', 'Ada Example']);
+    expect(screen.getByRole('radio', { name: 'All' })).toHaveAttribute('aria-checked', 'true');
   });
 
-  it('bulk status change writes only status for the selected contacts', async () => {
+  it('bulk status writes every selected row with the status alone (the database stamps client_since)', async () => {
     renderAt('/contacts');
     await screen.findByText('Ada Example');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
@@ -147,12 +179,40 @@ describe('contacts list', () => {
     expect(new Set(updates[0].filters[0].value as string[])).toEqual(new Set([ADA, CY]));
   });
 
+  it('"Email them" opens a group email to exactly the selected contacts', async () => {
+    renderAt('/contacts');
+    await screen.findByText('Ada Example');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Cy Test' }));
+    const link = within(screen.getByRole('region', { name: 'Selected contacts' })).getByRole('link', { name: 'Email them' });
+    expect(link).toHaveAttribute('href', `/email/new?to=${encodeURIComponent(`${ADA},${CY}`)}`);
+  });
+
+  it('a bulk status the server refuses says so and keeps the contacts selected', async () => {
+    renderAt('/contacts');
+    await screen.findByText('Ada Example');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Cy Test' }));
+    fake.state.errors['contacts:update'] = { message: 'permission denied' };
+    await choose(screen.getByLabelText('New status'), 'Client');
+    fireEvent.click(screen.getByRole('button', { name: 'Apply status' }));
+    expect(await screen.findByText(/Status changed on 0 of 2 contacts/)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Select Ada Example' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Select Cy Test' })).toBeChecked();
+  });
+
+  it('offers the Layout switch only on wide screens, where the board and table live', async () => {
+    renderAt('/contacts');
+    await screen.findByText('Ada Example');
+    expect(screen.queryByRole('radiogroup', { name: 'Layout' })).toBeNull();
+  });
+
   it('bulk delete calls the edge function per contact and reports a partial failure honestly', async () => {
     fake.state.invokeResults[BO] = { data: null, error: functionsHttpError(409, { error: 'delete_in_progress' }) };
     renderAt('/contacts');
     await screen.findByText('Ada Example');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Bo Sample' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Sample, Bo' }));
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Delete contacts' }));
     expect(await screen.findByText('Deleted 1 of 2 contacts.')).toBeInTheDocument();
@@ -192,7 +252,7 @@ describe('contacts list', () => {
     expect(queryClient.getQueryCache().getAll()).toEqual([]);
   });
 
-  it('redirects / to the list and shows a not-found view for unknown routes', async () => {
+  it('redirects / to the contacts page', async () => {
     renderAt('/');
     expect(await screen.findByText('Ada Example')).toBeInTheDocument();
     expect(window.location.pathname).toBe('/contacts');
@@ -204,11 +264,108 @@ describe('contacts list', () => {
   });
 });
 
+describe('board and table (wide screens)', () => {
+  beforeEach(() => setWide(true));
+
+  it('shows one column per open stage, and the card bar moves a stage with the status alone', async () => {
+    renderAt('/contacts');
+    const hot = await screen.findByRole('region', { name: 'Hot column' });
+    fireEvent.click(within(hot).getByRole('button', { name: 'Show Cy Test' }));
+    const bar = await screen.findByRole('complementary', { name: 'Cy Test details' });
+    await choose(within(bar).getByLabelText('Stage'), 'Client');
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    expect(fake.calls('contacts', 'update')[0].payload).toEqual({ status: 'client' });
+  });
+
+  async function openCyQuote() {
+    const cyQuote = { ...QUOTE, contact_id: CY };
+    fake.state.tables.contact_services = [{ ...cyQuote }];
+    fake.state.tables.contacts[2].contact_services = [{ ...cyQuote }];
+    renderAt('/contacts');
+    const hot = await screen.findByRole('region', { name: 'Hot column' });
+    fireEvent.click(within(hot).getByRole('button', { name: 'Show Cy Test' }));
+    const bar = await screen.findByRole('complementary', { name: 'Cy Test details' });
+    return bar;
+  }
+
+  it('the card bar counts accepted quotes as MRR/ARR and shows proposed work apart', async () => {
+    const bar = await openCyQuote();
+    expect(within(bar).getByText('$6,000 a year proposed')).toBeInTheDocument();
+    expect(within(bar).queryByText('$500')).toBeNull();
+  });
+
+  it('a failed price save can be retried with the same value', async () => {
+    const bar = await openCyQuote();
+    fake.state.errors['contact_services:update'] = { message: 'refused' };
+    fireEvent.click(within(bar).getByRole('button', { name: 'Edit Retainer quote' }));
+    fireEvent.change(within(bar).getByLabelText('Price'), { target: { value: '600' } });
+    fireEvent.keyDown(within(bar).getByLabelText('Price'), { key: 'Enter' });
+    await waitFor(() => expect(fake.calls('contact_services', 'update')).toHaveLength(1));
+    await act(async () => {});
+    delete fake.state.errors['contact_services:update'];
+    fireEvent.click(within(bar).getByRole('button', { name: 'Edit Retainer quote' }));
+    const price = await within(bar).findByLabelText('Price');
+    await waitFor(() => expect(price).not.toBeDisabled());
+    fireEvent.change(price, { target: { value: '600' } });
+    fireEvent.keyDown(price, { key: 'Enter' });
+    await waitFor(() => expect(fake.calls('contact_services', 'update')).toHaveLength(2));
+    expect(fake.calls('contact_services', 'update')[1].payload).toEqual({ amount: 600 });
+  });
+
+  it('a price typo never saves: "oops0" leaves a $500 price alone', async () => {
+    const bar = await openCyQuote();
+    fireEvent.click(within(bar).getByRole('button', { name: 'Edit Retainer quote' }));
+    fireEvent.change(within(bar).getByLabelText('Price'), { target: { value: 'oops0' } });
+    fireEvent.keyDown(within(bar).getByLabelText('Price'), { key: 'Enter' });
+    await act(async () => {});
+    expect(fake.calls('contact_services', 'update')).toEqual([]);
+  });
+
+  it('the price is held while a stage move for the contact is saving', async () => {
+    const bar = await openCyQuote();
+    fireEvent.click(within(bar).getByRole('button', { name: 'Edit Retainer quote' }));
+    let release = () => {};
+    fake.state.holds['contacts:update'] = new Promise<void>((r) => {
+      release = r;
+    });
+    await choose(within(bar).getByLabelText('Stage'), 'Client');
+    await waitFor(() => expect(within(bar).getByLabelText('Price')).toBeDisabled());
+    await act(async () => {
+      release();
+    });
+  });
+
+  it('flags a lead nobody can reach', async () => {
+    fake.state.tables.contacts.push(contact('10000000-0000-4000-8000-00000000000d', 'Di', 'Nowhere'));
+    renderAt('/contacts');
+    const column = await screen.findByRole('region', { name: 'New column' });
+    expect(within(column).getByRole('button', { name: 'Show Di Nowhere' })).toHaveTextContent('No email or phone');
+    expect(within(column).getByRole('button', { name: 'Show Ada Example' })).not.toHaveTextContent('No email or phone');
+  });
+
+  it('a column heading filters the index with ?view=, and an unknown view filters nothing', async () => {
+    renderAt('/contacts?view=nonsense');
+    const hot = await screen.findByRole('region', { name: 'Hot column' });
+    expect(indexNames()).toHaveLength(3);
+    fireEvent.click(within(hot).getAllByRole('button', { pressed: false })[0]);
+    await waitFor(() => expect(indexNames()).toEqual(['Cy Test']));
+    expect(window.location.search).toBe('?view=leads_hot');
+  });
+
+  it('the Table view counts what is in view and is remembered', async () => {
+    renderAt('/contacts');
+    await screen.findByRole('region', { name: 'Hot column' });
+    fireEvent.click(screen.getByRole('radio', { name: 'Table' }));
+    expect(await screen.findByText('3 of 3 contacts in view')).toBeInTheDocument();
+    expect(localStorage.getItem('open-crm:contacts:layout')).toBe('"table"');
+  });
+});
+
 describe('intake', () => {
-  it('refuses a contact with no name or business, and a malformed email', async () => {
+  it('requires a first name and refuses a malformed email, writing nothing', async () => {
     renderAt('/contacts/new');
     fireEvent.click(await screen.findByRole('button', { name: 'Save contact' }));
-    expect(await screen.findByText('Enter a first name, a last name or a business name.')).toBeInTheDocument();
+    expect(await screen.findByText('Enter a first name.')).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('First name'), { target: { value: 'Di' } });
     fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'not-an-email' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save contact' }));
@@ -216,17 +373,27 @@ describe('intake', () => {
     expect(fake.calls('contacts', 'insert')).toEqual([]);
   });
 
-  it('saves the contact and its first note, then opens the workspace', async () => {
+  it('has no form element, so Enter in a field never submits', async () => {
+    renderAt('/contacts/new');
+    const first = await screen.findByLabelText('First name');
+    expect(first.closest('form')).toBeNull();
+    fireEvent.change(first, { target: { value: 'Di' } });
+    fireEvent.keyDown(first, { key: 'Enter' });
+    await act(async () => {});
+    expect(fake.calls('contacts', 'insert')).toEqual([]);
+  });
+
+  it('saves the contact, its first note and an audit row, then opens the record', async () => {
     renderAt('/contacts/new');
     await screen.findByRole('button', { name: 'Save contact' });
-    // The defaults come from the tables once they load.
-    await waitFor(() => expect(screen.getByLabelText('Status')).toHaveTextContent('New'));
-    expect(screen.getByLabelText('Source')).toHaveTextContent('Other');
-    expect(screen.queryByText('Retired ad')).toBeNull();
+    await waitFor(() => expect(screen.getByRole('radio', { name: 'New' })).toHaveAttribute('aria-checked', 'true'));
+    expect(screen.getByRole('radio', { name: 'Other' })).toHaveAttribute('aria-checked', 'true');
+    expect(screen.queryByRole('radio', { name: 'Retired ad' })).toBeNull();
+    expect(screen.queryByRole('radio', { name: 'Signer only' })).toBeNull();
     fireEvent.change(screen.getByLabelText('First name'), { target: { value: 'Di' } });
     fireEvent.change(screen.getByLabelText('Last name'), { target: { value: 'Demo' } });
     fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'di@example.com' } });
-    await choose(screen.getByLabelText('Source'), 'Referral');
+    fireEvent.click(screen.getByRole('radio', { name: 'Referral' }));
     fireEvent.change(screen.getByLabelText('First note (optional)'), { target: { value: 'Met at the open day.' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save contact' }));
 
@@ -241,102 +408,158 @@ describe('intake', () => {
       source: 'referral',
       submitted_at: null,
     });
-    const [note] = fake.calls('contact_notes', 'insert');
-    expect(note.payload).toMatchObject({ body: 'Met at the open day.', kind: 'note', source: 'owner' });
+    expect(fake.calls('contact_notes', 'insert')[0].payload).toMatchObject({ body: 'Met at the open day.', kind: 'note', source: 'owner' });
+    expect(fake.calls('contact_services', 'insert')).toEqual([]);
+    await waitFor(() =>
+      expect(fake.calls('audit_logs', 'insert').map((c) => (c.payload as { action: string }).action)).toContain('contact_create'),
+    );
+  });
+
+  it('a client gets accepted quotes and no browser-made client_since; a blank service writes nothing', async () => {
+    renderAt('/contacts/new');
+    fireEvent.change(await screen.findByLabelText('First name'), { target: { value: 'Ed' } });
+    fireEvent.click(await screen.findByRole('radio', { name: 'Client' }));
+    fireEvent.change(await screen.findByLabelText('Retainer'), { target: { value: '$1,200' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save contact' }));
+    expect(await screen.findByRole('heading', { name: 'Ed' })).toBeInTheDocument();
+    expect(fake.calls('contacts', 'insert')[0].payload).toMatchObject({ status: 'client' });
+    expect(fake.calls('contacts', 'insert')[0].payload).not.toHaveProperty('client_since');
+    expect(fake.calls('contact_services', 'insert')[0].payload).toEqual([
+      { contact_id: expect.any(String), organization_id: null, service_type: 'retainer', state: 'accepted', cadence: 'monthly', amount: 1200 },
+    ]);
+  });
+
+  it('still opens the record when the quotes fail after the contact saved, and says so', async () => {
+    fake.state.errors['contact_services:insert'] = { message: 'quote refused' };
+    renderAt('/contacts/new');
+    fireEvent.change(await screen.findByLabelText('First name'), { target: { value: 'Fay' } });
+    fireEvent.change(await screen.findByLabelText('Annual plan'), { target: { value: '900' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save contact' }));
+    expect(await screen.findByText('Contact saved; its quotes were not.')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Fay' })).toBeInTheDocument();
+  });
+
+  it('refuses a service amount that is not a number, before writing anything', async () => {
+    renderAt('/contacts/new');
+    fireEvent.change(await screen.findByLabelText('First name'), { target: { value: 'Gus' } });
+    fireEvent.change(await screen.findByLabelText('Retainer'), { target: { value: 'abc' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save contact' }));
+    expect(await screen.findByText('Enter each service amount as a number, or leave it blank.')).toBeInTheDocument();
+    expect(fake.calls('contacts', 'insert')).toEqual([]);
   });
 
   it('shows the database error when the insert is refused', async () => {
     fake.state.errors['contacts:insert'] = { message: 'new row violates row-level security policy for table "contacts"' };
     renderAt('/contacts/new');
-    fireEvent.change(await screen.findByLabelText('Business name'), { target: { value: 'Example Works' } });
+    fireEvent.change(await screen.findByLabelText('First name'), { target: { value: 'Hal' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save contact' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('violates row-level security policy');
   });
 });
 
-describe('workspace overview', () => {
-  it('saves only the fields that changed', async () => {
+/** Opens an in-place field by its display button, types, and presses Enter. */
+async function editField(label: string, value: string) {
+  fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^${label}:`) }));
+  const input = await screen.findByRole(label === 'Phone' ? 'textbox' : 'textbox', { name: label });
+  fireEvent.change(input, { target: { value } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+}
+
+describe('record overview', () => {
+  it('saves one field in place on Enter, and only that field', async () => {
     renderAt(`/contacts/${ADA}`);
     expect(await screen.findByRole('heading', { name: 'Ada Example' })).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText('City'), { target: { value: 'Springfield' } });
-    fireEvent.change(screen.getByLabelText('Spouse first name'), { target: { value: 'Al' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
-    expect(await screen.findByText('Saved.')).toBeInTheDocument();
-    const [update] = fake.calls('contacts', 'update');
-    expect(update.payload).toEqual({ mailing_city: 'Springfield', spouse_first_name: 'Al' });
+    await editField('City', 'Springfield');
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    expect(fake.calls('contacts', 'update')[0].payload).toEqual({ mailing_city: 'Springfield' });
   });
 
-  it('an edit typed while a save is in flight stays unsaved', async () => {
-    let release!: () => void;
-    fake.state.holds['contacts:update'] = new Promise<void>((r) => { release = r; });
+  it('stores a cleared field as null', async () => {
     renderAt(`/contacts/${ADA}`);
-    fireEvent.change(await screen.findByLabelText('City'), { target: { value: 'Springfield' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
-    fireEvent.change(screen.getByLabelText('State'), { target: { value: 'IL' } });
-    await act(async () => { release(); });
-    expect(await screen.findByText('Saved.')).toBeInTheDocument();
-    expect(fake.calls('contacts', 'update')[0].payload).toEqual({ mailing_city: 'Springfield' });
-    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled();
+    await screen.findByRole('heading', { name: 'Ada Example' });
+    await editField('Phone', '');
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    expect(fake.calls('contacts', 'update')[0].payload).toEqual({ phone: null });
+  });
+
+  it('Escape discards an edit', async () => {
+    renderAt(`/contacts/${ADA}`);
+    fireEvent.click(await screen.findByRole('button', { name: /^City:/ }));
+    const input = await screen.findByRole('textbox', { name: 'City' });
+    fireEvent.change(input, { target: { value: 'Nowhere' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+    await act(async () => {});
+    expect(fake.calls('contacts', 'update')).toEqual([]);
   });
 
   it("shows the database's message when a save is refused", async () => {
     fake.state.errors['contacts:update'] = { message: 'permission denied for table contacts', code: '42501' };
     renderAt(`/contacts/${ADA}`);
-    fireEvent.change(await screen.findByLabelText('City'), { target: { value: 'Springfield' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await screen.findByRole('heading', { name: 'Ada Example' });
+    await editField('City', 'Springfield');
     expect(await screen.findByText('permission denied for table contacts')).toBeInTheDocument();
   });
 
-  it('adds a note as the owner', async () => {
-    renderAt(`/contacts/${ADA}`);
-    fireEvent.change(await screen.findByLabelText('New note'), { target: { value: 'Sent the welcome pack.' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Add note' }));
-    expect(await screen.findByText('Sent the welcome pack.')).toBeInTheDocument();
-    expect(fake.calls('contact_notes', 'insert')[0].payload).toEqual({
-      contact_id: ADA,
-      body: 'Sent the welcome pack.',
-      kind: 'note',
-      source: 'owner',
-    });
-  });
-
-  it('keeps a note typed while the previous one was saving', async () => {
+  it('adds a note as the owner, and keeps a note typed while the previous one was saving', async () => {
     let release!: () => void;
-    fake.state.holds['contact_notes:insert'] = new Promise<void>((r) => { release = r; });
+    fake.state.holds['contact_notes:insert'] = new Promise<void>((r) => {
+      release = r;
+    });
     renderAt(`/contacts/${ADA}`);
     const box = await screen.findByLabelText('New note');
     fireEvent.change(box, { target: { value: 'First.' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add note' }));
     fireEvent.change(box, { target: { value: 'Second, still typing' } });
-    await act(async () => { release(); });
+    await act(async () => {
+      release();
+    });
     expect(await screen.findByText('First.')).toBeInTheDocument();
     expect(box).toHaveValue('Second, still typing');
+    expect(fake.calls('contact_notes', 'insert')[0].payload).toEqual({ contact_id: ADA, body: 'First.', kind: 'note', source: 'owner' });
+  });
+
+  it('labels a note an agent wrote', async () => {
+    fake.state.tables.contact_notes = [
+      { id: 'n1', contact_id: ADA, body: 'Logged by the agent.', kind: 'note', source: 'mcp', created_at: '2026-03-02T10:00:00Z' },
+    ];
+    renderAt(`/contacts/${ADA}`);
+    expect(await screen.findByText('Logged by the agent.')).toBeInTheDocument();
+    expect(screen.getByText('Agent')).toBeInTheDocument();
+  });
+
+  it('adds a spouse address and makes it the default through the RPC', async () => {
+    renderAt(`/contacts/${ADA}`);
+    const form = await screen.findByRole('form', { name: 'Add spouse emails' });
+    fireEvent.change(within(form).getByLabelText('New address'), { target: { value: 'al@example.com' } });
+    expect(within(form).getByRole('checkbox')).toBeChecked();
+    fireEvent.click(within(form).getByRole('button', { name: 'Add' }));
+    expect(await screen.findByText('al@example.com')).toBeInTheDocument();
+    expect(fake.calls('contact_emails', 'insert')[0].payload).toEqual({
+      contact_id: ADA,
+      kind: 'spouse',
+      email: 'al@example.com',
+      label: 'other',
+      is_default: false,
+    });
+    expect(fake.state.rpcCalls.filter((r) => r.name === 'contact_emails_set_default')).toEqual([
+      { name: 'contact_emails_set_default', args: { p_id: expect.any(String), p_contact_id: ADA, p_kind: 'spouse' } },
+    ]);
   });
 
   it('says so when an address is added but cannot be made the default', async () => {
     fake.state.rpcErrors.contact_emails_set_default = { message: 'MFA session expired' };
     renderAt(`/contacts/${ADA}`);
     const form = await screen.findByRole('form', { name: 'Add spouse emails' });
-    const input = within(form).getByLabelText('New address');
-    fireEvent.change(input, { target: { value: 'al@example.com' } });
+    fireEvent.change(within(form).getByLabelText('New address'), { target: { value: 'al@example.com' } });
     fireEvent.click(within(form).getByRole('button', { name: 'Add' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('The address was added but not made the default: MFA session expired');
-    expect(input).toHaveValue('');
-    expect(await screen.findByText('al@example.com')).toBeInTheDocument();
+    expect(await screen.findByText('The address was added but not made the default: MFA session expired')).toBeInTheDocument();
   });
 
-  it('keeps an address typed while the previous one was saving', async () => {
-    let release!: () => void;
-    fake.state.holds['contact_emails:insert'] = new Promise<void>((r) => { release = r; });
+  it('copies the email by clicking the value, and nothing launches a mail client or dialer', async () => {
     renderAt(`/contacts/${ADA}`);
-    const form = await screen.findByRole('form', { name: 'Add spouse emails' });
-    const input = within(form).getByLabelText('New address');
-    fireEvent.change(input, { target: { value: 'al@example.com' } });
-    fireEvent.click(within(form).getByRole('button', { name: 'Add' }));
-    fireEvent.change(input, { target: { value: 'al.second@example.com' } });
-    await act(async () => { release(); });
-    expect(await screen.findByText('al@example.com')).toBeInTheDocument();
-    expect(input).toHaveValue('al.second@example.com');
+    await screen.findByRole('heading', { name: 'Ada Example' });
+    expect(screen.getAllByRole('button', { name: 'Copy email: ada@example.com' }).length).toBeGreaterThan(0);
+    expect(document.querySelector('a[href^="mailto:"], a[href^="tel:"]')).toBeNull();
   });
 
   it('shows not-found for a missing contact', async () => {
@@ -344,34 +567,138 @@ describe('workspace overview', () => {
     expect(await screen.findByText('Contact not found')).toBeInTheDocument();
   });
 
-  it('never queries with an id that is not a uuid', async () => {
+  it('never writes with an id that is not a uuid', async () => {
     renderAt('/contacts/not-a-uuid');
     expect(await screen.findByText('Contact not found')).toBeInTheDocument();
-    await act(async () => {});
-    expect(fake.calls('contacts')).toEqual([]);
+    expect(fake.state.calls.filter((c) => c.op !== 'select')).toEqual([]);
   });
 
-  it('adds an address and makes it the default through the RPC', async () => {
+  it('deletes through the edge function from the More menu and returns to the list', async () => {
     renderAt(`/contacts/${ADA}`);
-    const form = await screen.findByRole('form', { name: 'Add spouse emails' });
-    fireEvent.change(within(form).getByLabelText('New address'), { target: { value: 'al@example.com' } });
-    // No spouse address yet, so the first one is offered as the default.
-    expect(within(form).getByRole('checkbox')).toBeChecked();
-    fireEvent.click(within(form).getByRole('button', { name: 'Add' }));
-    expect(await screen.findByText('al@example.com')).toBeInTheDocument();
-    const [insert] = fake.calls('contact_emails', 'insert');
-    expect(insert.payload).toEqual({ contact_id: ADA, kind: 'spouse', email: 'al@example.com', label: 'other', is_default: false });
-    expect(fake.state.rpcCalls.filter((r) => r.name === 'contact_emails_set_default')).toEqual([
-      { name: 'contact_emails_set_default', args: { p_id: expect.any(String), p_contact_id: ADA, p_kind: 'spouse' } },
-    ]);
-  });
-
-  it('deletes through the edge function and returns to the list', async () => {
-    renderAt(`/contacts/${ADA}`);
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete contact' }));
+    await screen.findByRole('heading', { name: 'Ada Example' });
+    fireEvent.keyDown(screen.getByRole('button', { name: 'More actions' }), { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Delete contact' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Delete contact' }));
     await waitFor(() => expect(window.location.pathname).toBe('/contacts'));
     expect(fake.state.invokeCalls).toEqual([{ name: 'delete-contact', body: { contact_id: ADA } }]);
     expect(fake.calls('contacts', 'delete')).toEqual([]);
+  });
+});
+
+const QUOTE = {
+  id: 'q1',
+  contact_id: ADA,
+  organization_id: null,
+  service_type: 'retainer',
+  state: 'proposed',
+  cadence: 'monthly',
+  amount: '500.00',
+  created_at: '2026-03-01T00:00:00Z',
+  updated_at: '2026-03-01T00:00:00Z',
+};
+
+describe('billing', () => {
+  it('adds a proposed quote at the service default cadence, unpriced, and changes nothing about the contact', async () => {
+    renderAt(`/contacts/${ADA}/billing`);
+    const personal = await screen.findByRole('region', { name: 'Quotes for Personal' });
+    fireEvent.keyDown(within(personal).getByRole('button', { name: 'Add service' }), { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Annual plan' }));
+    await waitFor(() => expect(fake.calls('contact_services', 'insert')).toHaveLength(1));
+    expect(fake.calls('contact_services', 'insert')[0].payload).toEqual({
+      contact_id: ADA,
+      organization_id: null,
+      service_type: 'annual_plan',
+      state: 'proposed',
+      cadence: 'annual',
+      amount: null,
+    });
+    await waitFor(() => expect(fake.calls('contact_services', 'select').length).toBeGreaterThan(0));
+    expect(fake.calls('contacts', 'update')).toEqual([]);
+  });
+
+  it('accepting a recurring quote makes a lead a client, derived from the quotes re-read on the server', async () => {
+    fake.state.tables.contact_services = [{ ...QUOTE }];
+    fake.state.tables.contacts[0].contact_services = [{ ...QUOTE }];
+    renderAt(`/contacts/${ADA}/billing`);
+    const state = await screen.findByRole('radiogroup', { name: 'Retainer state' });
+    fireEvent.click(within(state).getByRole('radio', { name: 'Accepted' }));
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    expect(fake.calls('contact_services', 'update')[0].payload).toEqual({ state: 'accepted' });
+    const [update] = fake.calls('contacts', 'update');
+    expect(update.payload).toEqual({ status: 'client' });
+    // Compare-and-set on the status just read from the server.
+    expect(update.filters).toEqual([
+      { type: 'eq', column: 'id', value: ADA },
+      { type: 'eq', column: 'status', value: 'new_lead' },
+    ]);
+  });
+
+  it('a quote derives the status from a fresh read, never the cache: a contact moved to Cold meanwhile stays Cold', async () => {
+    fake.state.tables.contact_services = [{ ...QUOTE }];
+    fake.state.tables.contacts[0].contact_services = [{ ...QUOTE }];
+    renderAt(`/contacts/${ADA}/billing`);
+    const state = await screen.findByRole('radiogroup', { name: 'Retainer state' });
+    // Another tab moved the contact to Cold; this screen's cache still says New.
+    fake.state.tables.contacts[0].status = 'cold';
+    fireEvent.click(within(state).getByRole('radio', { name: 'Accepted' }));
+    await waitFor(() => expect(fake.calls('contacts', 'select').some((c) => c.columns === 'status')).toBe(true));
+    await act(async () => {});
+    expect(fake.calls('contacts', 'update')).toEqual([]);
+    expect(fake.state.tables.contacts[0].status).toBe('cold');
+  });
+
+  it('never promotes a cold contact from a quote', async () => {
+    fake.state.tables.contacts[0].status = 'cold';
+    fake.state.tables.contact_services = [{ ...QUOTE }];
+    fake.state.tables.contacts[0].contact_services = [{ ...QUOTE }];
+    renderAt(`/contacts/${ADA}/billing`);
+    const state = await screen.findByRole('radiogroup', { name: 'Retainer state' });
+    fireEvent.click(within(state).getByRole('radio', { name: 'Accepted' }));
+    await waitFor(() => expect(fake.calls('contact_services', 'select').length).toBeGreaterThan(0));
+    await act(async () => {});
+    expect(fake.calls('contacts', 'update')).toEqual([]);
+  });
+
+  it('a rename sends the name alone, even when a refetch moved the status while the editor was open', async () => {
+    fake.state.tables.organizations = [
+      { id: 'o1', contact_id: ADA, name: 'Acme LLC', organization_type: 'other', tax_id: null, status: 'prospect', created_at: '2026-03-01T00:00:00Z', updated_at: '2026-03-01T00:00:00Z' },
+    ];
+    renderAt(`/contacts/${ADA}/billing`);
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit Acme LLC' }));
+    const name = await screen.findByLabelText('Name');
+    // Someone else activates the organization; the screen refetches mid-edit.
+    fake.state.tables.organizations[0].status = 'active';
+    await act(async () => {
+      await queryClient.invalidateQueries();
+    });
+    fireEvent.change(name, { target: { value: 'Acme Studio LLC' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(fake.calls('organizations', 'update')).toHaveLength(1));
+    expect(fake.calls('organizations', 'update')[0].payload).toEqual({ name: 'Acme Studio LLC' });
+    expect(fake.state.tables.organizations[0].status).toBe('active');
+  });
+
+  it('refuses a second organization with the same name, read fresh', async () => {
+    fake.state.tables.organizations = [
+      { id: 'o1', contact_id: ADA, name: 'Acme LLC', organization_type: 'other', tax_id: null, status: 'prospect', created_at: '2026-03-01T00:00:00Z', updated_at: '2026-03-01T00:00:00Z' },
+    ];
+    renderAt(`/contacts/${ADA}/billing`);
+    fireEvent.click(await screen.findByRole('button', { name: 'Add organization' }));
+    fireEvent.change(await screen.findByLabelText('Name'), { target: { value: '  acme   llc ' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    expect(await screen.findByText(/Acme LLC is already on this contact/)).toBeInTheDocument();
+    expect(fake.calls('organizations', 'insert')).toEqual([]);
+  });
+
+  it('writes a won upsell with no estimate to pricing unpriced, never at 0', async () => {
+    fake.state.tables.contact_upsells = [
+      { id: 'u1', contact_id: ADA, title: 'Quarterly review', service_type: 'retainer', est_amount: null, cadence: 'monthly', status: 'won', notes: null, created_at: '2026-03-01T00:00:00Z', updated_at: '2026-03-01T00:00:00Z' },
+    ];
+    renderAt(`/contacts/${ADA}/billing`);
+    fireEvent.click(await screen.findByRole('button', { name: 'Add to pricing' }));
+    const dialog = await screen.findByRole('alertdialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add to pricing' }));
+    await waitFor(() => expect(fake.calls('contact_services', 'insert')).toHaveLength(1));
+    expect(fake.calls('contact_services', 'insert')[0].payload).toMatchObject({ service_type: 'retainer', state: 'accepted', amount: null });
   });
 });

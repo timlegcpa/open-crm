@@ -13,6 +13,7 @@ import { manifest as requests } from '@/features/requests/manifest';
 import { manifest as settings } from '@/features/settings/manifest';
 import {
   NAV_SECTIONS,
+  type ContactActivityCard,
   type ContactHeaderAction,
   type ContactSidePanel,
   type ContactTab,
@@ -22,6 +23,7 @@ import {
   type OwnerNavItem,
   type OwnerRouteHandle,
   type PortalHomeCard,
+  type PortalProfileSection,
   type PortalTab,
   type SettingsSection,
   type ShellProps,
@@ -72,6 +74,8 @@ export const portalTabs: PortalTab[] = collect((f) => f.portalTabs).sort(byOrder
 export const portalRoutes: RouteObject[] = collect((f) => f.portalRoutes);
 /** Cards on the portal's Home page, in order. */
 export const portalHomeCards: PortalHomeCard[] = collect((f) => f.portalHomeCards).sort(byOrderThenKey);
+/** Sections of the portal's Profile page, in order. */
+export const portalProfileSections: PortalProfileSection[] = collect((f) => f.portalProfileSections).sort(byOrderThenKey);
 /** Routes that need no session. */
 export const publicRoutes: RouteObject[] = collect((f) => f.publicRoutes);
 /** Tabs on the contact record, in order. */
@@ -80,6 +84,8 @@ export const contactTabs: ContactTab[] = collect((f) => f.contactTabs).sort(byOr
 export const contactHeaderActions: ContactHeaderAction[] = collect((f) => f.contactHeaderActions).sort(byOrderThenKey);
 /** Panels in the contact record's right bar, in order. */
 export const contactSidePanels: ContactSidePanel[] = collect((f) => f.contactSidePanels).sort(byOrderThenKey);
+/** Cards on the contact record's Activity tab, in order. */
+export const contactActivityCards: ContactActivityCard[] = collect((f) => f.contactActivityCards).sort(byOrderThenKey);
 /** Settings sections, in order. */
 export const settingsSections: SettingsSection[] = collect((f) => f.settingsSections).sort(byOrderThenLabel);
 /** The portal's frame, from the one feature that provides it (registry.test.ts allows one); null for none. */

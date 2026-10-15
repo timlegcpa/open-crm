@@ -1,14 +1,34 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { links } from '@/features/links';
-import { useAuth } from '@/lib/auth';
+import { SESSION_EXPIRED_KEY, useAuth } from '@/lib/auth';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 
+/** True when the portal signed this tab out for inactivity (the flag is read once, then removed). */
+function readSessionExpired(): boolean {
+  try {
+    return window.sessionStorage.getItem(SESSION_EXPIRED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
 export function SignInForm({ orgName }: { orgName: string | null }) {
   const { login } = useAuth();
+  // Read during the first render, removed in the effect: the note shows once, for this
+  // sign-in screen, and a later visit to it says nothing.
+  const [expired] = useState(readSessionExpired);
+  useEffect(() => {
+    if (!expired) return;
+    try {
+      window.sessionStorage.removeItem(SESSION_EXPIRED_KEY);
+    } catch {
+      // Nothing stored.
+    }
+  }, [expired]);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
@@ -37,6 +57,11 @@ export function SignInForm({ orgName }: { orgName: string | null }) {
       </CardHeader>
       <CardContent>
         <form onSubmit={submit} className="flex flex-col gap-4" noValidate>
+          {expired && (
+            <p role="status" className="rounded-md border border-border bg-muted px-3 py-2 text-sm">
+              You were signed out after a period of inactivity. Sign in again to continue.
+            </p>
+          )}
           <div className="flex flex-col gap-2">
             <Label htmlFor="email">Email</Label>
             <Input id="email" type="email" autoComplete="username" required value={email} onChange={(e) => setEmail(e.target.value)} />

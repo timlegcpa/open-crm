@@ -1,6 +1,6 @@
 import { lazy } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import type { ContactHeaderAction, ContactSidePanel, ContactTab, ContactTabProps } from '@/features/types';
@@ -112,10 +112,11 @@ describe('contact record slots', () => {
     expect(screen.getByTestId('where').textContent).toBe(`/contacts/${ADA}`);
   });
 
-  it('renders header actions beside Delete, and side panels in the right bar', async () => {
+  it('renders header actions beside the More menu (which holds Delete), and side panels in the right bar', async () => {
     renderAt(`/contacts/${ADA}`);
     expect(await screen.findByRole('button', { name: 'Send to a' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Delete contact' })).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('button', { name: 'More actions' }), { key: 'Enter' });
+    expect(await screen.findByRole('menuitem', { name: 'Delete contact' })).toBeInTheDocument();
     const bar = screen.getByRole('complementary', { name: 'Contact summary', hidden: true });
     expect(await within(bar).findByText('Portal access: none')).toBeInTheDocument();
   });

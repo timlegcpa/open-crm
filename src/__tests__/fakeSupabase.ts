@@ -1,9 +1,12 @@
 /**
  * An in-memory stand-in for the Supabase browser client, for API and screen tests.
  *
- * It keeps one array of rows per table, applies the filters the app uses (eq, gt, in,
- * or), and records every executed request as a `Call` so a test can assert the exact
- * payload a write sent. Errors are injected per `table:op`, per RPC, or per function.
+ * It keeps one array of rows per table, applies the filters the app uses (eq, gt, lt, in,
+ * is, not, or), ordering, limit and range, answers a `{ count: 'exact', head: true }`
+ * select with a count and no rows, and records every executed request as a `Call` so a
+ * test can assert the exact payload a write sent. Realtime channels are recorded in
+ * `state.channels` (removed ones flagged). Errors are injected per `table:op`, per RPC, or
+ * per function.
  *
  * Use it from a test file with:
  *   vi.mock('@/lib/supabase', async () => (await import('@/__tests__/fakeSupabase')).supabaseModule);
@@ -17,9 +20,11 @@ type Op = 'select' | 'insert' | 'update' | 'delete';
 const MAX_ROWS = 1000;
 
 interface Filter {
-  type: 'eq' | 'gt' | 'in' | 'or';
+  type: 'eq' | 'gt' | 'lt' | 'in' | 'is' | 'not' | 'or';
   column?: string;
   value?: unknown;
+  /** For `not`: the negated operator ('eq', 'is' or 'in'). */
+  op?: string;
 }
 
 export interface Call {
@@ -30,10 +35,17 @@ export interface Call {
   filters: Filter[];
 }
 
-type Result = { data: unknown; error: unknown };
+type Result = { data: unknown; error: unknown; count?: number | null };
 
 export interface FakeSession {
   user: { id: string; email: string; factors?: Array<{ id: string; status: string }> };
+}
+
+export interface FakeChannelEntry {
+  name: string;
+  config: Record<string, unknown>;
+  handler: (payload: unknown) => void;
+  removed: boolean;
 }
 
 let idCounter = 0;
@@ -42,19 +54,35 @@ function nextId(): string {
   return `ffffffff-0000-4000-8000-${String(idCounter).padStart(12, '0')}`;
 }
 
+/** `not(column, 'in', '(a,b)')` takes PostgREST's list text; `in(column, [...])` takes an array. */
+function inList(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  return String(value).replace(/^\(|\)$/g, '').split(',').map((v) => v.trim());
+}
+
+function matchesOne(row: Row, f: Filter): boolean {
+  const cell = row[f.column!];
+  if (f.type === 'eq') return cell === f.value;
+  if (f.type === 'gt') return String(cell) > String(f.value);
+  if (f.type === 'lt') return String(cell) < String(f.value);
+  if (f.type === 'in') return inList(f.value).includes(cell);
+  // is: null or a boolean; a column the row does not carry reads as null.
+  if (f.type === 'is') return (cell ?? null) === f.value;
+  if (f.type === 'not') {
+    if (f.op !== 'eq' && f.op !== 'is' && f.op !== 'in') throw new Error(`fakeSupabase: not(${f.op}) is not supported`);
+    return !matchesOne(row, { type: f.op, column: f.column, value: f.value });
+  }
+  // or: "a.eq.X,b.eq.Y", the only shape the app sends.
+  return String(f.value)
+    .split(',')
+    .some((clause) => {
+      const [column, op, ...rest] = clause.split('.');
+      return op === 'eq' && row[column] === rest.join('.');
+    });
+}
+
 function matches(row: Row, filters: Filter[]): boolean {
-  return filters.every((f) => {
-    if (f.type === 'eq') return row[f.column!] === f.value;
-    if (f.type === 'gt') return String(row[f.column!]) > String(f.value);
-    if (f.type === 'in') return (f.value as unknown[]).includes(row[f.column!]);
-    // or: "a.eq.X,b.eq.Y" — the only shape the app sends.
-    return String(f.value)
-      .split(',')
-      .some((clause) => {
-        const [column, op, ...rest] = clause.split('.');
-        return op === 'eq' && row[column] === rest.join('.');
-      });
-  });
+  return filters.every((f) => matchesOne(row, f));
 }
 
 function withGenerated(table: string, row: Row): Row {
@@ -83,6 +111,8 @@ function createState() {
     session: null as FakeSession | null,
     isOwner: { data: true as unknown, error: null as unknown },
     listeners: [] as Array<(event: string, s: FakeSession | null) => void>,
+    /** Every realtime channel opened, with its last `on` config; `removed` once removeChannel ran. */
+    channels: [] as FakeChannelEntry[],
   };
 }
 
@@ -96,14 +126,19 @@ class Query implements PromiseLike<Result> {
   private filters: Filter[] = [];
   private orders: Array<{ column: string; ascending: boolean }> = [];
   private max: number | null = null;
+  private window: { from: number; to: number } | null = null;
+  private countMode: string | null = null;
+  private head = false;
   private shape: 'many' | 'single' | 'maybeSingle' = 'many';
 
   constructor(private readonly table: string) {}
 
-  select(columns: string) {
+  select(columns: string, options?: { count?: 'exact' | 'planned' | 'estimated'; head?: boolean }) {
     if (this.op === null) this.op = 'select';
     else this.returning = true;
     this.columns = columns;
+    this.countMode = options?.count ?? null;
+    this.head = options?.head ?? false;
     return this;
   }
   insert(payload: unknown) { this.op = 'insert'; this.payload = payload; return this; }
@@ -111,6 +146,9 @@ class Query implements PromiseLike<Result> {
   delete() { this.op = 'delete'; return this; }
   eq(column: string, value: unknown) { this.filters.push({ type: 'eq', column, value }); return this; }
   gt(column: string, value: unknown) { this.filters.push({ type: 'gt', column, value }); return this; }
+  lt(column: string, value: unknown) { this.filters.push({ type: 'lt', column, value }); return this; }
+  is(column: string, value: null | boolean) { this.filters.push({ type: 'is', column, value }); return this; }
+  not(column: string, op: string, value: unknown) { this.filters.push({ type: 'not', column, op, value }); return this; }
   in(column: string, value: unknown[]) { this.filters.push({ type: 'in', column, value }); return this; }
   or(value: string) { this.filters.push({ type: 'or', value }); return this; }
   order(column: string, options?: { ascending?: boolean }) {
@@ -118,6 +156,8 @@ class Query implements PromiseLike<Result> {
     return this;
   }
   limit(n: number) { this.max = n; return this; }
+  /** Rows `from` to `to`, both inclusive and zero-based, as PostgREST's Range header. */
+  range(from: number, to: number) { this.window = { from, to }; return this; }
   single() { this.shape = 'single'; return this; }
   maybeSingle() { this.shape = 'maybeSingle'; return this; }
   returns() { return this; }
@@ -148,8 +188,12 @@ class Query implements PromiseLike<Result> {
           return (x < y ? -1 : x > y ? 1 : 0) * (ascending ? 1 : -1);
         });
       }
+      const total = out.length;
+      if (this.window) out = out.slice(this.window.from, this.window.to + 1);
       // PostgREST's max_rows (supabase/config.toml): a select never returns more, asked or not.
       out = out.slice(0, Math.min(this.max ?? MAX_ROWS, MAX_ROWS));
+      if (this.head) return { data: null, error: null, count: this.countMode ? total : null };
+      if (this.countMode) return this.shaped(out, total);
     } else if (op === 'insert') {
       const list = Array.isArray(this.payload) ? (this.payload as Row[]) : [this.payload as Row];
       out = list.map((r) => withGenerated(this.table, r));
@@ -163,17 +207,49 @@ class Query implements PromiseLike<Result> {
     }
 
     if (op !== 'select' && !this.returning) return { data: null, error: null };
+    return this.shaped(out);
+  }
+
+  private shaped(out: Row[], count?: number): Result {
+    const withCount = (r: Result): Result => (count === undefined ? r : { ...r, count });
     const copies = out.map((r) => ({ ...r }));
-    if (this.shape === 'many') return { data: copies, error: null };
-    if (this.shape === 'maybeSingle') return { data: copies[0] ?? null, error: null };
+    if (this.shape === 'many') return withCount({ data: copies, error: null });
+    if (this.shape === 'maybeSingle') return withCount({ data: copies[0] ?? null, error: null });
     return copies.length === 1
-      ? { data: copies[0], error: null }
+      ? withCount({ data: copies[0], error: null })
       : { data: null, error: { message: 'JSON object requested, multiple (or no) rows returned' } };
   }
 }
 
+interface FakeChannel {
+  entry: FakeChannelEntry;
+  on(type: string, config: Record<string, unknown>, handler: (payload: unknown) => void): FakeChannel;
+  subscribe(callback?: (status: string) => void): FakeChannel;
+}
+
 const client = {
   from: (table: string) => new Query(table),
+  channel: (name: string): FakeChannel => {
+    const entry: FakeChannelEntry = { name, config: {}, handler: () => {}, removed: false };
+    state.channels.push(entry);
+    const channel: FakeChannel = {
+      entry,
+      on(_type, config, handler) {
+        entry.config = config;
+        entry.handler = handler;
+        return channel;
+      },
+      subscribe(callback) {
+        callback?.('SUBSCRIBED');
+        return channel;
+      },
+    };
+    return channel;
+  },
+  removeChannel: async (channel: FakeChannel) => {
+    channel.entry.removed = true;
+    return 'ok' as const;
+  },
   rpc: async (name: string, args?: unknown): Promise<Result> => {
     state.rpcCalls.push({ name, args });
     if (name === 'get_org_branding') return { data: { display_name: 'Example Org' }, error: null };

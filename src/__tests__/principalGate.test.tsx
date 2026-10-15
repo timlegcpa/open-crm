@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 // The shared fake, with the client RPC answerable per test (the shared one answers null).
@@ -19,6 +19,7 @@ vi.mock('@/lib/supabase', async () => {
 
 import { fake, type FakeSession } from '@/__tests__/fakeSupabase';
 import { App } from '@/App';
+import { sessionGeneration } from '@/features/messages/keySession';
 import { AuthProvider, useAuth } from '@/lib/auth';
 import { queryClient } from '@/lib/queryClient';
 
@@ -45,6 +46,21 @@ function asClient() {
 }
 
 const rpcNames = () => fake.state.rpcCalls.map((c) => c.name);
+
+// Load every lazy page these tests reach before the first one runs. A cold transform of a
+// page chunk under a busy machine outlasted findByText's wait; once loaded, a lazy page
+// resolves in a tick.
+beforeAll(async () => {
+  await Promise.all([
+    import('@/AuthenticatedApp'),
+    import('@/OwnerApp'),
+    import('@/PortalApp'),
+    import('@/pages/contacts/ContactsList'),
+    import('@/features/portal/PortalLayout'),
+    import('@/features/portal/pages/HomePage'),
+    import('@/features/portal/pages/ProfilePage'),
+  ]);
+}, 60_000);
 
 beforeEach(() => {
   fake.reset();
@@ -145,6 +161,18 @@ describe('the signed-in gate', () => {
     await authEvent('SIGNED_IN', CLIENT);
     expect(await screen.findByRole('navigation', { name: 'Portal' })).toBeInTheDocument();
     expect(queryClient.getQueryData(['probe'])).toBeUndefined();
+  });
+
+  it('locks the messages key when the signed-in principal changes', async () => {
+    fake.state.session = OWNER;
+    renderAt('/contacts');
+    await screen.findByText('Signed in as owner@example.com.');
+    const before = sessionGeneration();
+
+    asClient();
+    await authEvent('SIGNED_IN', CLIENT);
+    expect(await screen.findByRole('navigation', { name: 'Portal' })).toBeInTheDocument();
+    expect(sessionGeneration()).toBeGreaterThan(before);
   });
 
   it("never wipes a principal's first queries with the clear meant for the one before", async () => {

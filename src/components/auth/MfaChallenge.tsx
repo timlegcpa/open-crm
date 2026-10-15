@@ -1,4 +1,5 @@
-import { useState, type FormEvent } from 'react';
+import { Suspense, useState, type FormEvent } from 'react';
+import { lazyNamed } from '@/features/lazy';
 import { useAuth } from '@/lib/auth';
 import { getSupabase } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
@@ -6,9 +7,16 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 
-/** The second step for an account with an authenticator app: a six-digit code. */
+// Loaded only when someone asks for it: most sign-ins never need a backup code.
+const BackupCodeRecovery = lazyNamed(() => import('@/features/settings/BackupCodeRecovery'), 'BackupCodeRecovery');
+
+/**
+ * The second step for an account with an authenticator app: a six-digit code, or, for a
+ * lost authenticator, one of the backup codes saved when two-factor was turned on.
+ */
 export function MfaChallenge() {
   const { completeMfa, logout } = useAuth();
+  const [useBackup, setUseBackup] = useState(false);
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -51,6 +59,22 @@ export function MfaChallenge() {
     }
   };
 
+  if (useBackup) {
+    return (
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle>Backup code</CardTitle>
+          <CardDescription>Lost your authenticator? Enter one of your saved backup codes.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Suspense fallback={<p className="text-sm text-muted-foreground">Loading...</p>}>
+            <BackupCodeRecovery onCancel={() => setUseBackup(false)} />
+          </Suspense>
+        </CardContent>
+      </Card>
+    );
+  }
+
   return (
     <Card className="w-full max-w-sm">
       <CardHeader>
@@ -73,6 +97,9 @@ export function MfaChallenge() {
           {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
           <Button type="submit" disabled={busy || code.length !== 6}>
             {busy ? 'Checking...' : 'Verify'}
+          </Button>
+          <Button type="button" variant="link" className="self-center" disabled={busy} onClick={() => setUseBackup(true)}>
+            Use a backup code
           </Button>
           <Button type="button" variant="ghost" disabled={busy} onClick={() => void logout()}>
             Sign out

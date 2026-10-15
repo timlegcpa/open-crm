@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { contactDisplayName, listContacts } from '@/api/contacts';
+import { ChevronsUpDown, UserPlus, X } from 'lucide-react';
 import {
   addRelationship,
   listHousehold,
@@ -11,9 +11,12 @@ import {
   type RelationshipKind,
 } from '@/api/contactRelationships';
 import { queryKeys } from '@/api/queryKeys';
+import { ContactPicker } from '@/components/contacts/ContactPicker';
+import { Panel } from '@/components/layout/page';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { toast } from '@/components/ui/sonner';
 import {
   Dialog,
   DialogContent,
@@ -22,14 +25,20 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import type { ContactCandidate } from '@/hooks/useContactCandidates';
 import { getErrorMessage } from '@/lib/errors';
 
-const MAX_RESULTS = 20;
-
-/** Links to other contacts, in both directions, and a picker to add one. */
+/**
+ * People linked to this contact, in both directions, and a picker to link one.
+ *
+ * A link is an identity record and nothing more: it grants no access to anything. The card
+ * says so in visible copy, because the obvious reading of "link these two" is that their
+ * records are now shared, which is the opposite of what the schema does. Sharing is a
+ * separate, deliberate act wherever it exists. Never derive access from a row here.
+ */
 export function HouseholdPanel({ contactId }: { contactId: string }) {
   const queryClient = useQueryClient();
-  const links = useQuery({
+  const household = useQuery({
     queryKey: queryKeys.contactRelationships.forContact(contactId),
     queryFn: () => listHousehold(contactId),
   });
@@ -38,93 +47,112 @@ export function HouseholdPanel({ contactId }: { contactId: string }) {
   // A link shows on both contacts' records, so every household is stale, not just this one.
   const refresh = () => queryClient.invalidateQueries({ queryKey: queryKeys.contactRelationships.all });
 
-  const unlink = useMutation({ mutationFn: removeRelationship, onSettled: refresh });
+  const unlink = useMutation({
+    mutationFn: removeRelationship,
+    onError: (err) => toast.error(getErrorMessage(err, 'The link was not removed.')),
+    onSettled: refresh,
+  });
 
   return (
-    <section aria-labelledby="household-heading" className="flex flex-col gap-3">
-      <div className="flex items-center justify-between">
-        <h2 id="household-heading" className="text-base font-semibold">Household</h2>
-        <Button size="sm" variant="outline" onClick={() => setOpen(true)}>Link contact</Button>
+    <Panel
+      title="Household"
+      action={
+        <Button type="button" size="xs" variant="ghost" onClick={() => setOpen(true)}>
+          <UserPlus aria-hidden="true" />
+          Link a person
+        </Button>
+      }
+    >
+      <div className="flex flex-col gap-2 px-3.5 py-3 text-[13px]">
+        {household.isPending && <p className="text-muted-foreground">Loading household...</p>}
+        {household.isError && (
+          <p role="alert" className="text-destructive">Could not load household: {getErrorMessage(household.error)}</p>
+        )}
+        {household.data?.length === 0 && <p className="text-muted-foreground">No linked people.</p>}
+        {household.data && household.data.length > 0 && (
+          <ul className="flex flex-col gap-1">
+            {household.data.map((l) => (
+              <li key={l.id} className="flex min-w-0 items-center gap-2">
+                <span className="w-24 shrink-0 text-[12px] text-muted-foreground">{RELATIONSHIP_LABELS[l.relationship] ?? l.relationship}</span>
+                <Link to={`/contacts/${l.otherId}`} className="min-w-0 flex-1 truncate underline-offset-2 hover:underline">
+                  {l.otherName}
+                </Link>
+                {l.direction === 'incoming' && <span className="shrink-0 text-[11px] text-muted-foreground">from their record</span>}
+                <Button
+                  type="button"
+                  size="icon-xs"
+                  variant="ghost"
+                  aria-label={`Unlink ${l.otherName}`}
+                  disabled={unlink.isPending}
+                  onClick={() => void unlink.mutateAsync(l.id).catch(() => undefined)}
+                >
+                  <X aria-hidden="true" />
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-[11px] text-muted-foreground">A link records who someone is. It grants no access to anything.</p>
       </div>
-      {links.isPending && <p className="text-sm text-muted-foreground">Loading household...</p>}
-      {links.isError && <p role="alert" className="text-sm text-destructive">Could not load household: {getErrorMessage(links.error)}</p>}
-      {unlink.isError && <p role="alert" className="text-sm text-destructive">{getErrorMessage(unlink.error, 'The link was not removed.')}</p>}
-      {links.data?.length === 0 && <p className="text-sm text-muted-foreground">No linked contacts.</p>}
-      <ul className="flex flex-col gap-2">
-        {links.data?.map((l) => (
-          <li key={l.id} className="flex flex-wrap items-center gap-2 text-sm">
-            <span className="font-medium">{RELATIONSHIP_LABELS[l.relationship] ?? l.relationship}:</span>
-            <Link to={`/contacts/${l.otherId}`} className="underline">{l.otherName}</Link>
-            {l.direction === 'incoming' && <span className="text-muted-foreground">(linked from their record)</span>}
-            <Button size="xs" variant="ghost" disabled={unlink.isPending} onClick={() => unlink.mutate(l.id)}>
-              Unlink {l.otherName}
-            </Button>
-          </li>
-        ))}
-      </ul>
       {open && <LinkDialog contactId={contactId} onClose={() => setOpen(false)} onLinked={refresh} />}
-    </section>
+    </Panel>
   );
 }
 
 function LinkDialog({ contactId, onClose, onLinked }: { contactId: string; onClose: () => void; onLinked: () => void }) {
-  const contacts = useQuery({ queryKey: queryKeys.contacts.list(), queryFn: listContacts });
-  const [search, setSearch] = useState('');
-  const [picked, setPicked] = useState<string | null>(null);
+  const [picked, setPicked] = useState<ContactCandidate | null>(null);
   const [relationship, setRelationship] = useState<RelationshipKind>('spouse');
-
-  const results = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    return (contacts.data ?? [])
-      .filter((c) => c.id !== contactId)
-      .filter((c) => needle === '' || [c.full_name, c.business_name, c.email].filter(Boolean).join(' ').toLowerCase().includes(needle))
-      .slice(0, MAX_RESULTS);
-  }, [contacts.data, search, contactId]);
+  const [error, setError] = useState<string | null>(null);
 
   const link = useMutation({
-    mutationFn: () => addRelationship({ contactId, relatedContactId: picked!, relationship }),
-    onSuccess: () => {
+    mutationFn: (other: string) => addRelationship({ contactId, relatedContactId: other, relationship }),
+  });
+
+  const submit = async () => {
+    if (!picked) return;
+    setError(null);
+    try {
+      await link.mutateAsync(picked.id);
       onLinked();
       onClose();
-    },
-  });
+    } catch (err) {
+      setError(getErrorMessage(err, 'The link was not saved.'));
+    }
+  };
 
   return (
     <Dialog open onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="max-h-[90vh] overflow-y-auto">
+      <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>Link a contact</DialogTitle>
-          <DialogDescription>Find the other contact and choose how they are related.</DialogDescription>
+          <DialogTitle>Link a person</DialogTitle>
+          <DialogDescription>
+            This records who someone is on this record. It grants them no access to anything.
+          </DialogDescription>
         </DialogHeader>
-        <Input aria-label="Find a contact" placeholder="Search by name, business or email" value={search} onChange={(e) => setSearch(e.target.value)} />
-        {contacts.isPending && <p className="text-sm text-muted-foreground">Loading contacts...</p>}
-        {contacts.isError && <p role="alert" className="text-sm text-destructive">{getErrorMessage(contacts.error)}</p>}
-        <ul className="flex max-h-60 flex-col gap-1 overflow-y-auto" aria-label="Matching contacts">
-          {results.map((c) => (
-            <li key={c.id}>
-              <button
-                type="button"
-                aria-pressed={picked === c.id}
-                onClick={() => setPicked(c.id)}
-                className={`w-full rounded-md px-2 py-1 text-left text-sm hover:bg-accent ${picked === c.id ? 'bg-accent font-medium' : ''}`}
-              >
-                {contactDisplayName(c)}
-                {c.email && <span className="ml-2 text-muted-foreground">{c.email}</span>}
-              </button>
-            </li>
-          ))}
-          {contacts.data && results.length === 0 && <li className="text-sm text-muted-foreground">No matching contacts.</li>}
-        </ul>
-        <Select value={relationship} onValueChange={(v) => setRelationship(v as RelationshipKind)}>
-          <SelectTrigger aria-label="Relationship"><SelectValue /></SelectTrigger>
-          <SelectContent>
-            {RELATIONSHIP_KINDS.map((k) => <SelectItem key={k} value={k}>{RELATIONSHIP_LABELS[k]}</SelectItem>)}
-          </SelectContent>
-        </Select>
-        {link.isError && <p role="alert" className="text-sm text-destructive">{getErrorMessage(link.error, 'The link was not saved.')}</p>}
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
+            <Label id="link-person-label">Person</Label>
+            <ContactPicker onSelect={(c) => setPicked(c.id === contactId ? null : c)} selectedId={picked?.id ?? null}>
+              <Button type="button" variant="outline" aria-labelledby="link-person-label" className="w-full justify-between font-normal">
+                <span className="truncate">{picked ? picked.name : 'Choose a contact'}</span>
+                <ChevronsUpDown aria-hidden="true" className="opacity-60" />
+              </Button>
+            </ContactPicker>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="link-relationship">Relationship</Label>
+            <Select value={relationship} onValueChange={(v) => setRelationship(v as RelationshipKind)}>
+              <SelectTrigger id="link-relationship"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {RELATIONSHIP_KINDS.map((k) => <SelectItem key={k} value={k}>{RELATIONSHIP_LABELS[k]}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+          {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+        </div>
         <DialogFooter>
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button disabled={!picked || link.isPending} onClick={() => link.mutate()}>Link</Button>
+          <Button type="button" variant="outline" onClick={onClose}>Cancel</Button>
+          <Button type="button" disabled={!picked || link.isPending} onClick={() => void submit()}>Link</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

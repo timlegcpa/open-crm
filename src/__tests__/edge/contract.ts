@@ -147,6 +147,8 @@ export interface EdgeContractTarget {
   body: ContractBody;
   /** Default 'POST'. */
   method?: 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'GET';
+  /** The function's allowHeaders: request headers granted beyond the base four. */
+  allowHeaders?: readonly string[];
 }
 
 /** Every credential header swapped for a wrong value of the same shape. */
@@ -167,7 +169,7 @@ export function describeEdgeContract(t: EdgeContractTarget): void {
     it('answers a preflight from the allowed origin with a CORS grant', async () => {
       const res = await call({ method: 'OPTIONS', headers: { 'Access-Control-Request-Method': method } });
       expect(res.status).toBe(204);
-      expect(res.headers.get('Access-Control-Allow-Headers')).toBe('authorization, x-client-info, apikey, content-type');
+      expect(res.headers.get('Access-Control-Allow-Headers')).toBe(['authorization, x-client-info, apikey, content-type', ...(t.allowHeaders ?? [])].join(', '));
       expect(res.headers.get('Access-Control-Allow-Methods')?.split(', ')).toContain(method);
       expectEdgeHeaders(res);
     });

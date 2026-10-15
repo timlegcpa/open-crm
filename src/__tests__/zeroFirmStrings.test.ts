@@ -151,8 +151,9 @@ describe('zero firm strings', () => {
       if (bad.length) offenders.push(`${rel}: ${bad.join(', ')}`);
     }
     expect(offenders).toEqual([]);
-    // Reads every file in the tree; under a parallel vitest run it outlasts the 5 s default.
-  }, 30_000);
+    // Reads every file in the tree, dist/ included; under a full parallel vitest run on a busy
+    // machine it has taken close to 40 s (about 7 s alone). The limit bounds a hang, not the scan.
+  }, 120_000);
 
   it('the README names the author only inside its Author section', () => {
     const readme = readFileSync(path.join(ROOT, 'README.md'), 'utf8').replace(/\r\n/g, '\n');

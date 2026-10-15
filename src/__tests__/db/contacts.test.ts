@@ -31,7 +31,7 @@ const forger = user(FORGER, { appRole: 'admin' }); // signed in, no account, for
 const TABLES = [
   'contact_statuses', 'lead_sources', 'organization_types', 'service_types',
   'contacts', 'organizations', 'contact_emails', 'contact_notes', 'contact_relationships',
-  'contact_followups', 'contact_services', 'contact_upsells', 'client_portal_accounts',
+  'contact_services', 'contact_upsells', 'client_portal_accounts',
   'portal_invitations', 'client_activity_log', 'client_tasks', 'impersonation_sessions',
 ];
 
@@ -75,7 +75,6 @@ beforeAll(async () => {
     INSERT INTO public.contact_notes (contact_id, body) VALUES ('${CONTACT_A}', 'Called');
     INSERT INTO public.contact_relationships (contact_id, related_contact_id, relationship)
       VALUES ('${CONTACT_A}', '${CONTACT_B}', 'business_partner');
-    INSERT INTO public.contact_followups (contact_id, next_followup_date) VALUES ('${CONTACT_A}', '2030-01-01');
     INSERT INTO public.contact_services (contact_id, organization_id, service_type, state, cadence, amount)
       VALUES ('${CONTACT_A}', '${ORG_A}', 'retainer', 'accepted', 'monthly', 500);
     INSERT INTO public.contact_upsells (contact_id, title, service_type) VALUES ('${CONTACT_A}', 'Add a plan', 'annual_plan');
@@ -350,6 +349,27 @@ describe('portal activity', () => {
     expect(await insert('document_delete', '{"count":2}')).toMatch(/row-level security/);
     expect(await insert('document_delete', `{"filename":"${'y'.repeat(2000)}"}`)).toMatch(/row-level security/);
   });
+
+  it('retention removes activity older than three years, as the server only', async () => {
+    for (const who of [owner, clientB]) {
+      expect(await errorOf(db, who, 'SELECT public.cleanup_aged_client_activity()')).toMatch(/permission denied/);
+    }
+    const { removed, kept } = await session(db, service, async (tx) => {
+      await tx.exec(`
+        INSERT INTO public.client_activity_log (contact_id, action, details, created_at) VALUES
+          ('${CONTACT_B}', 'logout', '{"retention":"past"}', now() - interval '3 years 1 day'),
+          ('${CONTACT_B}', 'logout', '{"retention":"inside"}', now() - interval '3 years' + interval '1 day'),
+          ('${CONTACT_B}', 'logout', '{"retention":"recent"}', now());
+      `);
+      const [{ v }] = (await tx.query<{ v: unknown }>('SELECT public.cleanup_aged_client_activity() AS v')).rows;
+      const left = (await tx.query<{ r: string }>(
+        `SELECT details ->> 'retention' AS r FROM public.client_activity_log WHERE details ? 'retention' ORDER BY created_at`,
+      )).rows.map((row) => row.r);
+      return { removed: v, kept: left };
+    });
+    expect(removed).toEqual({ client_activity: 1 });
+    expect(kept).toEqual(['inside', 'recent']);
+  });
 });
 
 describe('email mirror', () => {
@@ -436,8 +456,9 @@ describe('quotes and businesses', () => {
 
   it('pick-list values are enforced by foreign key', async () => {
     expect(await errorOf(db, owner, `INSERT INTO public.contacts (first_name, source) VALUES ('x', 'nowhere')`)).toMatch(/foreign key/);
-    // A free portal tier and the two retired pipeline stages are not statuses here.
-    for (const retired of ['free_user', 'nurture', 'follow_up_later']) {
+    // A free portal tier and a retired pipeline stage are not statuses here (the exact
+    // stage list is pinned in "the pipeline is exactly these stages").
+    for (const retired of ['free_user', 'follow_up_later']) {
       expect(await errorOf(db, owner, `INSERT INTO public.contacts (first_name, status) VALUES ('x', $1)`, [retired]), retired).toMatch(/foreign key/);
     }
     expect(await errorOf(db, owner, `INSERT INTO public.contact_services (contact_id, service_type, state, cadence) VALUES ('${CONTACT_A}', 'not_a_service', 'proposed', 'annual')`)).toMatch(/foreign key/);
@@ -452,6 +473,12 @@ describe('the contact row', () => {
       ['client', 'Client'], ['one_time', 'One-time client'], ['former_client', 'Former client'], ['lost', 'Lost'],
       ['esign_signer', 'Signer only'],
     ]);
+  });
+
+  it('has no follow-up table: the CRM keeps no follow-up dates', async () => {
+    const { rows } = await db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pg_class WHERE relname = 'contact_followups'`);
+    expect(rows[0].n).toBe(0);
   });
 
   it('carries no date of birth, for the contact or a spouse', async () => {
@@ -514,6 +541,17 @@ describe('pick-lists', () => {
     }
   });
 
+  it('a colour is lowercase #rrggbb or nothing, on every pick-list, and every stage ships with one', async () => {
+    for (const t of ['contact_statuses', 'lead_sources', 'organization_types', 'service_types']) {
+      expect(await errorOf(db, service, `UPDATE public.${t} SET colour = 'red' WHERE key = (SELECT min(key) FROM public.${t})`), t).toMatch(/check constraint/);
+      expect(await errorOf(db, service, `UPDATE public.${t} SET colour = '#ABCDEF' WHERE key = (SELECT min(key) FROM public.${t})`), t).toMatch(/check constraint/);
+    }
+    expect(await errorOf(db, owner, `UPDATE public.contact_statuses SET colour = '#0a0b0c' WHERE key = 'hot'`)).toBeNull();
+    expect(await errorOf(db, owner, `UPDATE public.lead_sources SET colour = NULL WHERE key = 'referral'`)).toBeNull();
+    const unset = await as(db, service, `SELECT key FROM public.contact_statuses WHERE colour IS NULL`);
+    expect(unset).toEqual([]);
+  });
+
   it('a client cannot change organization types', async () => {
     expect(await as(db, clientA, `UPDATE public.organization_types SET label = 'x' RETURNING key`)).toEqual([]);
   });
@@ -559,6 +597,44 @@ describe('status history', () => {
     expect(hist.map((e) => e.status)).toEqual(['new_lead', 'active_lead']);
     expect(hist[0].changed_by).toBe(SYSTEM); // written by the server: the system actor
     expect(hist[1].changed_by).toBe(OWNER);
+  });
+
+  it('stamps client_since the first time a contact becomes a client, and never over a date', async () => {
+    const out = await session(db, service, async (tx) => {
+      const ins = async (status: string, since: string | null) =>
+        (await tx.query<{ id: string; client_since: string | null }>(
+          `INSERT INTO public.contacts (first_name, status, client_since) VALUES ('Zed', $1, $2) RETURNING id, client_since::text`,
+          [status, since])).rows[0];
+      const lead = await ins('new_lead', null);
+      const won = await ins('one_time', null);
+      const dated = await ins('client', '2020-02-02');
+      const today = (await tx.query<{ d: string }>('SELECT current_date::text AS d')).rows[0].d;
+      const promote = async (id: string, status: string) =>
+        (await tx.query<{ c: string | null }>(
+          `UPDATE public.contacts SET status = $2 WHERE id = $1 RETURNING client_since::text AS c`, [id, status])).rows[0].c;
+      const afterPromote = await promote(lead.id, 'client');
+      // A date cleared by hand stays cleared while the status holds.
+      await tx.query(`UPDATE public.contacts SET client_since = NULL WHERE id = $1`, [lead.id]);
+      const afterClear = (await tx.query<{ c: string | null }>(
+        `UPDATE public.contacts SET phone = '1' WHERE id = $1 RETURNING client_since::text AS c`, [lead.id])).rows[0].c;
+      const dropped = await promote(won.id, 'lost');
+      const leadStays = (await ins('hot', null)).client_since;
+      return { today, lead: lead.client_since, won: won.client_since, dated: dated.client_since, afterPromote, afterClear, dropped, leadStays };
+    });
+    expect(out.lead).toBeNull();
+    expect(out.leadStays).toBeNull();
+    expect(out.won).toBe(out.today);
+    expect(out.dated).toBe('2020-02-02');
+    expect(out.afterPromote).toBe(out.today);
+    expect(out.afterClear).toBeNull();
+    expect(out.dropped).toBe(out.today);
+  });
+
+  it('a client_since the caller sends is kept, so the owner’s local day wins', async () => {
+    const since = await session(db, owner, async (tx) =>
+      (await tx.query<{ c: string }>(
+        `INSERT INTO public.contacts (first_name, status, client_since) VALUES ('Lu', 'client', '2031-12-31') RETURNING client_since::text AS c`)).rows[0].c);
+    expect(since).toBe('2031-12-31');
   });
 
   it('the owner cannot write status history at all', async () => {

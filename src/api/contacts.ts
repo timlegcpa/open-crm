@@ -2,7 +2,7 @@ import { getSupabase } from '@/lib/supabase';
 import { fetchAllPaged, PAGE_SIZE } from '@/lib/pagedFetch';
 import { getErrorMessage } from '@/lib/errors';
 
-/** What the list screen shows and searches. */
+/** What a contact list, a picker and a search read. Every contact row carries at least this. */
 export interface ContactListRow {
   id: string;
   created_at: string;
@@ -17,6 +17,29 @@ export interface ContactListRow {
   source: string;
 }
 
+/**
+ * A quote: one `contact_services` row per (contact, organization or none, service type).
+ * PostgREST returns numeric(15,2) as a string, so `amount` is read through `num` or
+ * `toAmount`, never used as a number directly. NULL (and 0) means no price agreed yet.
+ */
+export interface ContactService {
+  id: string;
+  contact_id: string;
+  organization_id: string | null;
+  service_type: string;
+  state: 'proposed' | 'accepted';
+  cadence: 'monthly' | 'annual' | 'one_time';
+  amount: number | string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * A contact as every CRM screen holds it: the whole row the owner may see plus its quotes.
+ * The list carries the quotes because the board, the table's MRR, the pipeline figures, the
+ * right bar and the CSV all read them; a write returns the same shape, so merging it into
+ * the cached list never strips the quotes off a card.
+ */
 export interface Contact extends ContactListRow {
   updated_at: string;
   spouse_first_name: string | null;
@@ -29,6 +52,7 @@ export interface Contact extends ContactListRow {
   mailing_state: string | null;
   mailing_zip: string | null;
   client_since: string | null;
+  contact_services: ContactService[];
 }
 
 /** The name to show for a contact: the person, else the business. */
@@ -36,12 +60,17 @@ export function contactDisplayName(c: Pick<ContactListRow, 'full_name' | 'busine
   return c.full_name || c.business_name || 'Unnamed contact';
 }
 
-const LIST_COLUMNS =
-  'id, created_at, submitted_at, first_name, last_name, full_name, email, phone, business_name, status, source';
+export const CONTACT_SERVICE_COLUMNS =
+  'id, contact_id, organization_id, service_type, state, cadence, amount, created_at, updated_at';
 
-const DETAIL_COLUMNS =
-  `${LIST_COLUMNS}, updated_at, spouse_first_name, spouse_last_name, spouse_name, spouse_email, ` +
-  'spouse_phone, mailing_street, mailing_city, mailing_state, mailing_zip, client_since';
+/**
+ * Every column a CRM screen reads, and the quotes. Named, never `*`: a column added to the
+ * table later (a server-only one) does not reach the browser by default.
+ */
+const CONTACT_COLUMNS =
+  'id, created_at, updated_at, submitted_at, first_name, last_name, full_name, email, phone, business_name, ' +
+  'spouse_first_name, spouse_last_name, spouse_name, spouse_email, spouse_phone, mailing_street, mailing_city, ' +
+  `mailing_state, mailing_zip, status, source, client_since, contact_services(${CONTACT_SERVICE_COLUMNS})`;
 
 // Same pattern as supabase/functions/_shared/http.ts, so an id the browser accepts is
 // never refused by an edge function. src/__tests__/edge/uuidParity.test.ts pins it.
@@ -52,28 +81,35 @@ export function isUuid(value: string | undefined): value is string {
   return typeof value === 'string' && UUID.test(value);
 }
 
-/** Every contact, read in pages of 1,000 so the list is never silently cut short. */
-export function listContacts(): Promise<ContactListRow[]> {
-  return fetchAllPaged<ContactListRow>((afterId) => {
+/** A contact with no quotes has an empty array, never a missing one. */
+function withQuotes(row: Contact): Contact {
+  return Array.isArray(row.contact_services) ? row : { ...row, contact_services: [] };
+}
+
+/** Every contact with its quotes, read in pages of 1,000 so the list is never silently cut short. */
+export async function listContacts(): Promise<Contact[]> {
+  const rows = await fetchAllPaged<Contact>((afterId) => {
     let query = getSupabase()
       .from('contacts')
-      .select(LIST_COLUMNS)
+      .select(CONTACT_COLUMNS)
       .order('id', { ascending: true })
       .limit(PAGE_SIZE);
     if (afterId) query = query.gt('id', afterId);
-    return query.returns<ContactListRow[]>();
+    return query.returns<Contact[]>();
   });
+  return rows.map(withQuotes);
 }
 
-/** One contact, or null when no such row exists (or it is not visible). */
+/** One contact with its quotes, or null when it does not exist or is not visible. */
 export async function getContact(id: string): Promise<Contact | null> {
   const { data, error } = await getSupabase()
     .from('contacts')
-    .select(DETAIL_COLUMNS)
+    .select(CONTACT_COLUMNS)
     .eq('id', id)
+    .returns<Contact[]>()
     .maybeSingle();
   if (error) throw error;
-  return (data as Contact | null) ?? null;
+  return data ? withQuotes(data) : null;
 }
 
 export interface NewContact {
@@ -87,7 +123,11 @@ export interface NewContact {
   submitted_at: string | null;
 }
 
-/** Creates a contact from the intake form and returns its id. */
+/**
+ * Creates a contact from the intake and returns its id. Never sends `status_history`
+ * (the database writes it), `full_name` (generated) or `client_since` (the database
+ * stamps it, as a UTC day, when a contact is entered as a client).
+ */
 export async function createContact(input: NewContact): Promise<string> {
   const row = {
     first_name: input.first_name,
@@ -105,10 +145,11 @@ export async function createContact(input: NewContact): Promise<string> {
 }
 
 /**
- * The contact columns the Overview form may write. `email` and `spouse_email` are not
- * here: they mirror the default rows in contact_emails (a database trigger keeps both
- * in step), so they change only through the emails manager. `portal_sidebar_config`
- * is granted but has no screen yet.
+ * The contact columns the CRM may write. `email` and `spouse_email` are not here: they
+ * mirror the default rows in contact_emails (a database trigger keeps both in step), so
+ * they change only through the emails manager. `status_history` (trigger-owned),
+ * `full_name` and `spouse_name` (generated) are never written. `portal_sidebar_config`
+ * belongs to the portal's own panel.
  */
 export const CONTACT_PATCH_COLUMNS = [
   'submitted_at',
@@ -131,16 +172,36 @@ export const CONTACT_PATCH_COLUMNS = [
 export type ContactPatchColumn = (typeof CONTACT_PATCH_COLUMNS)[number];
 export type ContactPatch = Partial<Record<ContactPatchColumn, string | null>>;
 
-/** Writes only the allow-listed columns present in `patch`. Nothing else can ride along. */
-export async function updateContact(id: string, patch: ContactPatch): Promise<void> {
+/** NOT NULL with a '' default in the table: cleared means '', never null. */
+const NAME_COLUMNS: ReadonlySet<string> = new Set(['first_name', 'last_name']);
+
+/**
+ * The payload a patch becomes: allow-listed columns only, and a cleared field ('') stored
+ * as null, so a nullable text column never holds an empty string and a cleared date never
+ * fails as ''. The two name columns keep ''.
+ */
+export function contactPatchPayload(patch: ContactPatch): ContactPatch {
   const payload: ContactPatch = {};
   for (const column of CONTACT_PATCH_COLUMNS) {
-    if (Object.prototype.hasOwnProperty.call(patch, column)) payload[column] = patch[column] ?? null;
+    if (!Object.prototype.hasOwnProperty.call(patch, column)) continue;
+    const value = patch[column];
+    payload[column] = NAME_COLUMNS.has(column) ? (value ?? '') : value === '' || value == null ? null : value;
   }
-  if (Object.keys(payload).length === 0) return;
-  const { data, error } = await getSupabase().from('contacts').update(payload).eq('id', id).select('id');
+  return payload;
+}
+
+/**
+ * Writes the allow-listed columns present in `patch` and returns the saved row, quotes
+ * included, for the caller to merge into the cached list.
+ */
+export async function updateContact(id: string, patch: ContactPatch): Promise<Contact> {
+  const payload = contactPatchPayload(patch);
+  if (Object.keys(payload).length === 0) throw new Error('Nothing to save.');
+  const { data, error } = await getSupabase().from('contacts').update(payload).eq('id', id).select(CONTACT_COLUMNS);
   if (error) throw error;
-  if (!data || data.length === 0) throw new Error('This contact was not saved. It may have been deleted.');
+  const rows = (data ?? []) as unknown as Contact[];
+  if (rows.length === 0) throw new Error('This contact was not saved. It may have been deleted.');
+  return withQuotes(rows[0]);
 }
 
 /** Ids per request: a long `in.(...)` filter is a long URL. */
@@ -148,25 +209,36 @@ const BULK_CHUNK = 100;
 
 export interface BulkStatusResult {
   requested: number;
+  /** Contacts the server says it wrote. */
   updated: number;
+  /** Every selected id the server did not return as written (refused, gone, or never sent after a failure). */
+  failedIds: string[];
   /** Set when a request failed; earlier chunks may already have been written. */
   error: string | null;
 }
 
-/** Sets the status of many contacts. Writes `status` and nothing else. */
-export async function bulkUpdateStatus(ids: string[], status: string): Promise<BulkStatusResult> {
-  let updated = 0;
+/**
+ * Sets the status of many contacts. Every selected row is written, whatever the cache
+ * says its status is, and only the ids the server returns count as updated: a row that
+ * is gone or out of reach comes back as failed. A row already at the target gets no new
+ * history entry (the database records history only on a change). client_since is the
+ * database's to stamp (see statusChangePatch).
+ */
+export async function bulkUpdateStatus(ids: readonly string[], status: string): Promise<BulkStatusResult> {
+  const written = new Set<string>();
+  let error: string | null = null;
   for (let i = 0; i < ids.length; i += BULK_CHUNK) {
     const chunk = ids.slice(i, i + BULK_CHUNK);
-    const { data, error } = await getSupabase()
-      .from('contacts')
-      .update({ status })
-      .in('id', chunk)
-      .select('id');
-    if (error) return { requested: ids.length, updated, error: getErrorMessage(error, 'The status change failed.') };
-    updated += data?.length ?? 0;
+    const result = await getSupabase().from('contacts').update({ status }).in('id', chunk).select('id');
+    if (result.error) {
+      error = getErrorMessage(result.error, 'The status change failed.');
+      break;
+    }
+    for (const row of (result.data ?? []) as Array<{ id: string }>) written.add(row.id);
   }
-  return { requested: ids.length, updated, error: null };
+  const failedIds = ids.filter((id) => !written.has(id));
+  if (!error && failedIds.length > 0) error = 'Some contacts were not changed. They may have been deleted.';
+  return { requested: ids.length, updated: ids.length - failedIds.length, failedIds, error };
 }
 
 const DELETE_IN_PROGRESS_MESSAGE = 'This contact is already being deleted. Try again in a moment.';

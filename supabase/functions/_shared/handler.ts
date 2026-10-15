@@ -12,6 +12,11 @@
 //        client    bearer token, authorizeClient
 //        cron      x-cron-secret against CRON_SHARED_SECRET, constant time
 //        internal  a named header against a named secret, constant time
+//        apiKey    a server-to-server key (x-api-key, or Authorization with or without
+//                  "Bearer"), checked by the function's own verify(presented). Wrong or
+//                  missing: 401. A verify that throws: 503 (it could not check), never
+//                  allowed. Stands alone and must declare a rate limit, which runs after
+//                  the key, so a flood of wrong keys never spends a bucket entry.
 //        public    no Supabase principal. The function proves the caller itself inside
 //                  handle (a signed link, a webhook signature, an API key, an OAuth
 //                  token) and must declare a rate limit, which runs before that proof.
@@ -26,13 +31,23 @@
 //   7. The body, capped while streaming: 413 over the cap, 400 for a malformed JSON
 //      body or form.
 //   8. handle(ctx). Its Response is returned with the CORS and security headers and
-//      Vary: Origin merged in; an HttpError becomes its own status and public message;
-//      anything else thrown becomes a generic 500. No internal message ever reaches a
-//      response body.
+//      Vary: Origin merged in, and a JSON body is always labelled application/json (a
+//      Response built from a string defaults to text/plain); an HttpError becomes its own
+//      status and public message; anything else thrown becomes a generic 500. No internal
+//      message ever reaches a response body.
 //
 // Every response, errors included, carries Vary: Origin and the security headers.
 
-import { BodyError, bearerToken, originRefused, readBodyBytes, readFormBody, readJsonBody, responseHeaders } from './http.ts';
+import {
+  BodyError,
+  bearerToken,
+  originRefused,
+  presentedApiKey,
+  readBodyBytes,
+  readFormBody,
+  readJsonBody,
+  responseHeaders,
+} from './http.ts';
 import { MAX_TOKEN_LENGTH, type AuthOutcome, type ClientPrincipal, type OwnerPrincipal } from './auth.ts';
 import { CRON_SECRET_HEADER, verifyCronSecret, verifyInternalSecret } from './secrets.ts';
 import { getClientIp, type RateLimitOutcome } from './rate-limit.ts';
@@ -46,10 +61,13 @@ export interface CronPrincipal {
 export interface InternalPrincipal {
   kind: 'internal';
 }
+export interface ApiKeyPrincipal {
+  kind: 'apiKey';
+}
 export interface PublicPrincipal {
   kind: 'public';
 }
-export type Principal = OwnerPrincipal | ClientPrincipal | CronPrincipal | InternalPrincipal | PublicPrincipal;
+export type Principal = OwnerPrincipal | ClientPrincipal | CronPrincipal | InternalPrincipal | ApiKeyPrincipal | PublicPrincipal;
 
 export interface AuthModes {
   owner?: (token: string) => Promise<AuthOutcome<OwnerPrincipal>>;
@@ -58,6 +76,8 @@ export interface AuthModes {
   cron?: { secret: string | null | undefined };
   /** A function-to-function secret, e.g. { header: 'x-internal-secret', secret: env MCP_INTERNAL_SECRET }. */
   internal?: { header: string; secret: string | null | undefined };
+  /** A server-to-server key. verify answers whether `presented` is the live key; a throw is 503. */
+  apiKey?: { verify(presented: string): Promise<boolean> };
   public?: true;
 }
 
@@ -67,6 +87,7 @@ type Union<A extends AuthModes> =
   | (A extends { client: Fn } ? ClientPrincipal : never)
   | (A extends { cron: object } ? CronPrincipal : never)
   | (A extends { internal: object } ? InternalPrincipal : never)
+  | (A extends { apiKey: object } ? ApiKeyPrincipal : never)
   | (A extends { public: true } ? PublicPrincipal : never);
 /** The principals a handler with these modes can see. */
 export type PrincipalFor<A extends AuthModes> = [Union<A>] extends [never] ? Principal : Union<A>;
@@ -112,7 +133,9 @@ export interface HandlerOptions<A extends AuthModes, K extends BodyKind> {
   /** Refuse the owner's View-as-client session (a client write function). Required with
    *  auth.client, so a client function cannot forget to decide. */
   clientWrites?: boolean;
-  /** Runs after auth, before the body. Required with auth.public. */
+  /** Request headers the function's protocol needs in the CORS grant, beyond BASE_ALLOW_HEADERS. Lowercase. */
+  allowHeaders?: readonly string[];
+  /** Runs after auth, before the body. Required with auth.public and auth.apiKey. */
   rateLimit?: (ctx: RequestContext<PrincipalFor<A>>) => Promise<RateLimitOutcome>;
   /** Default 'json'. */
   body?: K;
@@ -178,10 +201,16 @@ export function createHandler<A extends AuthModes, K extends BodyKind = 'json'>(
   const newRequestId = options.newRequestId ?? (() => crypto.randomUUID());
 
   // Misconfiguration fails at startup, never as an open door at request time.
-  const modes = (['owner', 'client', 'cron', 'internal', 'public'] as const).filter((m) => auth[m]);
+  const modes = (['owner', 'client', 'cron', 'internal', 'apiKey', 'public'] as const).filter((m) => auth[m]);
   if (modes.length === 0) throw new Error(`${options.name}: declare at least one auth mode`);
   if (auth.public && modes.length > 1) throw new Error(`${options.name}: public cannot be combined with another mode`);
   if (auth.public && !options.rateLimit) throw new Error(`${options.name}: a public function must declare rateLimit`);
+  if (auth.apiKey && modes.length > 1) throw new Error(`${options.name}: apiKey cannot be combined with another mode`);
+  if (auth.apiKey && !options.rateLimit) throw new Error(`${options.name}: an apiKey function must declare rateLimit`);
+  const allowHeaders = options.allowHeaders ?? [];
+  if (allowHeaders.some((h) => !/^[a-z0-9-]+$/.test(h))) {
+    throw new Error(`${options.name}: allowHeaders must be lowercase header names`);
+  }
   if (options.clientWrites && !auth.client) throw new Error(`${options.name}: clientWrites needs the client mode`);
   if (auth.client && options.clientWrites === undefined) {
     throw new Error(`${options.name}: a client function must declare clientWrites`);
@@ -195,7 +224,7 @@ export function createHandler<A extends AuthModes, K extends BodyKind = 'json'>(
   return async (req: Request): Promise<Response> => {
     const requestId = newRequestId();
     const log = createLogger(options.name, { requestId, sink: options.logSink });
-    const headers = () => responseHeaders(req, options.allowedOrigins, methods);
+    const headers = () => responseHeaders(req, options.allowedOrigins, methods, allowHeaders);
     const json = (status: number, body: unknown): Response =>
       new Response(JSON.stringify(body), { status, headers: headers() });
     const refuse = (r: Refusal, extra: Record<string, string> = {}): Response =>
@@ -247,7 +276,7 @@ export function createHandler<A extends AuthModes, K extends BodyKind = 'json'>(
       }
 
       const res = await options.handle({ ...base, body: body as BodyFor<K>, json });
-      return withHeaders(res, headers());
+      return await withHeaders(res, headers());
     } catch (err) {
       if (err instanceof HttpError && err.status >= 400 && err.status <= 599) {
         return json(err.status, err.code ? { error: err.publicMessage, code: err.code } : { error: err.publicMessage });
@@ -260,6 +289,18 @@ export function createHandler<A extends AuthModes, K extends BodyKind = 'json'>(
 
 async function authenticate(req: Request, auth: AuthModes, log: Logger): Promise<Authenticated | Refusal> {
   if (auth.public) return { principal: { kind: 'public' }, token: null };
+  if (auth.apiKey) {
+    const presented = presentedApiKey(req);
+    if (!presented) return REFUSALS.unauthenticated;
+    let ok: boolean;
+    try {
+      ok = await auth.apiKey.verify(presented);
+    } catch (err) {
+      log.error('the key could not be checked; refusing', err);
+      return REFUSALS.unavailable;
+    }
+    return ok === true ? { principal: { kind: 'apiKey' }, token: null } : REFUSALS.unauthenticated;
+  }
 
   // A secret header, when present, decides on its own: a wrong one is refused, not
   // retried as something else.
@@ -308,13 +349,34 @@ async function readBody(req: Request, kind: BodyKind, maxBytes: number): Promise
   }
 }
 
+/** A body that is JSON text: an object or an array that parses. */
+function isJsonText(text: string): boolean {
+  const start = text.trimStart()[0];
+  if (start !== '{' && start !== '[') return false;
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The function's own Response, with the CORS and security headers and Vary merged in.
  * CORS is decided here alone: any Access-Control-* header the function set is dropped,
  * so a stray wildcard cannot outlive the origin check. The function's Content-Type wins
- * (set one for anything that is not JSON).
+ * (set one for anything that is not JSON), with one exception: a body that carries only
+ * the platform's default label, exactly `text/plain;charset=UTF-8` (any case), and is a
+ * JSON object or array goes out as application/json. `new Response(JSON.stringify(x))`
+ * gets that default, and a client that checks the type (an MCP connector, a fetch
+ * wrapper) would then refuse a correct answer. A text/plain the function set itself, in
+ * any other spelling, is its choice and stays. When the body is rebuilt, any
+ * Content-Length the function set is dropped: the platform measures the new body.
  */
-function withHeaders(res: Response, ours: Record<string, string>): Response {
+/** What a Response built from a string is labelled when the function sets no type. */
+const PLATFORM_DEFAULT_TYPE = 'text/plain;charset=utf-8';
+
+async function withHeaders(res: Response, ours: Record<string, string>): Promise<Response> {
   const merged = new Headers(res.headers);
   for (const key of [...merged.keys()]) {
     if (key.startsWith('access-control-')) merged.delete(key);
@@ -323,5 +385,12 @@ function withHeaders(res: Response, ours: Record<string, string>): Response {
     if (key === 'Content-Type' && merged.has('Content-Type')) continue;
     merged.set(key, value);
   }
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: merged });
+  let body: BodyInit | null = res.body;
+  if (res.body && (merged.get('Content-Type') ?? '').toLowerCase() === PLATFORM_DEFAULT_TYPE) {
+    const text = await res.text();
+    if (isJsonText(text)) merged.set('Content-Type', 'application/json');
+    merged.delete('Content-Length');
+    body = text;
+  }
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: merged });
 }

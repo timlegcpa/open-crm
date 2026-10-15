@@ -145,3 +145,23 @@ export function supabaseClients<C>(
       createClient(config.supabaseUrl, config.anonKey, { auth, global: { headers: { Authorization: `Bearer ${token}` } } }),
   };
 }
+
+/**
+ * The aal and iat claims of an access token. Reads the payload without checking the
+ * signature, so call it only on a token Auth has already accepted (the handler's
+ * authorizers do that first). A claim that is missing or malformed is null.
+ */
+export function jwtAssurance(token: string): { aal: string | null; iat: number | null } {
+  const part = token.replace(/^Bearer\s+/i, '').split('.')[1];
+  if (!part) return { aal: null, iat: null };
+  try {
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    const payload = JSON.parse(atob(b64.padEnd(Math.ceil(b64.length / 4) * 4, '='))) as { aal?: unknown; iat?: unknown };
+    return {
+      aal: typeof payload.aal === 'string' ? payload.aal : null,
+      iat: typeof payload.iat === 'number' && Number.isInteger(payload.iat) ? payload.iat : null,
+    };
+  } catch {
+    return { aal: null, iat: null };
+  }
+}

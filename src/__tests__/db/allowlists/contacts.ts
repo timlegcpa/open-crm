@@ -11,5 +11,6 @@ export const allowlist: DomainAllowlist = {
     'admin_contact_delete_begin(uuid)', 'admin_contact_delete_release(uuid,jsonb,uuid,uuid[])',
     'admin_delete_contact(uuid,uuid)', 'is_impersonation_session(uuid,uuid)',
     'revoke_impersonation_auth_session(uuid)', 'auto_end_stale_impersonation_sessions()',
+    'cleanup_aged_client_activity()',
   ],
 };

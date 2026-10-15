@@ -18,8 +18,8 @@ import type { RouteObject } from 'react-router-dom';
  *   tab paths are ABSOLUTE ('/documents'). Every nav path must match a route.
  * - Routes use `element` (and `children`), never `lazy`, `loader` or `action`: the app
  *   renders through useRoutes, where those data-router fields do nothing.
- * - Keys (contact tabs, header actions, side panels, settings sections, home cards) and paths
- *   are unique across features.
+ * - Keys (contact tabs, header actions, side panels, activity cards, settings sections, home
+ *   cards, portal profile sections) and paths are unique across features.
  * - An owner route whose page lays out its own scrolling sets `handle: BOUNDED_PAGE`.
  * - A public page module lives under src/features/<id>/public/ (the build names its chunk
  *   `public-*`, and bundleBoundary.test.ts proves it never loads supabase-js).
@@ -118,6 +118,18 @@ export interface ContactSidePanel {
   Component: LazyComponent<ContactTabProps>;
 }
 
+/**
+ * A card on the contact record's Activity tab, below the portal activity feed (the group
+ * emails a contact was sent), contributed by the feature that owns its data. It draws its
+ * own Panel and returns null when it has nothing to show.
+ */
+export interface ContactActivityCard {
+  /** Unique across features. */
+  key: string;
+  order: number;
+  Component: LazyComponent<ContactTabProps>;
+}
+
 /** A section of Settings (/settings/<key>), contributed by the feature that owns the setting. */
 export interface SettingsSection {
   /** The URL segment; unique across features. */
@@ -129,6 +141,19 @@ export interface SettingsSection {
 
 /** A card on the client portal's Home page, contributed by the feature that owns its data. */
 export interface PortalHomeCard {
+  key: string;
+  order: number;
+  Component: LazyComponent;
+}
+
+/**
+ * A section of the client portal's Profile page (two-factor sign-in), contributed by the
+ * feature that owns it. It draws its own Panel and acts on whoever is signed in. The page
+ * leaves every section out during View as client: the owner must not change a client's
+ * sign-in.
+ */
+export interface PortalProfileSection {
+  /** Unique across features. */
   key: string;
   order: number;
   Component: LazyComponent;
@@ -148,11 +173,13 @@ export interface FeatureManifest {
   /** The portal's frame (header, tabs, banners) around every portal page; renders <Outlet />. One feature provides it. */
   portalLayout?: LazyComponent<ShellProps>;
   portalHomeCards?: PortalHomeCard[];
+  portalProfileSections?: PortalProfileSection[];
   /** Routes that need no session ('sign/*', 'unsubscribe'). Relative paths, lazy pages under ./public/. */
   publicRoutes?: RouteObject[];
   contactTabs?: ContactTab[];
   contactHeaderActions?: ContactHeaderAction[];
   contactSidePanels?: ContactSidePanel[];
+  contactActivityCards?: ContactActivityCard[];
   settingsSections?: SettingsSection[];
 }
 

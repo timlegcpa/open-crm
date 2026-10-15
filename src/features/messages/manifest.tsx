@@ -1,20 +1,28 @@
 import { MessageSquare } from 'lucide-react';
 import { lazyNamed } from '@/features/lazy';
-import type { FeatureManifest } from '@/features/types';
+import { BOUNDED_PAGE, type FeatureManifest } from '@/features/types';
 
+// Owner screens, the portal page and the badges are separate chunks: a badge in the
+// sidebar must not pull the conversation screens in with it, and the portal never loads
+// the owner's code.
 const MessagesPage = lazyNamed(() => import('./pages'), 'MessagesPage');
 const ConversationPage = lazyNamed(() => import('./pages'), 'ConversationPage');
-const PortalMessagesPage = lazyNamed(() => import('./pages'), 'PortalMessagesPage');
 const MessagesTab = lazyNamed(() => import('./pages'), 'MessagesTab');
+const EncryptionSettings = lazyNamed(() => import('./settings'), 'EncryptionSettings');
+const OwnerUnreadBadge = lazyNamed(() => import('./badges'), 'OwnerUnreadBadge');
+const ContactUnreadBadge = lazyNamed(() => import('./badges'), 'ContactUnreadBadge');
+const PortalMessagesPage = lazyNamed(() => import('./portal'), 'PortalMessagesPage');
+const PortalUnreadBadge = lazyNamed(() => import('./portal'), 'PortalUnreadBadge');
 
 export const manifest: FeatureManifest = {
   id: 'messages',
-  ownerNav: [{ label: 'Messages', icon: MessageSquare, path: '/messages', order: 40, section: 'workflow' }],
+  ownerNav: [{ label: 'Messages', icon: MessageSquare, path: '/messages', order: 40, section: 'workflow', badge: OwnerUnreadBadge }],
   ownerRoutes: [
     { path: 'messages', element: <MessagesPage /> },
-    { path: 'messages/:contactId', element: <ConversationPage /> },
+    { path: 'messages/:contactId', element: <ConversationPage />, handle: BOUNDED_PAGE },
   ],
-  portalTabs: [{ label: 'Messages', icon: MessageSquare, path: '/portal/messages', order: 30 }],
+  portalTabs: [{ label: 'Messages', icon: MessageSquare, path: '/portal/messages', order: 30, badge: PortalUnreadBadge }],
   portalRoutes: [{ path: 'messages', element: <PortalMessagesPage /> }],
-  contactTabs: [{ key: 'messages', label: 'Messages', order: 40, Component: MessagesTab }],
+  contactTabs: [{ key: 'messages', label: 'Messages', order: 40, Component: MessagesTab, badge: ContactUnreadBadge }],
+  settingsSections: [{ key: 'messages', label: 'Secure messages', order: 50, Component: EncryptionSettings }],
 };

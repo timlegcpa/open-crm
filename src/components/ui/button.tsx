@@ -37,7 +37,7 @@ const buttonVariants = cva(
         // those two differ by 2px and nobody notices; the admin theme set
         // `--radius: 0.75rem` from 2026-08 to 2026-09-18 (now 0.5rem, authored
         // in scripts/tweakcn-theme.css), which made `rounded-md` 10px and left
-        // `rounded` at 4px — a gap that rendered a row's Finalize button as a
+        // `rounded` at 4px: a gap that rendered a row's Finalize button as a
         // different SHAPE from the toolbar's Finalize All right above it (first
         // seen at the export's original 1.3rem, where the gap was 14.8px). A
         // theme may move `--radius` again; the rule below is what holds.

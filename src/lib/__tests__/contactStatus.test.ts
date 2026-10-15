@@ -12,10 +12,12 @@ import {
   STORED_STATUSES,
   SYSTEM_STATUSES,
   TERMINAL_STATUSES,
+  WON_STATUSES,
   isActivePipelineStatus,
   isClientLike,
   isEmailableStatus,
   isTerminalStatus,
+  isWonStatus,
 } from '@/lib/contactStatus';
 
 const MIGRATION = path.resolve(__dirname, '..', '..', '..', 'supabase', 'migrations', '0002_contacts.sql');
@@ -49,7 +51,7 @@ describe('contact-status taxonomy', () => {
 
   it('every set is a subset of STORED', () => {
     const stored = new Set<string>(STORED_STATUSES);
-    for (const set of [LEAD_LIKE_STATUSES, PIPELINE_STATUSES, CLIENT_LIKE_STATUSES, ACTIVE_PIPELINE_STATUSES, EMAILABLE_STATUSES, TERMINAL_STATUSES]) {
+    for (const set of [LEAD_LIKE_STATUSES, PIPELINE_STATUSES, CLIENT_LIKE_STATUSES, ACTIVE_PIPELINE_STATUSES, EMAILABLE_STATUSES, TERMINAL_STATUSES, WON_STATUSES]) {
       expect(set.filter((s) => !stored.has(s))).toEqual([]);
     }
   });
@@ -85,5 +87,11 @@ describe('contact-status taxonomy', () => {
     expect(isClientLike('client')).toBe(true);
     expect(isClientLike('one_time')).toBe(true);
     expect(isClientLike('former_client')).toBe(false);
+  });
+
+  it('won is client-like plus a client who left, and never a lead that did not pay', () => {
+    expect(sorted(WON_STATUSES)).toEqual(sorted([...CLIENT_LIKE_STATUSES, 'former_client']));
+    for (const s of STORED_STATUSES) expect([s, isWonStatus(s)]).toEqual([s, (WON_STATUSES as readonly string[]).includes(s)]);
+    for (const s of ['lost', 'cold', ...LEAD_LIKE_STATUSES, ...SYSTEM_STATUSES]) expect([s, isWonStatus(s)]).toEqual([s, false]);
   });
 });

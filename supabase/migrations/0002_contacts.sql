@@ -15,6 +15,9 @@
 -- ---------------------------------------------------------------------------
 -- Pick-lists. Labels, colours and order are the owner's to edit; keys never change.
 -- System rows are ones the code depends on: they can be relabelled, not deleted.
+-- A colour is lowercase #rrggbb (what a colour input emits) or NULL, which renders muted.
+-- Screens paint it as a dot or a tint beside text in the theme's own colour, never as
+-- the text itself: a hex picked in light mode can be unreadable in dark mode.
 -- ---------------------------------------------------------------------------
 
 -- The pipeline. Code branches on these keys, so the set is fixed; only the labels move.
@@ -27,7 +30,7 @@
 CREATE TABLE public.contact_statuses (
   key text PRIMARY KEY,
   label text NOT NULL CHECK (char_length(label) BETWEEN 1 AND 60),
-  colour text,
+  colour text CHECK (colour IS NULL OR colour ~ '^#[0-9a-f]{6}$'),
   sort_order integer NOT NULL DEFAULT 0
 );
 
@@ -43,10 +46,21 @@ INSERT INTO public.contact_statuses (key, label, sort_order) VALUES
   ('lost', 'Lost', 90),
   ('esign_signer', 'Signer only', 100);
 
+-- Each stage's starting colour (the owner changes it in Settings). Drawn as a dot or a faint
+-- tint only, never as text colour.
+UPDATE public.contact_statuses AS s
+SET colour = v.colour
+FROM (VALUES
+  ('new_lead', '#2563eb'), ('active_lead', '#7c3aed'), ('hot', '#dc2626'), ('warm', '#d97706'),
+  ('cold', '#0891b2'), ('client', '#16a34a'), ('one_time', '#0d9488'), ('former_client', '#78716c'),
+  ('lost', '#71717a'), ('esign_signer', '#a1a1aa')
+) AS v (key, colour)
+WHERE s.key = v.key;
+
 CREATE TABLE public.lead_sources (
   key text PRIMARY KEY CHECK (key ~ '^[a-z][a-z0-9_]{0,39}$'),
   label text NOT NULL CHECK (char_length(label) BETWEEN 1 AND 60),
-  colour text,
+  colour text CHECK (colour IS NULL OR colour ~ '^#[0-9a-f]{6}$'),
   sort_order integer NOT NULL DEFAULT 0,
   is_active boolean NOT NULL DEFAULT true,
   is_system boolean NOT NULL DEFAULT false
@@ -66,7 +80,7 @@ INSERT INTO public.lead_sources (key, label, sort_order, is_system) VALUES
 CREATE TABLE public.organization_types (
   key text PRIMARY KEY CHECK (key ~ '^[a-z][a-z0-9_]{0,39}$'),
   label text NOT NULL CHECK (char_length(label) BETWEEN 1 AND 60),
-  colour text,
+  colour text CHECK (colour IS NULL OR colour ~ '^#[0-9a-f]{6}$'),
   sort_order integer NOT NULL DEFAULT 0,
   is_active boolean NOT NULL DEFAULT true,
   is_system boolean NOT NULL DEFAULT false
@@ -85,7 +99,7 @@ INSERT INTO public.organization_types (key, label, sort_order, is_system) VALUES
 CREATE TABLE public.service_types (
   key text PRIMARY KEY CHECK (key ~ '^[a-z][a-z0-9_]{0,39}$'),
   label text NOT NULL CHECK (char_length(label) BETWEEN 1 AND 60),
-  colour text,
+  colour text CHECK (colour IS NULL OR colour ~ '^#[0-9a-f]{6}$'),
   sort_order integer NOT NULL DEFAULT 0,
   is_active boolean NOT NULL DEFAULT true,
   is_system boolean NOT NULL DEFAULT false,
@@ -215,12 +229,24 @@ CREATE TRIGGER trg_contacts_updated_at
 
 -- History comes from OLD, never NEW: a caller's own write to status_history is dropped
 -- on INSERT and on UPDATE alike.
+--
+-- client_since: the first time a contact becomes a client (client or one_time) and the
+-- STORED date is null, it is stamped here. This is the only place the date is computed:
+-- the decision reads the row being written, never a caller's cached copy, so a date
+-- already set is never overwritten. The value is current_date, which is the UTC day (an
+-- evening win west of Greenwich reads as tomorrow). A date the owner sets explicitly is
+-- kept; one the owner clears stays cleared until the status changes again.
 CREATE FUNCTION public.contacts_record_status()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 BEGIN
+  IF NEW.status IN ('client', 'one_time') AND NEW.client_since IS NULL
+     AND (TG_OP = 'INSERT' OR NEW.status IS DISTINCT FROM OLD.status) THEN
+    NEW.client_since := current_date;
+  END IF;
+
   IF TG_OP = 'INSERT' THEN
     NEW.status_history := jsonb_build_array(jsonb_build_object(
       'status', NEW.status, 'timestamp', now(), 'changed_by', public.audit_actor()));
@@ -315,25 +341,6 @@ CREATE TABLE public.contact_relationships (
 );
 
 CREATE INDEX idx_contact_relationships_related ON public.contact_relationships (related_contact_id);
-
--- At most one open follow-up per contact.
-CREATE TABLE public.contact_followups (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  contact_id uuid NOT NULL UNIQUE REFERENCES public.contacts (id) ON DELETE CASCADE,
-  next_followup_date date,
-  reason text CHECK (char_length(COALESCE(reason, '')) <= 2000),
-  private_note text CHECK (char_length(COALESCE(private_note, '')) <= 5000),
-  created_by uuid REFERENCES auth.users (id) ON DELETE SET NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_contact_followups_due
-  ON public.contact_followups (next_followup_date) WHERE next_followup_date IS NOT NULL;
-
-CREATE TRIGGER trg_contact_followups_updated_at
-  BEFORE UPDATE ON public.contact_followups
-  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
 -- Quotes: one row per (contact, business or none, service).
 CREATE TABLE public.contact_services (
@@ -913,6 +920,24 @@ BEGIN
 END;
 $$;
 
+-- Server only: portal activity older than three years, the same horizon as the audit log.
+-- SECURITY INVOKER: it runs as the server (service_role, which may delete these rows), so
+-- it grants nothing the caller did not already have. The job-runner calls it in the
+-- ops:maintenance kind (supabase/functions/job-runner/kinds.ts).
+CREATE FUNCTION public.cleanup_aged_client_activity()
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_client_activity integer;
+BEGIN
+  DELETE FROM public.client_activity_log WHERE created_at < now() - interval '3 years';
+  GET DIAGNOSTICS v_client_activity = ROW_COUNT;
+  RETURN jsonb_build_object('client_activity', v_client_activity);
+END;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Contact delete: a claim protocol, because deleting a contact also destroys its
 -- portal logins (in auth, outside this transaction). The server calls begin, deletes
@@ -1150,7 +1175,6 @@ ALTER TABLE public.organizations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.contact_emails ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.contact_notes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.contact_relationships ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.contact_followups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.contact_services ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.contact_upsells ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.client_portal_accounts ENABLE ROW LEVEL SECURITY;
@@ -1206,9 +1230,6 @@ CREATE POLICY contact_emails_owner_all ON public.contact_emails
   FOR ALL TO authenticated
   USING ((SELECT public.is_owner())) WITH CHECK ((SELECT public.is_owner()));
 CREATE POLICY contact_relationships_owner_all ON public.contact_relationships
-  FOR ALL TO authenticated
-  USING ((SELECT public.is_owner())) WITH CHECK ((SELECT public.is_owner()));
-CREATE POLICY contact_followups_owner_all ON public.contact_followups
   FOR ALL TO authenticated
   USING ((SELECT public.is_owner())) WITH CHECK ((SELECT public.is_owner()));
 CREATE POLICY contact_services_owner_all ON public.contact_services
@@ -1309,7 +1330,7 @@ BEGIN
   FOREACH t IN ARRAY ARRAY[
     'contact_statuses', 'lead_sources', 'organization_types', 'service_types',
     'contacts', 'organizations', 'contact_emails', 'contact_notes', 'contact_relationships',
-    'contact_followups', 'contact_services', 'contact_upsells', 'client_portal_accounts',
+    'contact_services', 'contact_upsells', 'client_portal_accounts',
     'portal_invitations', 'client_activity_log', 'client_tasks', 'impersonation_sessions'
   ] LOOP
     EXECUTE format(
@@ -1330,7 +1351,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.client_tasks;
 REVOKE ALL ON
   public.contact_statuses, public.lead_sources, public.organization_types, public.service_types,
   public.contacts, public.organizations, public.contact_emails, public.contact_notes,
-  public.contact_relationships, public.contact_followups, public.contact_services,
+  public.contact_relationships, public.contact_services,
   public.contact_upsells, public.client_portal_accounts, public.portal_invitations,
   public.client_activity_log, public.client_tasks, public.impersonation_sessions
 FROM PUBLIC, anon, authenticated, service_role;
@@ -1340,7 +1361,7 @@ FROM PUBLIC, anon, authenticated, service_role;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
   public.contact_statuses, public.lead_sources, public.organization_types, public.service_types,
   public.contacts, public.organizations, public.contact_emails,
-  public.contact_relationships, public.contact_followups, public.contact_services,
+  public.contact_relationships, public.contact_services,
   public.contact_upsells, public.client_portal_accounts, public.portal_invitations,
   public.client_activity_log, public.client_tasks, public.impersonation_sessions
 TO service_role;
@@ -1381,7 +1402,7 @@ ON public.client_portal_accounts TO authenticated;
 GRANT SELECT, INSERT, DELETE, UPDATE (email, label, is_default) ON public.contact_emails TO authenticated;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-  public.organizations, public.contact_relationships, public.contact_followups,
+  public.organizations, public.contact_relationships,
   public.contact_services, public.contact_upsells, public.portal_invitations, public.client_tasks
 TO authenticated;
 GRANT SELECT, INSERT ON public.contact_notes, public.client_activity_log TO authenticated;
@@ -1407,6 +1428,7 @@ REVOKE ALL ON FUNCTION
   public.enforce_impersonation_read_only(),
   public.revoke_impersonation_auth_session(uuid),
   public.auto_end_stale_impersonation_sessions(),
+  public.cleanup_aged_client_activity(),
   public.contact_delete_claim_live(uuid),
   public.admin_contact_delete_begin(uuid),
   public.admin_contact_delete_release(uuid, jsonb, uuid, uuid[]),
@@ -1421,6 +1443,7 @@ GRANT EXECUTE ON FUNCTION
   public.is_impersonation_session(uuid, uuid),
   public.revoke_impersonation_auth_session(uuid),
   public.auto_end_stale_impersonation_sessions(),
+  public.cleanup_aged_client_activity(),
   public.contact_delete_claim_live(uuid),
   public.admin_contact_delete_begin(uuid),
   public.admin_contact_delete_release(uuid, jsonb, uuid, uuid[]),

@@ -9,18 +9,22 @@ import { cn } from "@/lib/utils"
  * information (a stage chip).
  *
  * `dotClassName` is a background utility from the theme (`bg-success`, `bg-link`,
- * `bg-caution`, `bg-muted-foreground`), never a literal colour. `muted` dims a retired or
- * parked status.
+ * `bg-caution`, `bg-muted-foreground`), never a literal colour. `dotStyle` is for a colour
+ * that is data, not theme (a contact status's stored `#rrggbb`): it is drawn on the dot
+ * only, never on the label, and wins over `dotClassName`, which stays as the fallback.
+ * `muted` dims a retired or parked status.
  */
 function StatusPill({
   children,
   dotClassName,
+  dotStyle,
   muted = false,
   className,
   title,
 }: {
   children: React.ReactNode
   dotClassName?: string
+  dotStyle?: React.CSSProperties
   muted?: boolean
   className?: string
   title?: string
@@ -34,7 +38,9 @@ function StatusPill({
       )}
       title={title}
     >
-      {dotClassName && <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", dotClassName)} aria-hidden="true" />}
+      {(dotClassName || dotStyle) && (
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", dotClassName)} style={dotStyle} aria-hidden="true" />
+      )}
       {children}
     </span>
   )

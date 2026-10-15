@@ -37,6 +37,7 @@ GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;
 CREATE TABLE auth.users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   email text,
+  encrypted_password text,
   phone text UNIQUE,
   raw_app_meta_data jsonb NOT NULL DEFAULT '{}'::jsonb,
   raw_user_meta_data jsonb,

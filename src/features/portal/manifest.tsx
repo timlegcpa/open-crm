@@ -1,24 +1,24 @@
-import { House, UserRound } from 'lucide-react';
+import { House } from 'lucide-react';
 import { lazyNamed } from '@/features/lazy';
 import type { FeatureManifest } from '@/features/types';
 
 const PortalLayout = lazyNamed(() => import('./PortalLayout'), 'PortalLayout');
-const PortalHomePage = lazyNamed(() => import('./pages'), 'PortalHomePage');
-const PortalProfilePage = lazyNamed(() => import('./pages'), 'PortalProfilePage');
-const PortalAccessTab = lazyNamed(() => import('./pages'), 'PortalAccessTab');
+const PortalHomePage = lazyNamed(() => import('./pages/HomePage'), 'PortalHomePage');
+const PortalProfilePage = lazyNamed(() => import('./pages/ProfilePage'), 'PortalProfilePage');
+const PortalAccessPanel = lazyNamed(() => import('./owner/PortalAccessPanel'), 'PortalAccessPanel');
 const InvitePage = lazyNamed(() => import('./public/InvitePage'), 'InvitePage');
 
 export const manifest: FeatureManifest = {
   id: 'portal',
   portalLayout: PortalLayout,
-  portalTabs: [
-    { label: 'Home', icon: House, path: '/portal', order: 10, end: true },
-    { label: 'Profile', icon: UserRound, path: '/portal/profile', order: 90 },
-  ],
+  // Profile is reached from the account menu ("Your account"), so it is not a section tab.
+  portalTabs: [{ label: 'Home', icon: House, path: '/portal', order: 10, end: true }],
   portalRoutes: [
     { index: true, element: <PortalHomePage /> },
     { path: 'profile', element: <PortalProfilePage /> },
   ],
   publicRoutes: [{ path: 'invite/*', element: <InvitePage /> }],
-  contactTabs: [{ key: 'portal', label: 'Portal', order: 60, Component: PortalAccessTab }],
+  // The right bar shows on wide screens only, so the same panel is also a tab.
+  contactSidePanels: [{ key: 'portal', order: 10, Component: PortalAccessPanel }],
+  contactTabs: [{ key: 'portal', label: 'Portal', order: 60, Component: PortalAccessPanel }],
 };

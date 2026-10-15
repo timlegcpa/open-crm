@@ -21,6 +21,7 @@ vi.mock('pdfjs-dist', () => {
 import { PUBLIC_PATHS, links } from '@/features/links';
 import {
   FEATURES,
+  contactActivityCards,
   contactHeaderActions,
   contactSidePanels,
   contactTabs,
@@ -30,6 +31,7 @@ import {
   ownerRoutes,
   ownerStandaloneRoutes,
   portalHomeCards,
+  portalProfileSections,
   portalRoutes,
   portalTabs,
   publicRoutes,
@@ -115,8 +117,10 @@ describe('feature registry', () => {
     expect(dupes(contactTabs.map((t) => t.key))).toEqual([]);
     expect(dupes(contactHeaderActions.map((a) => a.key))).toEqual([]);
     expect(dupes(contactSidePanels.map((p) => p.key))).toEqual([]);
+    expect(dupes(contactActivityCards.map((c) => c.key))).toEqual([]);
     expect(dupes(settingsSections.map((s) => s.key))).toEqual([]);
     expect(dupes(portalHomeCards.map((c) => c.key))).toEqual([]);
+    expect(dupes(portalProfileSections.map((s) => s.key))).toEqual([]);
     expect(dupes([...flatten(ownerRoutes), ...flatten(ownerStandaloneRoutes)].map((r) => r.full))).toEqual([]);
     expect(dupes(flatten(portalRoutes).map((r) => r.full))).toEqual([]);
     expect(dupes(flatten(publicRoutes).map((r) => r.full))).toEqual([]);
@@ -210,8 +214,10 @@ describe('feature registry', () => {
     expect(sorted(contactTabs)).toBe(true);
     expect(sorted(contactHeaderActions)).toBe(true);
     expect(sorted(contactSidePanels)).toBe(true);
+    expect(sorted(contactActivityCards)).toBe(true);
     expect(sorted(settingsSections)).toBe(true);
     expect(sorted(portalHomeCards)).toBe(true);
+    expect(sorted(portalProfileSections)).toBe(true);
   });
 
   it('a contact tab key never collides with the record route it sits under', () => {

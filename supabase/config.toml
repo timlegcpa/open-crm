@@ -159,7 +159,12 @@ site_url = "http://127.0.0.1:5173"
 # The public URL that Auth serves on. Defaults to the API external URL with `/auth/v1` appended.
 # external_url = ""
 # A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
-additional_redirect_urls = ["http://localhost:5173"]
+# The dev origins, with a wildcard path so the password reset (/reset-password) and the
+# email-change confirmation (/settings/security) can land on their own pages. A live project
+# adds its own SITE_URL/** in the dashboard (Authentication, URL Configuration).
+# The localhost entries are for local development only and must not be pushed to a live
+# project: before `config push` to a live project, put your site's addresses here instead.
+additional_redirect_urls = ["http://localhost:5173", "http://localhost:5173/**", "http://127.0.0.1:5173/**"]
 # How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
 jwt_expiry = 3600
 # JWT issuer URL. If not set, defaults to auth.external_url.
@@ -225,7 +230,10 @@ double_confirm_changes = true
 # If enabled, users need to confirm their email address before signing in.
 enable_confirmations = false
 # If enabled, users will need to reauthenticate or have logged in recently to change their password.
-secure_password_change = false
+# On: a password change needs a fresh sign-in or the emailed reauthentication code, so a
+# stolen session alone cannot replace the password. Production needs an email provider for
+# the code.
+secure_password_change = true
 # Controls the minimum amount of time that must pass before sending another signup confirmation or password reset email.
 max_frequency = "1s"
 # Number of characters used in the email OTP.
@@ -374,8 +382,8 @@ allow_dynamic_registration = false
 [edge_runtime]
 enabled = true
 # Supported request policies: `oneshot`, `per_worker`.
-# `per_worker` (default) — enables hot reload during local development.
-# `oneshot` — fallback mode if hot reload causes issues (e.g. in large repos or with symlinks).
+# `per_worker` (default): enables hot reload during local development.
+# `oneshot`: fallback mode if hot reload causes issues (e.g. in large repos or with symlinks).
 policy = "per_worker"
 # Port to attach the Chrome inspector for debugging edge functions.
 inspector_port = 8083
@@ -414,3 +422,48 @@ enabled = true
 # formatted with uppercase keywords, indent 2, max width 180, trailing commas,
 # and column/key alignment. Set to "null" to emit raw, unformatted SQL.
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":180,\"commaStyle\":\"trailing\"}"
+
+# Edge functions the Supabase gateway must not hold to a user JWT. Each one checks its own
+# caller in code (src/__tests__/edge/gatewayJwt.test.ts keeps this list equal to the functions
+# whose handler declares the public, apiKey or cron mode):
+#   - job-runner and send-portal-digest take the cron secret (or the owner's session);
+#   - csp-report is a browser's reporting endpoint;
+#   - email-unsubscribe is opened from a link in an email;
+#   - validate-portal-invite and accept-portal-invite are reached from an invitation link,
+#     before the client has an account;
+#   - lead-intake takes its own API key from another server;
+#   - mfa-recovery checks the caller's own token itself (a session that has not passed its
+#     second factor yet);
+#   - mcp-oauth and mcp-crm are the AI connector's authorization server and resource server,
+#     which issue and check their own tokens. mcp-oauth's owner consent endpoint (POST /)
+#     still needs the owner's session: the handler checks it (owner mode, at aal2), since
+#     the gateway check is off for the whole function.
+[functions.job-runner]
+verify_jwt = false
+
+[functions.csp-report]
+verify_jwt = false
+
+[functions.email-unsubscribe]
+verify_jwt = false
+
+[functions.send-portal-digest]
+verify_jwt = false
+
+[functions.validate-portal-invite]
+verify_jwt = false
+
+[functions.accept-portal-invite]
+verify_jwt = false
+
+[functions.lead-intake]
+verify_jwt = false
+
+[functions.mfa-recovery]
+verify_jwt = false
+
+[functions.mcp-oauth]
+verify_jwt = false
+
+[functions.mcp-crm]
+verify_jwt = false

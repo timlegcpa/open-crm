@@ -14,6 +14,16 @@
 -- GRANTed per table, never inherited from Supabase's default privileges; every function
 -- pins `search_path = ''` and schema-qualifies what it touches; EXECUTE is revoked from
 -- PUBLIC and granted per function.
+--
+-- Scheduling: no migration schedules anything (PGlite and a fresh project have no
+-- pg_cron). Scheduled work is a public.jobs row run by the job-runner edge function, or
+-- a line in supabase/schedules.sql that the adopter installs with
+-- `npm run schedules:install`. Retention is a plain SQL function the server calls
+-- (EXECUTE for service_role only); the job-runner's maintenance job runs the ones here.
+--
+-- The audit log keeps ids and codes, never personal data: `action` is a lowercase
+-- identifier and `details` is bounded, so neither the owner's browser nor a server path
+-- can turn it into a store of free text.
 
 -- ---------------------------------------------------------------------------
 -- Shared trigger helpers
@@ -255,8 +265,11 @@ $$;
 CREATE TABLE public.audit_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL,
-  action text NOT NULL CHECK (length(action) BETWEEN 1 AND 100),
-  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  -- The same shape the server's audit writer enforces (_shared/audit.ts): an owner write
+  -- straight from the browser meets it too.
+  action text NOT NULL CHECK (action ~ '^[a-z][a-z0-9_.]{0,99}$'),
+  details jsonb NOT NULL DEFAULT '{}'::jsonb
+    CHECK (jsonb_typeof(details) = 'object' AND pg_column_size(details) <= 8192),
   ip_address inet,
   user_agent text,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -321,6 +334,11 @@ CREATE TABLE public.mfa_backup_codes (
   reserved_at timestamptz,
   alert_sent_at timestamptz,
   used_at timestamptz,
+  -- The one request that may act on a reserved code: set by claim (a new token on every
+  -- claim or resume), required by release and finalize. A takeover after the lease runs
+  -- out rotates the token, so a delayed request can never act on the code again.
+  lease_token uuid,
+  lease_until timestamptz,
   UNIQUE (user_id, code_hash)
 );
 
@@ -434,6 +452,7 @@ AS $$
 DECLARE
   v_row public.mfa_backup_codes%ROWTYPE;
   v_has_factor boolean;
+  v_lease uuid;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('mfa_backup_codes:' || p_user_id::text));
 
@@ -444,7 +463,7 @@ BEGIN
   -- Lease-expire a crashed request's unalerted reservation (10 minutes).
   UPDATE public.mfa_backup_codes
     SET status = CASE WHEN v_has_factor THEN 'active' ELSE 'revoked' END,
-        reserved_at = NULL
+        reserved_at = NULL, lease_token = NULL, lease_until = NULL
     WHERE user_id = p_user_id AND status = 'reserved'
       AND alert_sent_at IS NULL
       AND reserved_at < now() - interval '10 minutes';
@@ -453,7 +472,7 @@ BEGIN
   -- step cannot wedge issuance. alert_sent_at stays set so the saga does not re-alert.
   UPDATE public.mfa_backup_codes
     SET status = CASE WHEN v_has_factor THEN 'active' ELSE 'revoked' END,
-        reserved_at = NULL
+        reserved_at = NULL, lease_token = NULL, lease_until = NULL
     WHERE user_id = p_user_id AND status = 'reserved'
       AND alert_sent_at IS NOT NULL
       AND reserved_at < now() - interval '60 minutes';
@@ -471,17 +490,26 @@ BEGIN
     IF NOT v_has_factor THEN
       RETURN jsonb_build_object('state', 'none');
     END IF;
+    v_lease := gen_random_uuid();
     UPDATE public.mfa_backup_codes
-      SET status = 'reserved', reserved_at = now()
+      SET status = 'reserved', reserved_at = now(),
+          lease_token = v_lease, lease_until = now() + interval '2 minutes'
       WHERE id = v_row.id;
-    RETURN jsonb_build_object('state', 'claimed', 'id', v_row.id,
+    RETURN jsonb_build_object('state', 'claimed', 'id', v_row.id, 'lease', v_lease,
                               'alerted', v_row.alert_sent_at IS NOT NULL);
   END IF;
 
   IF v_row.status = 'reserved' THEN
-    -- Resume stays reachable with no factor: the saga deletes the factor midway.
-    IF v_row.alert_sent_at IS NOT NULL THEN
-      RETURN jsonb_build_object('state', 'resume', 'id', v_row.id, 'alerted', true);
+    -- Resume stays reachable with no factor: a request that died after its alert is
+    -- finished by the same code. But only by ONE request at a time: while another
+    -- request's lease is live, this one is in flight, never a second resumer.
+    IF v_row.alert_sent_at IS NOT NULL
+       AND (v_row.lease_until IS NULL OR v_row.lease_until <= now()) THEN
+      v_lease := gen_random_uuid();
+      UPDATE public.mfa_backup_codes
+        SET lease_token = v_lease, lease_until = now() + interval '2 minutes'
+        WHERE id = v_row.id;
+      RETURN jsonb_build_object('state', 'resume', 'id', v_row.id, 'lease', v_lease, 'alerted', true);
     END IF;
     RETURN jsonb_build_object('state', 'in_flight');
   END IF;
@@ -490,32 +518,73 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION public.mfa_backup_code_release(p_id uuid, p_user_id uuid)
+CREATE FUNCTION public.mfa_backup_code_release(p_id uuid, p_user_id uuid, p_lease uuid)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = ''
+SET row_security = off
+AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('mfa_backup_codes:' || p_user_id::text));
+  -- Never alerted: the code goes back to active (revoked with no factor left).
+  UPDATE public.mfa_backup_codes
+    SET status = CASE WHEN EXISTS (SELECT 1 FROM auth.mfa_factors f
+                                   WHERE f.user_id = p_user_id AND f.status = 'verified')
+                      THEN 'active' ELSE 'revoked' END,
+        reserved_at = NULL, lease_token = NULL, lease_until = NULL
+    WHERE id = p_id AND user_id = p_user_id AND lease_token = p_lease
+      AND status = 'reserved' AND alert_sent_at IS NULL;
+  -- Alerted: stays reserved for a resume, which may start now.
+  UPDATE public.mfa_backup_codes
+    SET lease_until = now()
+    WHERE id = p_id AND user_id = p_user_id AND lease_token = p_lease
+      AND status = 'reserved' AND alert_sent_at IS NOT NULL;
+END;
+$$;
+
+-- Stamps the alert on a reservation this request still holds. True when a row was stamped.
+CREATE FUNCTION public.mfa_backup_code_alerted(p_id uuid, p_user_id uuid, p_lease uuid)
+RETURNS boolean
+LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('mfa_backup_codes:' || p_user_id::text));
   UPDATE public.mfa_backup_codes
-    SET status = CASE WHEN EXISTS (SELECT 1 FROM auth.mfa_factors f
-                                   WHERE f.user_id = p_user_id AND f.status = 'verified')
-                      THEN 'active' ELSE 'revoked' END,
-        reserved_at = NULL
-    WHERE id = p_id AND user_id = p_user_id
-      AND status = 'reserved' AND alert_sent_at IS NULL;
+    SET alert_sent_at = now(), lease_until = now() + interval '2 minutes'
+    WHERE id = p_id AND user_id = p_user_id AND lease_token = p_lease AND status = 'reserved';
+  RETURN FOUND;
+END;
+$$;
+
+-- Renews this request's lease before a step that acts outside the database (the
+-- sign-out). False when the lease is gone: the request must stop.
+CREATE FUNCTION public.mfa_backup_code_lease_renew(p_id uuid, p_user_id uuid, p_lease uuid)
+RETURNS boolean
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('mfa_backup_codes:' || p_user_id::text));
+  UPDATE public.mfa_backup_codes
+    SET lease_until = now() + interval '2 minutes'
+    WHERE id = p_id AND user_id = p_user_id AND lease_token = p_lease AND status = 'reserved';
+  RETURN FOUND;
 END;
 $$;
 
 CREATE FUNCTION public.mfa_backup_code_finalize(
-  p_id uuid, p_user_id uuid, p_ip text, p_user_agent text)
-RETURNS void
+  p_id uuid, p_user_id uuid, p_lease uuid, p_ip text, p_user_agent text)
+RETURNS integer
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = ''
+SET row_security = off
 AS $$
 DECLARE
   v_updated integer;
+  v_factors integer;
   v_ip inet;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('mfa_backup_codes:' || p_user_id::text));
@@ -525,26 +594,36 @@ BEGIN
     v_ip := NULL;
   END;
 
+  -- Still reserved AND still this request's: checked under the lock, in the same
+  -- transaction that deletes the factors, so no other request can finish in between.
   UPDATE public.mfa_backup_codes
-    SET status = 'used', used_at = now()
-    WHERE id = p_id AND user_id = p_user_id AND status = 'reserved';
+    SET status = 'used', used_at = now(), lease_token = NULL, lease_until = NULL
+    WHERE id = p_id AND user_id = p_user_id AND status = 'reserved' AND lease_token = p_lease;
   GET DIAGNOSTICS v_updated = ROW_COUNT;
   IF v_updated = 0 THEN
-    RAISE EXCEPTION 'mfa_backup_code_finalize: not_reserved';
+    RAISE EXCEPTION 'mfa_backup_code_finalize: lease_lost';
   END IF;
 
-  UPDATE public.mfa_backup_codes
-    SET status = 'revoked'
-    WHERE user_id = p_user_id AND status IN ('active', 'reserved') AND id <> p_id;
-
+  -- The lockout first (same transaction): no token from before this second survives the
+  -- moment the account reads as having no factor.
   INSERT INTO public.mfa_recovery_lockouts (user_id, revoked_before)
   VALUES (p_user_id, date_trunc('second', clock_timestamp()) + interval '1 second')
   ON CONFLICT (user_id) DO UPDATE
     SET revoked_before = GREATEST(public.mfa_recovery_lockouts.revoked_before, EXCLUDED.revoked_before);
 
+  -- Every authenticator of the account (Auth's own admin delete removes the row the same
+  -- way; its challenges go with it by foreign key).
+  DELETE FROM auth.mfa_factors WHERE user_id = p_user_id;
+  GET DIAGNOSTICS v_factors = ROW_COUNT;
+
+  UPDATE public.mfa_backup_codes
+    SET status = 'revoked'
+    WHERE user_id = p_user_id AND status IN ('active', 'reserved') AND id <> p_id;
+
   INSERT INTO public.audit_logs (user_id, action, details, ip_address, user_agent)
-  VALUES (p_user_id, 'mfa_recovery_used', jsonb_build_object('code_id', p_id),
+  VALUES (p_user_id, 'mfa_recovery_used', jsonb_build_object('code_id', p_id, 'factors_removed', v_factors),
           v_ip, NULLIF(p_user_agent, ''));
+  RETURN v_factors;
 END;
 $$;
 
@@ -739,6 +818,72 @@ BEGIN
 END;
 $$;
 
+-- A public endpoint's pair in ONE transaction: the caller's address bucket
+-- (`<action>.ip`), then the shared ceiling (`<action>.global`). Per address decides
+-- first, so one address cannot spend the shared bucket. Nothing is recorded unless BOTH
+-- allow: calling the two functions above in turn commits the address row even when the
+-- shared ceiling then refuses, so once the ceiling was spent every fresh address still
+-- wrote a row. Same buckets, sentinel and lock keys as those two, so the counts agree.
+-- Returns the new shared count, or NULL when either limit is reached.
+CREATE FUNCTION public.check_public_rate_limit(
+  p_action text, p_ip text, p_ip_max integer, p_ip_window_minutes integer,
+  p_global_max integer, p_global_window_minutes integer, p_user_agent text DEFAULT NULL)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  c_unusable_ip CONSTANT inet := '0.0.0.0/0'::inet;
+  v_ip_action text := p_action || '.ip';
+  v_global_action text := p_action || '.global';
+  v_ip inet;
+  v_ip_count integer;
+  v_global_count integer;
+BEGIN
+  IF p_ip_max IS NULL OR p_ip_max < 1 OR p_ip_window_minutes IS NULL OR p_ip_window_minutes < 1
+     OR p_global_max IS NULL OR p_global_max < 1 OR p_global_window_minutes IS NULL OR p_global_window_minutes < 1 THEN
+    RAISE EXCEPTION 'rate limit needs a positive max count and window';
+  END IF;
+
+  IF p_ip IS NULL OR btrim(p_ip) = '' THEN
+    v_ip := c_unusable_ip;
+  ELSE
+    BEGIN
+      v_ip := p_ip::inet;
+    EXCEPTION WHEN invalid_text_representation THEN
+      v_ip := c_unusable_ip;
+    END;
+  END IF;
+
+  -- Always the address lock, then the shared one: one order, so no deadlock.
+  PERFORM pg_advisory_xact_lock(hashtext(v_ip_action || ':' || v_ip::text));
+  SELECT count(*) INTO v_ip_count
+  FROM public.auth_rate_limits
+  WHERE action = v_ip_action
+    AND ip_address = v_ip
+    AND created_at >= now() - (p_ip_window_minutes * interval '1 minute');
+  IF v_ip_count >= p_ip_max THEN
+    RETURN NULL;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtext('global:' || v_global_action));
+  SELECT count(*) INTO v_global_count
+  FROM public.auth_rate_limits
+  WHERE action = v_global_action
+    AND ip_address IS NULL
+    AND user_id IS NULL
+    AND created_at >= now() - (p_global_window_minutes * interval '1 minute');
+  IF v_global_count >= p_global_max THEN
+    RETURN NULL;
+  END IF;
+
+  INSERT INTO public.auth_rate_limits (action, ip_address, user_agent) VALUES (v_ip_action, v_ip, p_user_agent);
+  INSERT INTO public.auth_rate_limits (action) VALUES (v_global_action);
+  RETURN v_global_count + 1;
+END;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Owner settings (key/value blobs edited in the admin settings pages)
 -- ---------------------------------------------------------------------------
@@ -824,7 +969,9 @@ BEGIN
       finished_at = v_now,
       claimed_until = NULL,
       claim_token = NULL,
-      last_error = COALESCE(last_error, 'lease expired on the final attempt')
+      -- Says what ended it (the lease, not the earlier error) and keeps that error too.
+      last_error = left('lease expired on the final attempt'
+                        || COALESCE(' (previous attempt: ' || last_error || ')', ''), 1000)
   WHERE status = 'running'
     AND claimed_until < v_now
     AND attempts >= max_attempts;
@@ -991,27 +1138,36 @@ CREATE UNIQUE INDEX uq_dev_outbox_idempotency_key ON public.dev_outbox (idempote
 ALTER TABLE public.dev_outbox ENABLE ROW LEVEL SECURITY;
 CREATE POLICY dev_outbox_owner_select ON public.dev_outbox
   FOR SELECT TO authenticated USING ((SELECT public.is_owner()));
+-- The owner clears it from the Outbox page: it holds live sign-in links and codes.
+CREATE POLICY dev_outbox_owner_delete ON public.dev_outbox
+  FOR DELETE TO authenticated USING ((SELECT public.is_owner()));
 
 -- ---------------------------------------------------------------------------
 -- CSP violation reports (written by the csp-report edge function)
 -- ---------------------------------------------------------------------------
 
+-- Anyone can post to the report endpoint, so a row is small and bounded: only the
+-- normalized fields, each capped in bytes (the function cuts them to the same lengths),
+-- and no copy of the raw report. A full row stays under 2 KB. A row names a directive
+-- and a URL: an all-null row is refused here as well as by the function.
 CREATE TABLE public.csp_violation_reports (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   received_at timestamptz NOT NULL DEFAULT now(),
-  document_url text,
-  referrer text,
-  violated_directive text,
-  effective_directive text,
-  blocked_url text,
-  source_file text,
+  document_url text CHECK (octet_length(document_url) <= 400),
+  referrer text CHECK (octet_length(referrer) <= 300),
+  violated_directive text CHECK (octet_length(violated_directive) <= 64),
+  effective_directive text CHECK (octet_length(effective_directive) <= 64),
+  blocked_url text CHECK (octet_length(blocked_url) <= 400),
+  source_file text CHECK (octet_length(source_file) <= 400),
   line_number integer,
   column_number integer,
-  disposition text,
+  disposition text CHECK (octet_length(disposition) <= 16),
   status_code integer,
-  user_agent text,
-  ip_address text,
-  raw jsonb NOT NULL
+  user_agent text CHECK (octet_length(user_agent) <= 200),
+  ip_address text CHECK (octet_length(ip_address) <= 45),
+  CONSTRAINT csp_violation_reports_well_formed CHECK (
+    num_nonnulls(NULLIF(violated_directive, ''), NULLIF(effective_directive, '')) > 0
+    AND num_nonnulls(NULLIF(document_url, ''), NULLIF(blocked_url, '')) > 0)
 );
 
 CREATE INDEX idx_csp_reports_received_at ON public.csp_violation_reports (received_at DESC);
@@ -1019,6 +1175,65 @@ CREATE INDEX idx_csp_reports_received_at ON public.csp_violation_reports (receiv
 ALTER TABLE public.csp_violation_reports ENABLE ROW LEVEL SECURITY;
 CREATE POLICY csp_reports_owner_select ON public.csp_violation_reports
   FOR SELECT TO authenticated USING ((SELECT public.is_owner()));
+
+-- ---------------------------------------------------------------------------
+-- Retention (server only; the job-runner's maintenance job calls these)
+-- ---------------------------------------------------------------------------
+
+-- Operational rows that are only useful for a while. Returns how many rows each rule
+-- removed, which the maintenance job stores as its result. A pending, running or failed
+-- job is never removed, whatever its age: it is still work, or still evidence.
+--   jobs        success after 30 days, dead after 90 (long enough to notice and retry)
+--   rate limits after 7 days (the longest window any caller asks for is an hour)
+--   CSP reports after 30 days (a diagnostic, and anyone can write one)
+--   dev outbox  after 7 days: it holds live sign-in links and codes
+CREATE FUNCTION public.cleanup_core_operational_rows()
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_jobs_success integer;
+  v_jobs_dead integer;
+  v_rate_limits integer;
+  v_csp_reports integer;
+  v_dev_outbox integer;
+BEGIN
+  DELETE FROM public.jobs WHERE status = 'success' AND finished_at < now() - interval '30 days';
+  GET DIAGNOSTICS v_jobs_success = ROW_COUNT;
+  DELETE FROM public.jobs WHERE status = 'dead' AND finished_at < now() - interval '90 days';
+  GET DIAGNOSTICS v_jobs_dead = ROW_COUNT;
+  DELETE FROM public.auth_rate_limits WHERE created_at < now() - interval '7 days';
+  GET DIAGNOSTICS v_rate_limits = ROW_COUNT;
+  DELETE FROM public.csp_violation_reports WHERE received_at < now() - interval '30 days';
+  GET DIAGNOSTICS v_csp_reports = ROW_COUNT;
+  DELETE FROM public.dev_outbox WHERE created_at < now() - interval '7 days';
+  GET DIAGNOSTICS v_dev_outbox = ROW_COUNT;
+  RETURN jsonb_build_object(
+    'jobs_success', v_jobs_success, 'jobs_dead', v_jobs_dead, 'rate_limits', v_rate_limits,
+    'csp_reports', v_csp_reports, 'dev_outbox', v_dev_outbox);
+END;
+$$;
+
+-- Audit rows older than three years. The one sanctioned use of the append-only escape:
+-- it is switched on for this delete alone and put back before returning, so nothing
+-- later in the same transaction can rewrite the log under it.
+CREATE FUNCTION public.cleanup_aged_audit_logs()
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_prior text := COALESCE(current_setting('app.allow_audit_maintenance', true), '');
+  v_audit_logs integer;
+BEGIN
+  PERFORM set_config('app.allow_audit_maintenance', 'on', true);
+  DELETE FROM public.audit_logs WHERE created_at < now() - interval '3 years';
+  GET DIAGNOSTICS v_audit_logs = ROW_COUNT;
+  PERFORM set_config('app.allow_audit_maintenance', v_prior, true);
+  RETURN jsonb_build_object('audit_logs', v_audit_logs);
+END;
+$$;
 
 -- A second, independent MFA gate on every table: whatever a permissive policy above
 -- says, a session that fails mfa_session_ok() reads and writes nothing.
@@ -1069,7 +1284,7 @@ GRANT SELECT, INSERT ON public.audit_logs TO authenticated;
 GRANT SELECT ON public.auth_rate_limits TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.app_settings TO authenticated;
 GRANT SELECT ON public.jobs TO authenticated;
-GRANT SELECT ON public.dev_outbox TO authenticated;
+GRANT SELECT, DELETE ON public.dev_outbox TO authenticated;
 GRANT SELECT ON public.csp_violation_reports TO authenticated;
 
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC, anon, authenticated, service_role;

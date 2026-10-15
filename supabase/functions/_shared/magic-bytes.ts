@@ -12,8 +12,10 @@
 // MIME types in allowed_mime_types; change all three places together (this file, the
 // browser's list, the bucket).
 //
-// Pure TypeScript: the browser can import ALLOWED_UPLOAD_MIME_TYPES and MAX_UPLOAD_BYTES
-// from this file directly instead of keeping a copy.
+// Pure TypeScript, and the browser imports this file directly (documents' upload checks,
+// documentNames.ts and the annotator's export), so the browser and the server read one list
+// and one size cap. Keep it free of Deno globals and of anything a browser bundle cannot
+// load.
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 

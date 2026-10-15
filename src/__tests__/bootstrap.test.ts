@@ -15,6 +15,7 @@ import {
   systemActorPassword,
 } from '../../scripts/lib/bootstrap-core.mjs';
 import { randomBytes } from 'node:crypto';
+import { passwordProblem as formProblem } from '@/lib/passwordRules';
 
 describe('projectProblems', () => {
   const good = { url: 'https://abcdefghijklmnopqrst.supabase.co', anonKey: 'sb_publishable_x', serviceKey: 'sb_secret_y' };
@@ -83,6 +84,19 @@ describe('ownerProblems and parseArgs', () => {
   ])('refuses a weak password (%s)', (_label, password) => {
     expect(ownerProblems({ ...good, password })).toHaveLength(1);
   });
+  it.each([
+    ['a space', 'Good pass-1'],
+    ['an accented letter', 'Gööd-pass-1'],
+    ['a passphrase', 'correct Horse 9 battery!'],
+  ])('accepts a password with %s', (_label, password) => {
+    expect(ownerProblems({ ...good, password })).toEqual([]);
+  });
+  it.each([['a tab', 'Good-pass-1\t'], ['a line break', 'Good-pass-1\n'], ['a NUL', 'Good-pass-1\u0000'], ['over 72 bytes', `Good-pass-1${'x'.repeat(62)}`], ['over 72 bytes in accented letters', `Good-pass-1${'\u00e9'.repeat(31)}`]])(
+    'refuses a password with %s',
+    (_label, password) => {
+      expect(ownerProblems({ ...good, password })).toHaveLength(1);
+    },
+  );
   it('refuses a bad email, the system actor email and a blank org name', () => {
     expect(ownerProblems({ ...good, email: 'nope' })).toHaveLength(1);
     expect(ownerProblems({ ...good, email: SYSTEM_ACTOR_EMAIL.toUpperCase() })).toHaveLength(1);
@@ -261,5 +275,18 @@ describe('systemActorPassword', () => {
   });
   it('a century ban is at least fifty years', () => {
     expect(parseInt(BAN_FOR_A_CENTURY, 10)).toBeGreaterThanOrEqual(50 * 365 * 24);
+  });
+});
+
+describe('the owner\'s first password and the app\'s forms', () => {
+  // Same accept-or-refuse answer for every input (the messages differ by audience), so the
+  // owner never sets a password at bootstrap that the change or reset form would refuse.
+  const CASES = [
+    '', 'short1!', 'Abcdef1!', 'abcdefg1!', 'ABCDEFG1!', 'Abcdefgh!', 'Abcdefgh1', 'Abc def1!', 'Abcdéfg1!',
+    'Abcdefg1 ', 'Abcdefg1é', 'Abcdefg1!\t', 'Abcdefg1!\n', 'Abcdefg1!\u0000', 'Abcdefg1!\u007f', 'Abcdefg1!\u0085',
+    `A1!${'a'.repeat(69)}`, `A1!${'a'.repeat(70)}`, `A1!${'\u00e9'.repeat(34)}a`, `A1!${'\u00e9'.repeat(35)}`, `A1!a${'\u{1F600}'.repeat(17)}`, `A1!a${'\u{1F600}'.repeat(17)}b`, 'Zz9~Zz9~', 'Pass[word]1', 'Pass`word1', 'Pass\\word1', 'Pass"word1', 'Emoji 1! \u{1F600}',
+  ];
+  it.each(CASES)('agree on %j', (input) => {
+    expect(passwordProblem(input) === null).toBe(formProblem(input) === null);
   });
 });

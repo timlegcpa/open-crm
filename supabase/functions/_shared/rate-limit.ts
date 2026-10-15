@@ -1,5 +1,6 @@
 // The caller's network address and the rate-limit buckets in 0001_core.sql
-// (check_auth_ip_rate_limit, check_auth_global_rate_limit, check_auth_user_rate_limit).
+// (check_auth_ip_rate_limit, check_auth_global_rate_limit, check_auth_user_rate_limit,
+// and check_public_rate_limit, which runs the first two as one transaction).
 //
 // Every wrapper fails closed. A limiter that logs its own error and lets the request
 // through is not a limiter: an unreadable bucket table would remove every bound on a
@@ -155,21 +156,30 @@ export function checkUserLimit(
 }
 
 /**
- * The pair every public endpoint carries: the caller's address bucket (`<action>.ip`),
- * then the shared ceiling (`<action>.global`).
+ * The pair every public endpoint carries, in ONE database call (check_public_rate_limit):
+ * the caller's address bucket (`<action>.ip`), then the shared ceiling (`<action>.global`).
+ * The function appends the two suffixes itself, so `action` is the bare name.
  *
- * ORDER IS LOAD-BEARING. The global function records a row on every call under its cap,
- * so running it first lets ONE address spend the shared bucket: fifty junk requests
- * commit fifty global rows, three survive the per-address check, and the endpoint is
- * closed to every visitor for the window. Per-address first turns a single abuser away
- * before it touches the shared bucket; the global ceiling then bounds many addresses
- * acting together.
+ * Per address decides first: run the other way round, one address could spend the shared
+ * bucket for every visitor (fifty junk requests commit fifty shared rows, three survive
+ * the per-address check, and the endpoint is closed to everyone for the window). And
+ * nothing is recorded unless BOTH allow. Two calls in turn committed the address row even
+ * when the shared ceiling then refused, so once the ceiling was spent every fresh address
+ * still wrote a row; one transaction leaves none. Same fail-closed reading as the
+ * single buckets: an error, a throw, or any answer but a positive count is 'unavailable';
+ * NULL (either limit reached) is 'limited'.
  */
-export async function checkPublicLimits(
+export function checkPublicLimits(
   db: RateLimitClient,
   opts: { action: string; ip: string | null; userAgent?: string | null; perIp: Limit; global: Limit },
 ): Promise<RateLimitOutcome> {
-  const perIp = await checkIpLimit(db, { action: `${opts.action}.ip`, ip: opts.ip, userAgent: opts.userAgent, ...opts.perIp });
-  if (perIp !== 'allowed') return perIp;
-  return checkGlobalLimit(db, { action: `${opts.action}.global`, ...opts.global });
+  return bucket(db, 'check_public_rate_limit', {
+    p_action: opts.action,
+    p_ip: opts.ip,
+    p_ip_max: opts.perIp.max,
+    p_ip_window_minutes: opts.perIp.windowMinutes,
+    p_global_max: opts.global.max,
+    p_global_window_minutes: opts.global.windowMinutes,
+    p_user_agent: opts.userAgent ? opts.userAgent.slice(0, 512) : null,
+  });
 }

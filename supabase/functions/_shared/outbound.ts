@@ -18,6 +18,7 @@
 // A provider's error body is logged (redacted) and never returned, since it can echo the
 // recipient's address or number.
 
+import { sha256Hex } from './crypto.ts';
 import { createLogger, type Logger } from './log.ts';
 
 export interface OutboundEnv {
@@ -123,11 +124,6 @@ function parseFrom(value: string): { address: string; name: string | null } {
   if (!isValidEmail(address)) throw new OutboundConfigError('EMAIL_FROM is not a valid address');
   const name = match ? displayName(match[1]) : '';
   return { address, name: name || null };
-}
-
-async function sha256Hex(input: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function providerKey(key: string): Promise<string> {

@@ -1,24 +1,10 @@
-import { useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowDown, ArrowUp, Plus } from 'lucide-react';
-import {
-  bulkUpdateStatus,
-  contactDisplayName,
-  deleteContacts,
-  listContacts,
-  type BulkStatusResult,
-  type ContactListRow,
-  type DeleteOutcome,
-} from '@/api/contacts';
+import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Link, Outlet, useParams, useSearchParams } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
+import { Download, LayoutList, Plus, Search, Table2, X } from 'lucide-react';
+import { bulkUpdateStatus, deleteContacts, type Contact } from '@/api/contacts';
 import { queryKeys } from '@/api/queryKeys';
-import { useByKey, useContactStatuses, useLeadSources } from '@/hooks/usePickLists';
-import { StatusBadge } from '@/components/contacts/StatusBadge';
-import { Button } from '@/components/ui/button';
-import { Checkbox } from '@/components/ui/checkbox';
-import { Input } from '@/components/ui/input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { EmptyState, PageHeader } from '@/components/layout/page';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -29,296 +15,372 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { matchesContactSearch } from '@/lib/contactSearch';
-import { dateSortKey, formatDate } from '@/lib/dates';
+import { Button } from '@/components/ui/button';
+import { ClickRegion } from '@/components/ui/click-region';
+import { Input } from '@/components/ui/input';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Segmented } from '@/components/ui/segmented';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { toast } from '@/components/ui/sonner';
+import { Toggle } from '@/components/ui/toggle';
+import { useCollapsedSections } from '@/hooks/useCollapsedSections';
+import { useByKey, useContactStatuses, useServiceTypes } from '@/hooks/usePickLists';
+import { links } from '@/features/links';
+import { CrmBoard } from '@/features/crm/components/board/CrmBoard';
+import { ContactIndexGroup, ContactIndexRow } from '@/features/crm/components/ContactIndex';
+import { CrmTable, tableMrrOf } from '@/features/crm/components/CrmTable';
+import { useContacts, useOrganizationRoster, useOrganizationsByContact, useUpdateContact } from '@/features/crm/hooks';
+import { contactIdsForView, cadenceText, matchesCrmSearch, pipelineFigures, unsignedWork } from '@/features/crm/lib/board';
+import { contactCsvRows } from '@/features/crm/lib/csv';
+import { quoteOpMutationKey, statusChangePatch } from '@/features/crm/lib/quotes';
+import { bucketBySection, CRM_LISTS, statusInList, type CrmListKey } from '@/features/crm/lib/sections';
+import { crmTableRows, DEFAULT_CRM_TABLE_FILTERS, type CrmTableFilters } from '@/features/crm/lib/table';
+import { CRM_COLLAPSED_KEY, useCrmLayout, useCrmList } from '@/features/crm/prefs';
+import { useWide } from '@/features/crm/useWide';
+import { isSystemStatus } from '@/lib/contactStatus';
+import { csvBlob } from '@/lib/csv';
+import { downloadBlob } from '@/lib/download';
 import { getErrorMessage } from '@/lib/errors';
+import { todayISODate } from '@/lib/format';
+import { cn } from '@/lib/utils';
 
-const ALL_STATUSES = '__all__';
-
-type SortKey = 'name' | 'status' | 'date';
-
-function contactDate(c: ContactListRow): string {
-  return c.submitted_at ?? c.created_at;
-}
-
-function SortHeader({
-  label,
-  sortKey,
-  sort,
-  onSort,
-}: {
-  label: string;
-  sortKey: SortKey;
-  sort: { key: SortKey; ascending: boolean };
-  onSort: (key: SortKey) => void;
-}) {
-  const active = sort.key === sortKey;
-  const Arrow = sort.ascending ? ArrowUp : ArrowDown;
-  return (
-    <TableHead aria-sort={active ? (sort.ascending ? 'ascending' : 'descending') : 'none'}>
-      <button type="button" className="inline-flex items-center gap-1" onClick={() => onSort(sortKey)}>
-        {label}
-        {active && <Arrow className="h-3 w-3" aria-hidden="true" />}
-      </button>
-    </TableHead>
-  );
-}
-
+/**
+ * The contacts page: a fixed 300px index of sections beside the record (nested with
+ * <Outlet key={id}>), or, with no record open, the pipeline board or the Table view.
+ */
 export function ContactsList() {
-  const navigate = useNavigate();
+  const { id } = useParams();
   const queryClient = useQueryClient();
-  const contacts = useQuery({ queryKey: queryKeys.contacts.list(), queryFn: listContacts });
-  const statuses = useContactStatuses();
-  const sources = useLeadSources();
-  const statusByKey = useByKey(statuses.data);
-  const sourceByKey = useByKey(sources.data);
-
+  const [searchParams, setSearchParams] = useSearchParams();
+  const view = searchParams.get('view');
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState(ALL_STATUSES);
-  const [sort, setSort] = useState<{ key: SortKey; ascending: boolean }>({ key: 'date', ascending: false });
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  const contacts = useContacts();
+  const roster = useOrganizationRoster();
+  const orgsByContact = useOrganizationsByContact();
+  const statuses = useContactStatuses();
+  const statusByKey = useByKey(statuses.data);
+  const services = useServiceTypes();
+  const serviceLabels = useMemo(() => new Map((services.data ?? []).map((s) => [s.key, s.label])), [services.data]);
+  const organizations = useMemo(() => roster.data ?? [], [roster.data]);
+  const all = useMemo(() => contacts.data ?? [], [contacts.data]);
+
+  const [list, setList] = useCrmList();
+  const [layout, setLayout] = useCrmLayout();
+  const { collapsed, toggle } = useCollapsedSections(CRM_COLLAPSED_KEY);
+  const [tableFilters, setTableFilters] = useState<CrmTableFilters>(DEFAULT_CRM_TABLE_FILTERS);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkStatus, setBulkStatus] = useState('');
-  const [bulkResult, setBulkResult] = useState<BulkStatusResult | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [deleteOutcomes, setDeleteOutcomes] = useState<DeleteOutcome[] | null>(null);
+  const selecting = selected.size > 0;
 
-  const visible = useMemo(() => {
-    const rows = (contacts.data ?? []).filter(
-      (c) => (statusFilter === ALL_STATUSES || c.status === statusFilter) && matchesContactSearch(c, search),
-    );
-    const direction = sort.ascending ? 1 : -1;
-    const compare = (a: ContactListRow, b: ContactListRow): number => {
-      if (sort.key === 'name') return contactDisplayName(a).localeCompare(contactDisplayName(b));
-      if (sort.key === 'status') {
-        return (statusByKey.get(a.status)?.sort_order ?? 0) - (statusByKey.get(b.status)?.sort_order ?? 0);
+  const statusLabel = useCallback((key: string) => statusByKey.get(key)?.label ?? key, [statusByKey]);
+  /** An organization's name first, else the free-text business on the contact. */
+  const businessOf = useCallback((c: Contact) => orgsByContact.get(c.id)?.[0]?.name ?? c.business_name ?? '', [orgsByContact]);
+
+  // THE one matcher and THE one view resolver, for the index, the board and the table.
+  const matches = useCallback((c: Contact) => matchesCrmSearch(c, orgsByContact.get(c.id) ?? [], search), [orgsByContact, search]);
+  const viewIds = useMemo(() => contactIdsForView(view, all, { serviceLabels, organizations }), [view, all, serviceLabels, organizations]);
+  const inView = useMemo(() => all.filter((c) => (!viewIds || viewIds.has(c.id)) && matches(c)), [all, viewIds, matches]);
+  // The list switch applies only with no view and no search.
+  const listApplies = !view && search.trim() === '';
+  const indexRows = useMemo(() => (listApplies ? inView.filter((c) => statusInList(c.status, list)) : inView), [inView, listApplies, list]);
+  const sections = useMemo(() => bucketBySection(indexRows, statusByKey).filter((s) => s.rows.length > 0), [indexRows, statusByKey]);
+  const figures = useMemo(() => pipelineFigures(unsignedWork(all, { serviceLabels, organizations })), [all, serviceLabels, organizations]);
+
+  const indexSearch = view ? `?view=${encodeURIComponent(view)}` : '';
+  const recordOpen = id !== undefined;
+  const wide = useWide();
+
+  const setView = (next: string | null) => {
+    const params = new URLSearchParams(searchParams);
+    if (next) params.set('view', next);
+    else params.delete('view');
+    setSearchParams(params, { replace: true });
+  };
+
+  const toggleSelect = (contactId: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(contactId)) next.delete(contactId);
+      else next.add(contactId);
+      return next;
+    });
+
+  // ── Stage moves ─────────────────────────────────────────────────
+  const update = useUpdateContact();
+  const movingRef = useRef(new Set<string>());
+  /** One move per contact at a time, and never while a quote for it is saving. */
+  const moveStage = async (contactId: string, status: string) => {
+    const contact = all.find((c) => c.id === contactId);
+    if (!contact || contact.status === status || movingRef.current.has(contactId)) return;
+    if (queryClient.isMutating({ mutationKey: quoteOpMutationKey(contactId) }) > 0) {
+      toast('A quote for this contact is still saving. Try again in a moment.');
+      return;
+    }
+    movingRef.current.add(contactId);
+    try {
+      await update.mutateAsync({ id: contactId, patch: statusChangePatch(status) });
+    } catch (err) {
+      toast.error(getErrorMessage(err, 'The stage was not changed.'));
+    } finally {
+      movingRef.current.delete(contactId);
+    }
+  };
+
+  // ── Bulk ────────────────────────────────────────────────────────
+  const selectedContacts = all.filter((c) => selected.has(c.id));
+
+  const applyStatus = async () => {
+    if (!bulkStatus || bulkBusy) return;
+    setBulkBusy(true);
+    try {
+      const result = await bulkUpdateStatus([...selected], bulkStatus);
+      if (result.error) {
+        toast.error(`Status changed on ${result.updated} of ${result.requested} contacts. ${result.error}`);
+        // Failures stay selected, so they can be tried again.
+        setSelected(new Set(result.failedIds));
+      } else {
+        toast.success(`Status changed on ${result.updated} of ${result.requested} contacts.`);
+        setSelected(new Set());
+        setBulkStatus('');
       }
-      return dateSortKey(contactDate(a)) - dateSortKey(contactDate(b));
-    };
-    return [...rows].sort((a, b) => compare(a, b) * direction);
-  }, [contacts.data, search, statusFilter, sort, statusByKey]);
+    } finally {
+      setBulkBusy(false);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.contacts.all });
+    }
+  };
 
-  const names = useMemo(() => new Map((contacts.data ?? []).map((c) => [c.id, contactDisplayName(c)])), [contacts.data]);
-  const selectedIds = [...selected];
-  const allVisibleSelected = visible.length > 0 && visible.every((c) => selected.has(c.id));
+  const deleteSelected = async () => {
+    setConfirmDelete(false);
+    setBulkBusy(true);
+    try {
+      const outcomes = await deleteContacts([...selected]);
+      const failed = outcomes.filter((o) => !o.ok);
+      const done = outcomes.length - failed.length;
+      const names = new Map(all.map((c) => [c.id, c.full_name || c.business_name || 'Unnamed contact']));
+      if (failed.length === 0) toast.success(`Deleted ${done} of ${outcomes.length} contacts.`);
+      else {
+        toast.error(`Deleted ${done} of ${outcomes.length} contacts.`, {
+          description: failed.map((f) => `${names.get(f.id)}: ${'error' in f ? f.error : ''}`).join(' '),
+        });
+      }
+      // Failures stay selected, so they can be tried again.
+      setSelected(new Set(failed.map((f) => f.id)));
+    } finally {
+      setBulkBusy(false);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.contacts.all });
+    }
+  };
 
-  const bulkStatusMutation = useMutation({
-    mutationFn: () => bulkUpdateStatus(selectedIds, bulkStatus),
-    onSuccess: (result) => setBulkResult(result),
-    onError: (err) => setBulkResult({ requested: selectedIds.length, updated: 0, error: getErrorMessage(err) }),
-    onSettled: () => queryClient.invalidateQueries({ queryKey: queryKeys.contacts.all }),
-  });
+  const exportCsv = (rows: readonly Contact[], name: string) => {
+    downloadBlob(csvBlob(contactCsvRows(rows, { businessOf, statusLabel })), `${name}-${todayISODate()}.csv`);
+  };
 
-  const bulkDeleteMutation = useMutation({
-    mutationFn: () => deleteContacts(selectedIds),
-    onSuccess: (outcomes) => {
-      setDeleteOutcomes(outcomes);
-      const gone = new Set(outcomes.filter((o) => o.ok).map((o) => o.id));
-      setSelected((prev) => new Set([...prev].filter((id) => !gone.has(id))));
-    },
-    onSettled: () => queryClient.invalidateQueries({ queryKey: queryKeys.contacts.all }),
-  });
+  const switchList = (next: CrmListKey) => {
+    setList(next);
+    setSelected(new Set());
+  };
 
-  const toggle = (id: string, on: boolean) =>
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (on) next.add(id);
-      else next.delete(id);
-      return next;
-    });
+  const today = useMemo(() => new Date(), []);
+  // The board and the table live only on wide screens (useWide), so the Layout switch and
+  // the table's export are offered only there.
+  const showTable = wide && !recordOpen && layout === 'table';
 
-  const toggleAllVisible = (on: boolean) =>
-    setSelected((prev) => {
-      const next = new Set(prev);
-      visible.forEach((c) => (on ? next.add(c.id) : next.delete(c.id)));
-      return next;
-    });
+  const headerActions = (
+    <>
+      {wide && !recordOpen && (
+        <Segmented
+          label="Layout"
+          value={layout}
+          onValueChange={setLayout}
+          options={[
+            { value: 'list', label: <><LayoutList aria-hidden="true" />List</> },
+            { value: 'table', label: <><Table2 aria-hidden="true" />Table</> },
+          ]}
+        />
+      )}
+      {figures.length > 0 && (
+        <div className="hidden items-center gap-1 min-[1400px]:flex">
+          {figures.map((f) => (
+            <Toggle
+              key={f.key}
+              size="sm"
+              pressed={view === f.key}
+              onPressedChange={(on) => setView(on ? f.key : null)}
+              aria-label={`${f.label}: ${cadenceText(f) || 'no price yet'}`}
+              className="h-7 gap-1.5 px-2 text-[12px]"
+            >
+              <span className="text-muted-foreground">{f.label}</span>
+              <span className="font-semibold tabular-nums">{cadenceText(f) || `${f.people} unpriced`}</span>
+            </Toggle>
+          ))}
+        </div>
+      )}
+      {showTable && (
+        <Button type="button" size="sm" variant="outline" onClick={() => exportCsv(crmTableRows(inView, tableFilters, { today, mrrOf: tableMrrOf }), 'contacts')}>
+          <Download aria-hidden="true" />
+          Export CSV
+        </Button>
+      )}
+      <Button asChild size="sm">
+        <Link to={links.newContact()}>
+          <Plus aria-hidden="true" />
+          Add contact
+        </Link>
+      </Button>
+    </>
+  );
 
-  const onSort = (key: SortKey) =>
-    setSort((prev) => (prev.key === key ? { key, ascending: !prev.ascending } : { key, ascending: key !== 'date' }));
-
-  if (contacts.isError) {
-    return (
-      <div role="alert" className="flex flex-col items-start gap-2">
+  let indexBody: ReactNode;
+  if (contacts.isPending) indexBody = <p className="px-3 py-4 text-[13px] text-muted-foreground">Loading contacts...</p>;
+  else if (contacts.isError) {
+    indexBody = (
+      <div role="alert" className="px-3 py-4 text-[13px]">
         <p className="font-medium">Could not load contacts.</p>
-        <p className="text-sm text-muted-foreground">{getErrorMessage(contacts.error)}</p>
-        <Button variant="outline" size="sm" onClick={() => void contacts.refetch()}>Try again</Button>
+        <p className="text-muted-foreground">{getErrorMessage(contacts.error)}</p>
       </div>
     );
+  } else if (all.length === 0) {
+    indexBody = <EmptyState title="No contacts yet." description="Add the first one to start the pipeline." action={<Button asChild size="sm"><Link to={links.newContact()}>Add contact</Link></Button>} />;
+  } else if (sections.length === 0) indexBody = <p className="px-3 py-4 text-[13px] text-muted-foreground">No contacts match.</p>;
+  else {
+    const filtering = !listApplies;
+    indexBody = sections.map((s) => (
+      <ContactIndexGroup
+        key={s.status}
+        section={s}
+        label={statusLabel(s.status)}
+        count={s.rows.length}
+        collapsed={!filtering && !!s.collapsible && (collapsed[s.status] ?? true)}
+        onToggle={() => toggle(s.status)}
+      >
+        {s.rows.map((c) => (
+          <ContactIndexRow
+            key={c.id}
+            contact={c}
+            status={statusByKey.get(c.status)}
+            selected={selected.has(c.id)}
+            selecting={selecting}
+            onToggleSelect={toggleSelect}
+            search={indexSearch}
+          />
+        ))}
+      </ContactIndexGroup>
+    ));
   }
 
-  const failures = deleteOutcomes?.filter((o): o is Extract<DeleteOutcome, { ok: false }> => !o.ok) ?? [];
+  const selectableStatuses = (statuses.data ?? []).filter((s) => !isSystemStatus(s.key));
 
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-xl font-semibold">Contacts</h1>
-        <Button asChild size="sm">
-          <Link to="/contacts/new"><Plus aria-hidden="true" />Add contact</Link>
-        </Button>
-      </div>
-
-      <div className="flex flex-col gap-2 sm:flex-row">
-        <Input
-          aria-label="Search contacts"
-          placeholder="Search name, email, phone or business"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="sm:max-w-sm"
-        />
-        <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger aria-label="Filter by status" className="sm:w-48">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL_STATUSES}>All statuses</SelectItem>
-            {(statuses.data ?? []).map((s) => (
-              <SelectItem key={s.key} value={s.key}>{s.label}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {selected.size > 0 && (
-        <div className="flex flex-wrap items-center gap-2 rounded-md border p-2">
-          <span className="text-sm">{selected.size} selected</span>
-          <Select value={bulkStatus} onValueChange={setBulkStatus}>
-            <SelectTrigger aria-label="New status" className="w-44">
-              <SelectValue placeholder="Change status to..." />
-            </SelectTrigger>
-            <SelectContent>
-              {(statuses.data ?? []).map((s) => (
-                <SelectItem key={s.key} value={s.key}>{s.label}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={!bulkStatus || bulkStatusMutation.isPending}
-            onClick={() => {
-              setBulkResult(null);
-              bulkStatusMutation.mutate();
-            }}
-          >
-            Apply status
-          </Button>
-          <Button
-            size="sm"
-            variant="destructive"
-            disabled={bulkDeleteMutation.isPending}
-            onClick={() => setConfirmDelete(true)}
-          >
-            {bulkDeleteMutation.isPending ? 'Deleting...' : 'Delete'}
-          </Button>
-        </div>
-      )}
-
-      {bulkResult && (
-        <p role="status" className="text-sm">
-          {bulkResult.error
-            ? `Status changed on ${bulkResult.updated} of ${bulkResult.requested} contacts. ${bulkResult.error}`
-            : `Status changed on ${bulkResult.updated} of ${bulkResult.requested} contacts.`}
-        </p>
-      )}
-
-      {deleteOutcomes && (
-        <div role="status" className="flex flex-col gap-1 text-sm">
-          <p>Deleted {deleteOutcomes.length - failures.length} of {deleteOutcomes.length} contacts.</p>
-          {failures.length > 0 && (
-            <ul className="list-disc pl-5 text-destructive">
-              {failures.map((f) => (
-                <li key={f.id}>{names.get(f.id) ?? f.id}: {f.error}</li>
-              ))}
-            </ul>
+    <>
+      <PageHeader title="Contacts" subtitle={contacts.data ? `${all.length} contacts` : undefined} actions={headerActions} />
+      <div className="flex h-full min-h-0 flex-1">
+        <div className={cn('relative flex min-h-0 shrink-0 flex-col border-r border-border', 'w-full lg:w-[300px]', recordOpen && 'max-lg:hidden')}>
+          <div className="flex flex-col gap-2 border-b border-border p-3">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+              <Input aria-label="Search contacts" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search" className="h-8 pl-8 text-[13px]" />
+            </div>
+            <Segmented<CrmListKey>
+              label="List"
+              value={list}
+              onValueChange={switchList}
+              options={CRM_LISTS.map((l) => ({ value: l.key, label: l.label, disabled: bulkBusy || !listApplies }))}
+            />
+            {view && (
+              <div className="flex items-center gap-1 text-[12px] text-muted-foreground">
+                Filtered by the board
+                <ClickRegion onClick={() => setView(null)} aria-label="Clear list filter" className="inline-flex rounded-sm p-0.5 hover:bg-muted">
+                  <X className="h-3 w-3" aria-hidden="true" />
+                </ClickRegion>
+              </div>
+            )}
+          </div>
+          <ScrollArea className="min-h-0 flex-1" fitWidth>
+            <div className={cn('pb-3', selecting && 'pb-36')}>{indexBody}</div>
+          </ScrollArea>
+          {selecting && (
+            <div role="region" aria-label="Selected contacts" className="absolute inset-x-2 bottom-2 flex flex-col gap-2 rounded-lg border border-border bg-popover p-2.5 text-[13px] shadow-lg">
+              <div className="flex items-center justify-between">
+                <span className="font-medium">{selected.size} selected</span>
+                <Button type="button" size="xs" variant="ghost" onClick={() => setSelected(new Set())}>Clear</Button>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Select value={bulkStatus} onValueChange={setBulkStatus}>
+                  <SelectTrigger aria-label="New status" className="h-7 min-w-0 flex-1 text-[12px]"><SelectValue placeholder="Change status" /></SelectTrigger>
+                  <SelectContent>
+                    {selectableStatuses.map((s) => <SelectItem key={s.key} value={s.key}>{s.label}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                <Button type="button" size="xs" disabled={!bulkStatus || bulkBusy} onClick={() => void applyStatus()}>Apply status</Button>
+              </div>
+              <div className="flex items-center gap-1.5">
+                {bulkBusy ? (
+                  <Button type="button" size="xs" variant="outline" disabled>Email them</Button>
+                ) : (
+                  <Button asChild size="xs" variant="outline">
+                    <Link to={links.newGroupEmail([...selected])}>Email them</Link>
+                  </Button>
+                )}
+                <Button type="button" size="xs" variant="outline" disabled={bulkBusy} onClick={() => exportCsv(selectedContacts, 'contacts-selected')}>
+                  Export CSV
+                </Button>
+                <Button type="button" size="xs" variant="outline" className="text-destructive" disabled={bulkBusy} onClick={() => setConfirmDelete(true)}>
+                  Delete
+                </Button>
+              </div>
+            </div>
           )}
         </div>
-      )}
-
-      {contacts.isPending ? (
-        <p className="text-muted-foreground">Loading contacts...</p>
-      ) : contacts.data.length === 0 ? (
-        <div className="flex flex-col items-start gap-2 rounded-md border p-6">
-          <p className="font-medium">No contacts yet.</p>
-          <p className="text-sm text-muted-foreground">Add your first contact to start your pipeline.</p>
+        <div className={cn('min-h-0 min-w-0 flex-1', !recordOpen && 'max-lg:hidden')}>
+          {recordOpen ? (
+            <Outlet key={id} />
+          ) : !wide ? null : showTable ? (
+            <CrmTable
+              contacts={inView}
+              total={all.length}
+              filters={tableFilters}
+              onFilters={setTableFilters}
+              statuses={statuses.data ?? []}
+              businessOf={businessOf}
+              today={today}
+            />
+          ) : (
+            <CrmBoard
+              contacts={all}
+              organizations={organizations}
+              serviceLabels={serviceLabels}
+              statusByKey={statusByKey}
+              search={search}
+              onSearch={setSearch}
+              matches={matches}
+              view={view}
+              onView={setView}
+              loading={contacts.isPending}
+              onMoveStage={moveStage}
+            />
+          )}
         </div>
-      ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-8">
-                <Checkbox
-                  aria-label="Select all shown contacts"
-                  checked={allVisibleSelected}
-                  onCheckedChange={(v) => toggleAllVisible(v === true)}
-                />
-              </TableHead>
-              <SortHeader label="Name" sortKey="name" sort={sort} onSort={onSort} />
-              <TableHead>Business</TableHead>
-              <TableHead>Email</TableHead>
-              <TableHead>Phone</TableHead>
-              <SortHeader label="Status" sortKey="status" sort={sort} onSort={onSort} />
-              <TableHead>Source</TableHead>
-              <SortHeader label="Date" sortKey="date" sort={sort} onSort={onSort} />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {visible.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={8} className="text-center text-muted-foreground">
-                  No contacts match.
-                </TableCell>
-              </TableRow>
-            )}
-            {visible.map((c) => (
-              <TableRow
-                key={c.id}
-                className="cursor-pointer"
-                data-state={selected.has(c.id) ? 'selected' : undefined}
-                onClick={() => navigate(`/contacts/${c.id}`)}
-              >
-                <TableCell onClick={(e) => e.stopPropagation()}>
-                  <Checkbox
-                    aria-label={`Select ${contactDisplayName(c)}`}
-                    checked={selected.has(c.id)}
-                    onCheckedChange={(v) => toggle(c.id, v === true)}
-                  />
-                </TableCell>
-                <TableCell className="font-medium">
-                  <Link to={`/contacts/${c.id}`} onClick={(e) => e.stopPropagation()}>{contactDisplayName(c)}</Link>
-                </TableCell>
-                <TableCell>{c.business_name}</TableCell>
-                <TableCell>{c.email}</TableCell>
-                <TableCell>{c.phone}</TableCell>
-                <TableCell><StatusBadge statusKey={c.status} status={statusByKey.get(c.status)} /></TableCell>
-                <TableCell>{sourceByKey.get(c.source)?.label ?? c.source}</TableCell>
-                <TableCell>{formatDate(contactDate(c))}</TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      )}
+      </div>
 
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete {selected.size} contacts?</AlertDialogTitle>
             <AlertDialogDescription>
-              This permanently deletes the selected contacts and everything recorded on them. It cannot be undone.
+              Each contact is deleted with everything recorded on it. This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                setDeleteOutcomes(null);
-                bulkDeleteMutation.mutate();
-              }}
-            >
+            <AlertDialogAction className="bg-destructive text-destructive-foreground hover:bg-destructive/90" onClick={() => void deleteSelected()}>
               Delete contacts
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+    </>
   );
 }

@@ -138,6 +138,16 @@ describe('the buckets, against 0001', () => {
     expect(await checkPublicLimits(client, { ...opts, ip: '198.51.100.3' })).toBe('allowed');
     expect(await checkPublicLimits(client, { ...opts, ip: '198.51.100.4' })).toBe('limited');
   });
+
+  it('checkPublicLimits: once the shared ceiling is spent, a fresh address records no row', async () => {
+    const opts = { action: 'test.spent', perIp: { max: 5, windowMinutes: 5 }, global: { max: 2, windowMinutes: 5 } };
+    await db.query(`INSERT INTO public.auth_rate_limits (action) VALUES ('test.spent.global'), ('test.spent.global')`);
+    for (const ip of ['203.0.113.21', '203.0.113.22', null]) {
+      expect(await checkPublicLimits(client, { ...opts, ip })).toBe('limited');
+    }
+    const [ipRows] = await rows(`SELECT count(*)::int AS n FROM public.auth_rate_limits WHERE action = 'test.spent.ip'`);
+    expect(ipRows.n).toBe(0);
+  });
 });
 
 describe('the wrappers fail closed', () => {
@@ -158,16 +168,33 @@ describe('the wrappers fail closed', () => {
     }
   });
 
-  it('checkPublicLimits stops at an unavailable address bucket', async () => {
-    const calls: string[] = [];
-    const db2: RateLimitClient = {
-      rpc: async (fn) => {
-        calls.push(fn);
-        return { data: null, error: { code: 'XX000' } };
+  it('checkPublicLimits makes one call, names every argument, and reads it fail-closed', async () => {
+    const calls: Array<{ fn: string; args?: Record<string, unknown> }> = [];
+    const recording = (result: { data: unknown; error: unknown }): RateLimitClient => ({
+      rpc: async (fn, args) => {
+        calls.push({ fn, args });
+        return result;
       },
+    });
+    const opts = {
+      action: 'test.one',
+      ip: '192.0.2.1',
+      userAgent: 'x'.repeat(600),
+      perIp: { max: 3, windowMinutes: 10 },
+      global: { max: 50, windowMinutes: 60 },
     };
-    const opts = { action: 'test.stop', ip: '192.0.2.1', perIp: limit, global: limit };
-    expect(await checkPublicLimits(db2, opts)).toBe('unavailable');
-    expect(calls).toEqual(['check_auth_ip_rate_limit']);
+    expect(await checkPublicLimits(recording({ data: 1, error: null }), opts)).toBe('allowed');
+    expect(calls).toEqual([{
+      fn: 'check_public_rate_limit',
+      args: {
+        p_action: 'test.one', p_ip: '192.0.2.1', p_ip_max: 3, p_ip_window_minutes: 10,
+        p_global_max: 50, p_global_window_minutes: 60, p_user_agent: 'x'.repeat(512),
+      },
+    }]);
+    expect(await checkPublicLimits(recording({ data: null, error: null }), opts)).toBe('limited');
+    expect(await checkPublicLimits(recording({ data: null, error: { code: 'XX000' } }), opts)).toBe('unavailable');
+    expect(await checkPublicLimits(recording({ data: 0, error: null }), opts)).toBe('unavailable');
+    const throwing: RateLimitClient = { rpc: () => { throw new Error('network'); } };
+    expect(await checkPublicLimits(throwing, opts)).toBe('unavailable');
   });
 });

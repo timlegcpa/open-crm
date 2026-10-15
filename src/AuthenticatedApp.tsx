@@ -4,6 +4,7 @@ import { MfaChallenge } from '@/components/auth/MfaChallenge';
 import { SignInForm } from '@/components/auth/SignInForm';
 import { Button } from '@/components/ui/button';
 import { lazyNamed } from '@/features/lazy';
+import { lockEncryptionSession } from '@/features/messages/keySession';
 import type { ShellProps } from '@/features/types';
 import { AuthProvider, useAuth } from '@/lib/auth';
 import { queryClient } from '@/lib/queryClient';
@@ -47,19 +48,28 @@ function useOrgName(): string | null {
   return name;
 }
 
+/**
+ * One recovery path: a password-reset link lands on the public /reset-password page
+ * (settings' ResetPasswordPage), which reads the token from the address, sets the new
+ * password over Auth's REST API and signs every session out. That route is public, so this
+ * gate and its Supabase client (which would otherwise turn the link's token into a session
+ * on its own) never load for it, and the gate has no set-new-password screen of its own.
+ */
 function Gate() {
   const { session, isLoadingAuth, mfaGate, principal, logout } = useAuth();
   const orgName = useOrgName();
 
-  // Nothing one principal fetched may outlive it: the cache is cleared whenever the
-  // signed-in user or what the database says about them changes (sign-out included). The
-  // app renders only once the clear has run for the CURRENT principal, so a screen's first
-  // queries can never be wiped by, or mixed with, a clear meant for the previous one.
+  // Nothing one principal fetched may outlive it: the cache is cleared, and the unlocked
+  // messages key dropped, whenever the signed-in user or what the database says about them
+  // changes (sign-out included). The app renders only once the clear has run for the
+  // CURRENT principal, so a screen's first queries can never be wiped by, or mixed with, a
+  // clear meant for the previous one.
   const userId = session?.user?.id ?? null;
   const principalKey = `${userId ?? ''}:${principal}`;
   const [clearedFor, setClearedFor] = useState<string | null>(null);
   useEffect(() => {
     queryClient.clear();
+    lockEncryptionSession();
     setClearedFor(principalKey);
   }, [principalKey]);
 

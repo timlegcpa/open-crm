@@ -2,7 +2,7 @@
 // The three wire formats, proven against an independent AES-GCM implementation
 // (node:crypto), not only against themselves: a value node writes in the documented
 // layout opens here, and a value written here opens in node.
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   base64ToBytes,
@@ -15,6 +15,8 @@ import {
   encryptPiiSplit,
   fromBytea,
   importAesKey,
+  randomTokenBase64Url,
+  sha256Hex,
   toByteaHex,
 } from '../../../supabase/functions/_shared/crypto';
 
@@ -167,5 +169,21 @@ describe('bytea and base64 helpers', () => {
   it('a pii value survives the trip through a bytea column', async () => {
     const blob = await encryptPii(PLAIN, KEY_B64);
     expect(await decryptPii(fromBytea(toByteaHex(blob)), KEY_B64)).toBe(PLAIN);
+  });
+});
+
+describe('tokens and hashes', () => {
+  it('sha256Hex is the SHA-256 of the UTF-8 bytes, in lowercase hex', async () => {
+    for (const input of ['', 'token-abc_123', 'Ada Lovelace é\u{1F600}']) {
+      expect(await sha256Hex(input)).toBe(createHash('sha256').update(input, 'utf8').digest('hex'));
+    }
+  });
+
+  it('randomTokenBase64Url is 32 random bytes as unpadded base64url', () => {
+    const a = randomTokenBase64Url();
+    const b = randomTokenBase64Url();
+    expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(Buffer.from(a, 'base64url')).toHaveLength(32);
+    expect(a).not.toBe(b);
   });
 });

@@ -94,6 +94,68 @@ describeEdgeContract({
   body: { kind: 'json', valid: { a: 1 }, maxBytes: 256 },
 });
 
+const API_KEY = `key_${'k'.repeat(40)}`;
+const apiKeyFn = (over: { verify?: (presented: string) => Promise<boolean>; outcome?: RateLimitOutcome; handle?: typeof ok } = {}) =>
+  sample({
+    auth: { apiKey: { verify: over.verify ?? (async (presented) => presented === API_KEY) } },
+    rateLimit: async () => over.outcome ?? 'allowed',
+    handle: (over.handle ?? ok) as never,
+  });
+describeEdgeContract({
+  name: 'apiKey function',
+  handler: apiKeyFn(),
+  failingHandler: apiKeyFn({ handle: throwInternal }),
+  limitedHandler: apiKeyFn({ outcome: 'limited' }),
+  credentials: { 'x-api-key': API_KEY },
+  body: { kind: 'json', valid: { a: 1 }, maxBytes: 256 },
+});
+
+describe('createHandler: the apiKey mode', () => {
+  it('takes the key in x-api-key, as a Bearer value or as a bare Authorization value', async () => {
+    for (const headers of [{ 'x-api-key': API_KEY }, { Authorization: `Bearer ${API_KEY}` }, { Authorization: API_KEY }] as Record<string, string>[]) {
+      const res = await apiKeyFn()(edgeRequest({ origin: null, headers, body: {} }));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ kind: 'apiKey', body: {} });
+    }
+  });
+
+  it('refuses a wrong, missing or oddly sized key with 401 before the limiter, never calling verify on a missing one', async () => {
+    const verify = vi.fn(async (presented: string) => presented === API_KEY);
+    const rateLimit = vi.fn(async (): Promise<RateLimitOutcome> => 'allowed');
+    const fn = sample({ auth: { apiKey: { verify } }, rateLimit });
+    for (const headers of [{ 'x-api-key': `${API_KEY}x` }, {}, { 'x-api-key': 'short' }, { 'x-api-key': 'x'.repeat(201) }] as Record<string, string>[]) {
+      const res = await fn(edgeRequest({ origin: null, headers, body: '{not json' }));
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: REFUSALS.unauthenticated.error, code: REFUSALS.unauthenticated.code });
+    }
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(rateLimit).not.toHaveBeenCalled();
+  });
+
+  it('answers 503 when the key cannot be checked, never letting the call through', async () => {
+    const handle = vi.fn(ok);
+    const fn = apiKeyFn({ verify: async () => { throw new Error('db down'); }, handle });
+    const res = await fn(edgeRequest({ origin: null, headers: { 'x-api-key': API_KEY }, body: {} }));
+    expect(res.status).toBe(503);
+    expect(handle).not.toHaveBeenCalled();
+  });
+
+  it('a verify that answers anything but true is a refusal', async () => {
+    const fn = apiKeyFn({ verify: async () => 'yes' as never });
+    expect((await fn(edgeRequest({ origin: null, headers: { 'x-api-key': API_KEY }, body: {} }))).status).toBe(401);
+  });
+});
+
+describe('createHandler: allowHeaders', () => {
+  it('adds the named request headers to the CORS grant, after the base four', async () => {
+    const fn = sample({ auth: { owner: fakeOwnerAuth() }, allowHeaders: ['mcp-session-id', 'mcp-protocol-version'] });
+    const pre = await fn(edgeRequest({ method: 'OPTIONS' }));
+    expect(pre.headers.get('Access-Control-Allow-Headers')).toBe('authorization, x-client-info, apikey, content-type, mcp-session-id, mcp-protocol-version');
+    const res = await fn(edgeRequest({ headers: CREDENTIALS.owner, body: {} }));
+    expect(res.headers.get('Access-Control-Allow-Headers')).toContain('mcp-session-id');
+  });
+});
+
 const uploadForm = () => {
   const form = new FormData();
   form.set('folder', 'inbox');
@@ -325,6 +387,54 @@ describe("createHandler: the function's own Response", () => {
     expect(fromElsewhere.headers.get('Access-Control-Allow-Origin')).toBeNull();
   });
 
+  it('labels a JSON body built from a bare string application/json, never text/plain', async () => {
+    const fn = sample({ auth: { owner: fakeOwnerAuth() }, handle: async () => new Response(JSON.stringify({ a: 1 }), { status: 201 }) });
+    const res = await fn(edgeRequest({ headers: CREDENTIALS.owner, body: {} }));
+    expect(res.status).toBe(201);
+    expect(res.headers.get('Content-Type')).toBe('application/json');
+    expect(await res.json()).toEqual({ a: 1 });
+
+    const array = sample({ auth: { owner: fakeOwnerAuth() }, handle: async () => new Response(' [1, 2]') });
+    expect((await array(edgeRequest({ headers: CREDENTIALS.owner, body: {} }))).headers.get('Content-Type')).toBe('application/json');
+
+    // The default label in any case is still the default.
+    const shouted = sample({ auth: { owner: fakeOwnerAuth() }, handle: async () => new Response('{"a":1}', { headers: { 'Content-Type': 'TEXT/PLAIN;CHARSET=UTF-8' } }) });
+    expect((await shouted(edgeRequest({ headers: CREDENTIALS.owner, body: {} }))).headers.get('Content-Type')).toBe('application/json');
+  });
+
+  it('keeps a text/plain the function chose, even when the body reads as JSON', async () => {
+    for (const type of ['text/plain', 'text/plain; charset=utf-8', 'text/plain;charset=us-ascii']) {
+      const fn = sample({ auth: { owner: fakeOwnerAuth() }, handle: async () => new Response('{"a":1}', { headers: { 'Content-Type': type } }) });
+      const res = await fn(edgeRequest({ headers: CREDENTIALS.owner, body: {} }));
+      expect([type, res.headers.get('Content-Type')]).toEqual([type, type]);
+      expect(await res.text()).toBe('{"a":1}');
+    }
+  });
+
+  it('drops a Content-Length the function set when the body is rebuilt, and keeps it otherwise', async () => {
+    const body = JSON.stringify({ a: 1 });
+    const rebuilt = sample({ auth: { owner: fakeOwnerAuth() }, handle: async () => new Response(body, { headers: { 'Content-Length': '999' } }) });
+    const res = await rebuilt(edgeRequest({ headers: CREDENTIALS.owner, body: {} }));
+    expect(res.headers.get('Content-Type')).toBe('application/json');
+    expect(res.headers.get('Content-Length')).toBeNull();
+    expect(await res.json()).toEqual({ a: 1 });
+
+    const typed = sample({
+      auth: { owner: fakeOwnerAuth() },
+      handle: async () => new Response(body, { headers: { 'Content-Type': 'application/json', 'Content-Length': String(body.length) } }),
+    });
+    expect((await typed(edgeRequest({ headers: CREDENTIALS.owner, body: {} }))).headers.get('Content-Length')).toBe(String(body.length));
+  });
+
+  it('keeps text/plain for a body that is not a JSON object or array', async () => {
+    for (const text of ['You are unsubscribed.', '42', '{not json']) {
+      const fn = sample({ auth: { owner: fakeOwnerAuth() }, handle: async () => new Response(text, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }) });
+      const res = await fn(edgeRequest({ headers: CREDENTIALS.owner, body: {} }));
+      expect(res.headers.get('Content-Type')).toBe('text/plain; charset=utf-8');
+      expect(await res.text()).toBe(text);
+    }
+  });
+
   it('keeps a 204 with no body', async () => {
     const fn = sample({ auth: { owner: fakeOwnerAuth() }, handle: async () => new Response(null, { status: 204 }) });
     const res = await fn(edgeRequest({ headers: CREDENTIALS.owner, body: {} }));
@@ -367,10 +477,13 @@ describe("createHandler: the function's own Response", () => {
 describe('createHandler: refuses to start misconfigured', () => {
   const handle = ok as never;
   const base = { name: 'bad', allowedOrigins: [ALLOWED_ORIGIN], handle };
-  it.each([
+  it.each<[string, unknown, RegExp]>([
     ['no auth mode', { ...base, auth: {} }, /at least one auth mode/],
     ['public plus owner', { ...base, auth: { public: true, owner: fakeOwnerAuth() }, rateLimit: async () => 'allowed' }, /cannot be combined/],
     ['public without a rate limit', { ...base, auth: { public: true } }, /must declare rateLimit/],
+    ['apiKey plus owner', { ...base, auth: { apiKey: { verify: async () => true }, owner: fakeOwnerAuth() }, rateLimit: async () => 'allowed' }, /apiKey cannot be combined/],
+    ['apiKey without a rate limit', { ...base, auth: { apiKey: { verify: async () => true } } }, /apiKey function must declare rateLimit/],
+    ['an allowHeaders entry that is not a lowercase header name', { ...base, auth: { owner: fakeOwnerAuth() }, allowHeaders: ['Mcp-Session-Id'] }, /allowHeaders/],
     ['the client mode without a clientWrites decision', { ...base, auth: { client: fakeClientAuth() } }, /must declare clientWrites/],
     ['clientWrites without the client mode', { ...base, auth: { owner: fakeOwnerAuth() }, clientWrites: true }, /clientWrites/],
     ['GET with a JSON body', { ...base, auth: { owner: fakeOwnerAuth() }, methods: ['GET'] }, /GET function/],

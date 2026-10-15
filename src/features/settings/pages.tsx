@@ -5,9 +5,11 @@ import { links } from '@/features/links';
 import { settingsSections } from '@/features/registry';
 import { cn } from '@/lib/utils';
 
-// Placeholders: the settings feature replaces these. The page already composes the
-// registry's `settingsSections`, so a feature's section shows up here as soon as it is
-// registered.
+/**
+ * The control center. It composes the registry's `settingsSections` (this feature's own and
+ * any other feature's), so a section shows up here as soon as it is registered. With no
+ * section in the address, the first one opens.
+ */
 
 export function SettingsPage() {
   const { section } = useParams();
@@ -47,12 +49,4 @@ export function SettingsPage() {
       </div>
     </>
   );
-}
-
-export function ProfileSettings() {
-  return <p className="text-[13px] text-muted-foreground">The organization's name, logo and contact details.</p>;
-}
-
-export function SecuritySettings() {
-  return <p className="text-[13px] text-muted-foreground">Your password and authenticator app.</p>;
 }

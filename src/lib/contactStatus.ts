@@ -65,6 +65,13 @@ export type PipelineStatus = (typeof PIPELINE_STATUSES)[number];
 export const CLIENT_LIKE_STATUSES = ['client', 'one_time'] as const;
 
 /**
+ * Won: paying in any shape, or paid and since left. A client later marked `former_client`
+ * still counts as won (in the month they were won): dropping them would rewrite past months
+ * every time a client leaves. Won is gross, so `lost` and `cold` (never paid) are not here.
+ */
+export const WON_STATUSES = [...CLIENT_LIKE_STATUSES, 'former_client'] as const;
+
+/**
  * Counts toward "active pipeline" rollups. An inclusion set on purpose: a parked lead
  * (`cold`), a client who left, a lost lead and a signer-only contact are not live work, and
  * an exclusion list would silently count any status added later.
@@ -93,5 +100,6 @@ export const isTerminalStatus = (s: string) => has(TERMINAL_STATUSES, s);
 export const isLeadLike = (s: string) => has(LEAD_LIKE_STATUSES, s);
 export const isPipelineStatus = (s: string) => has(PIPELINE_STATUSES, s);
 export const isClientLike = (s: string) => has(CLIENT_LIKE_STATUSES, s);
+export const isWonStatus = (s: string) => has(WON_STATUSES, s);
 export const isActivePipelineStatus = (s: string) => has(ACTIVE_PIPELINE_STATUSES, s);
 export const isEmailableStatus = (s: string) => has(EMAILABLE_STATUSES, s);

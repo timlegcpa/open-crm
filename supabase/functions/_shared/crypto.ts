@@ -111,6 +111,17 @@ export async function decryptPiiSplit(ciphertext: Uint8Array, iv: Uint8Array, ke
   return new TextDecoder().decode(await open(ciphertext, iv, keyB64));
 }
 
+/** The SHA-256 of a string's UTF-8 bytes, as 64 lowercase hex characters (a stored token's hash). */
+export async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** 32 random bytes as unpadded base64url (43 characters): a token safe in a URL. */
+export function randomTokenBase64Url(): string {
+  return bytesToBase64(crypto.getRandomValues(new Uint8Array(32))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 /** Bytes to the PostgREST bytea literal, '\x0102..'. */
 export function toByteaHex(bytes: Uint8Array): string {
   return '\\x' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');

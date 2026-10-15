@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 import path from 'path'
 import { pdfjsAssets } from './scripts/pdfjs-assets.mjs'
+import { wellKnownMetadata } from './scripts/well-known.mjs'
 
 // A public page's module lives under src/features/<domain>/public/. Its chunk is named
 // `public-*` so src/__tests__/bundleBoundary.test.ts can prove, after a build, that no
@@ -10,7 +11,7 @@ import { pdfjsAssets } from './scripts/pdfjs-assets.mjs'
 const PUBLIC_PAGE = /[\\/]src[\\/]features[\\/][^\\/]+[\\/]public[\\/]/
 
 export default defineConfig({
-  plugins: [react(), pdfjsAssets()],
+  plugins: [react(), pdfjsAssets(), wellKnownMetadata()],
   resolve: {
     alias: {
       '@': path.resolve(import.meta.dirname, './src'),

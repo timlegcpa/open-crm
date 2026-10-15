@@ -4,7 +4,9 @@
 -- and cost per acquisition. Revenue groups by service_types and leads count by
 -- lead_sources, both seeded in 0002; never a hardcoded list.
 --
--- Depends on: 0002_contacts (contact_services, service_types, lead_sources).
+-- Depends on: 0001_core (is_owner, mfa_session_ok, set_updated_at). The page also reads
+-- 0002_contacts (contacts, contact_services, contact_upsells and the pick-lists), but no
+-- object here refers to them.
 --
 -- Rules, as for every migration in this schema. src/__tests__/db/invariants.test.ts reads
 -- the migrated catalog and fails the build when a table or function here breaks one:
@@ -39,4 +41,61 @@
 --   * No cron schedules in a migration: scheduled work is a row in public.jobs run by the
 --     job-runner, or a schedule the adopter sets up outside the migrations.
 --
--- Allocated empty; the domain's tables arrive with its build.
+
+-- ---------------------------------------------------------------------------
+-- Monthly goals and ad spend
+-- ---------------------------------------------------------------------------
+
+-- One row per calendar month ('YYYY-MM', the key every screen groups months by). The name
+-- says goals, but the row also holds that month's ad spend, the figure cost per lead and
+-- cost per acquisition divide. Spend is one amount per month with no channel on it.
+--
+-- A NULL target means "no target set" and 0 is a target of zero: the marketing table
+-- draws the two differently ("7" against "7 / 0"), so the targets carry no default and a
+-- spend-only row leaves them NULL. Spend has nothing to tell apart, so it defaults to 0.
+CREATE TABLE public.monthly_goals (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  month text NOT NULL UNIQUE CHECK (month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
+  new_leads_target smallint CHECK (new_leads_target IS NULL OR new_leads_target >= 0),
+  closed_clients_target smallint CHECK (closed_clients_target IS NULL OR closed_clients_target >= 0),
+  ad_spend numeric(15, 2) NOT NULL DEFAULT 0 CHECK (ad_spend >= 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TRIGGER trg_monthly_goals_updated_at
+  BEFORE UPDATE ON public.monthly_goals
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- Row-level security
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE public.monthly_goals ENABLE ROW LEVEL SECURITY;
+
+-- The owner's alone. No client reads or writes a goal, so the table needs no
+-- View-as-client trigger: a client session matches no policy here.
+CREATE POLICY monthly_goals_owner_all ON public.monthly_goals
+  FOR ALL TO authenticated
+  USING ((SELECT public.is_owner())) WITH CHECK ((SELECT public.is_owner()));
+
+CREATE POLICY monthly_goals_mfa_gate ON public.monthly_goals
+  AS RESTRICTIVE FOR ALL TO authenticated
+  USING ((SELECT public.mfa_session_ok())) WITH CHECK ((SELECT public.mfa_session_ok()));
+
+-- ---------------------------------------------------------------------------
+-- Privileges
+-- ---------------------------------------------------------------------------
+
+REVOKE ALL ON public.monthly_goals FROM PUBLIC, anon, authenticated, service_role;
+
+-- The server: row access only, no TRUNCATE (it skips RLS and row triggers).
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.monthly_goals TO service_role;
+
+-- Signed-in sessions: a month is created once and never renamed (every screen keys on
+-- it), so it is insert-only. No DELETE: no screen removes a month, and an emptied month
+-- is a row with NULL targets and zero spend.
+GRANT SELECT,
+  INSERT (month, new_leads_target, closed_clients_target, ad_spend),
+  UPDATE (new_leads_target, closed_clients_target, ad_spend)
+ON public.monthly_goals TO authenticated;

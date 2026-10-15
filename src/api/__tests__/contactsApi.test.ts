@@ -9,6 +9,7 @@ import {
   bulkUpdateStatus,
   createContact,
   deleteContact,
+  contactPatchPayload,
   deleteContacts,
   listContacts,
   updateContact,
@@ -26,8 +27,18 @@ const A = '10000000-0000-4000-8000-00000000000a';
 const B = '10000000-0000-4000-8000-00000000000b';
 const C = '10000000-0000-4000-8000-00000000000c';
 
-function contactRow(id: string, first: string, last = '') {
-  return { id, first_name: first, last_name: last, full_name: last ? `${first} ${last}` : first, business_name: null, status: 'new_lead', source: 'other' };
+function contactRow(id: string, first: string, last = '', extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    first_name: first,
+    last_name: last,
+    full_name: last ? `${first} ${last}` : first,
+    business_name: null,
+    status: 'new_lead',
+    source: 'other',
+    client_since: null,
+    ...extra,
+  };
 }
 
 beforeEach(() => fake.reset());
@@ -43,6 +54,13 @@ describe('contacts', () => {
     expect(selects).toHaveLength(2);
     expect(selects[0].filters).toEqual([]);
     expect(selects[1].filters).toEqual([{ type: 'gt', column: 'id', value: all[999].id }]);
+  });
+
+  it('reads the quotes with every contact, and a contact with none has an empty list', async () => {
+    fake.state.tables.contacts = [contactRow(A, 'Ada')];
+    const [row] = await listContacts();
+    expect(fake.calls('contacts', 'select')[0].columns).toContain('contact_services(');
+    expect(row.contact_services).toEqual([]);
   });
 
   it('throws instead of returning a partial list when a page fails', async () => {
@@ -73,6 +91,8 @@ describe('contacts', () => {
       source: 'referral',
       submitted_at: '2026-01-02T05:00:00.000Z',
     });
+    // client_since is the database's to stamp: the browser never sends it.
+    expect(insert.payload).not.toHaveProperty('client_since');
   });
 
   it('a field update sends only allow-listed columns, dropping anything else', async () => {
@@ -80,8 +100,8 @@ describe('contacts', () => {
     await updateContact(A, {
       first_name: 'Ada',
       mailing_city: 'Springfield',
-      // Not editable from the form: must not ride along.
-      ...({ email: 'x@example.com', full_name: 'Forged', status_history: [], delete_claim: 'x' } as object),
+      // Not writable from the CRM: must not ride along.
+      ...({ email: 'x@example.com', spouse_email: 'y@example.com', full_name: 'Forged', status_history: [], delete_claim: 'x' } as object),
     });
     const [update] = fake.calls('contacts', 'update');
     expect(update.payload).toEqual({ first_name: 'Ada', mailing_city: 'Springfield' });
@@ -92,14 +112,43 @@ describe('contacts', () => {
     await expect(updateContact(A, { first_name: 'Ada' })).rejects.toThrow('may have been deleted');
   });
 
-  it('bulk status writes status and nothing else, and counts the rows it reached', async () => {
-    fake.state.tables.contacts = [contactRow(A, 'Ada'), contactRow(B, 'Bo')];
-    const result = await bulkUpdateStatus([A, B, C], 'client');
-    expect(result).toEqual({ requested: 3, updated: 2, error: null });
+  it('a field update stores a cleared field as null, but a cleared name as an empty string', () => {
+    expect(contactPatchPayload({ phone: '', mailing_zip: null, first_name: '', last_name: null, status: 'hot' })).toEqual({
+      phone: null,
+      mailing_zip: null,
+      first_name: '',
+      last_name: '',
+      status: 'hot',
+    });
+  });
+
+  it('a field update returns the saved row with its quotes', async () => {
+    fake.state.tables.contacts = [contactRow(A, 'Ada')];
+    const saved = await updateContact(A, { phone: '555-0101' });
+    expect(saved).toMatchObject({ id: A, phone: '555-0101', contact_services: [] });
+    expect(fake.calls('contacts', 'update')[0].columns).toContain('contact_services(');
+  });
+
+  it('bulk status writes EVERY selected row, whatever the cache says, and sends status alone', async () => {
+    fake.state.tables.contacts = [contactRow(A, 'Ada'), contactRow(B, 'Bo', '', { status: 'hot' })];
+    const result = await bulkUpdateStatus([A, B], 'client');
+    expect(result).toEqual({ requested: 2, updated: 2, failedIds: [], error: null });
     const updates = fake.calls('contacts', 'update');
     expect(updates).toHaveLength(1);
     expect(updates[0].payload).toEqual({ status: 'client' });
-    expect(updates[0].filters).toEqual([{ type: 'in', column: 'id', value: [A, B, C] }]);
+    expect(updates[0].filters).toEqual([{ type: 'in', column: 'id', value: [A, B] }]);
+  });
+
+  it('bulk status counts only rows the server returned; a row it did not reach is failed', async () => {
+    fake.state.tables.contacts = [contactRow(A, 'Ada')];
+    const result = await bulkUpdateStatus([A, C], 'hot');
+    expect(result).toEqual({ requested: 2, updated: 1, failedIds: [C], error: expect.stringContaining('not changed') });
+  });
+
+  it('bulk status reports the error, and everything not written is failed', async () => {
+    fake.state.errors['contacts:update'] = { message: 'permission denied' };
+    const result = await bulkUpdateStatus([A], 'lost');
+    expect(result).toEqual({ requested: 1, updated: 0, failedIds: [A], error: 'permission denied' });
   });
 
   it('bulk status splits long id lists into requests of 100', async () => {
