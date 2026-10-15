@@ -18,7 +18,8 @@
     "deno:check": "deno check supabase/functions/**/index.ts",
     "deno:lint": "deno lint supabase/functions",
     "dev:bootstrap": "node scripts/dev-bootstrap.mjs",
-    "schedules:install": "node scripts/install-schedules.mjs"
+    "schedules:install": "node scripts/install-schedules.mjs",
+    "demo:seed": "node scripts/demo-seed.mjs"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

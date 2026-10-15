@@ -1,0 +1,72 @@
+name: Bug report
+description: Something in Open CRM does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A security problem goes through the Security tab instead (see SECURITY.md), never here.
+        Leave out real names, email addresses, keys and anything from your clients' records.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Contacts
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Contacts and pipeline
+        - Client portal
+        - Documents
+        - Secure messages
+        - Requests
+        - E-signature
+        - Work board
+        - Group email
+        - Marketing
+        - AI connector
+        - Settings
+        - System pages (audit log, jobs, outbox)
+        - Setup, scripts or deployment
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: who
+    attributes:
+      label: Signed in as
+      options:
+        - Owner
+        - Client (portal)
+        - Owner in View as client
+        - Nobody (a public page)
+        - Not applicable
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The commit you run (git rev-parse --short HEAD).
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Browser and version, operating system, and where the app is served (local or a host).
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors or logs
+      description: Browser console errors or edge function log lines, with secrets and personal data removed.
+      render: text

@@ -5,13 +5,12 @@ Supabase. One owner runs it; clients get a secure portal.
 
 > **Status: early.** This repository is being extracted, piece by piece, from a CRM that has
 > run a real client practice in production. The contacts and pipeline, the client portal,
-> documents, secure messages, the work board, group email, marketing, the AI connector,
-> settings, e-signature and the system pages are here and tested. Requests are next: their
-> pages are placeholders for now.
+> documents, secure messages, requests, e-signature, the work board, group email, marketing,
+> the AI connector, settings and the system pages are here and tested.
 
 ## What it is for
 
-- **Contacts and pipeline**: contacts, businesses they own, notes, follow-ups, service quotes.
+- **Contacts and pipeline**: contacts, businesses they own, notes, service quotes and upsells.
 - **Client portal**: invitations, a client home, profile.
 - **Documents**: upload, preview, annotate and share, encrypted at rest.
 - **Secure messages**: secure messages between the owner and each client: a client's message is
@@ -45,7 +44,17 @@ Supabase. One owner runs it; clients get a secure portal.
 | Control center: identity and branding, pick-lists, lead intake, security, appearance | Done, tested |
 | System pages (audit log, jobs, outbox), schedules, Content-Security-Policy reporting | Done, tested |
 | E-signature: compose, send, sign (typed or drawn), text message codes, tamper check, templates | Done, tested |
-| Requests | Being ported (placeholder pages) |
+| Requests: documents, questions and tasks for a client, templates, start links, reminders | Done, tested |
+
+## Documentation
+
+- [Setup](docs/setup.md): from a fresh clone to a running install, step by step.
+- [Configuration](docs/configuration.md): every environment variable and function secret,
+  required or optional, and what stops working without it.
+- [Features](docs/features.md): what the owner and clients can do, domain by domain.
+- [Architecture](docs/architecture.md): the feature registry, the edge layer, the job runner,
+  the outbound adapter and the migrations.
+- [Contributing](CONTRIBUTING.md) and [Security](SECURITY.md) (how to report a vulnerability).
 
 ## Security model
 
@@ -89,10 +98,19 @@ is safe to run again; the service role key is used for that run only and never s
 `secrets set` hands the generated secrets to your project's edge functions, and
 `functions deploy --use-api` deploys them (bundled by Supabase, so no Docker), and
 `schedules:install` turns on the background work (see Schedules below). Then open
-http://localhost:5173 and sign in as the owner.
+http://localhost:5173, sign in as the owner, and turn on two-factor first (Settings, Security).
+[docs/setup.md](docs/setup.md) walks through each step and what the bootstrap does.
 
-The edge functions accept browser requests from http://localhost:5173 while `ENVIRONMENT` is
-unset. When you serve the app from a real address, set `SITE_URL` to it and `ENVIRONMENT`
+To look around with fictional data, `npm run demo:seed` loads a dozen made-up contacts with
+their businesses, quotes, board cards, messages, requests and a draft envelope. It creates no
+sign-in accounts, is safe to run twice, and refuses a project that already has contacts of its
+own (`npm run demo:seed -- --force` loads it anyway).
+
+Every setting and secret, with what breaks without it, is in
+[docs/configuration.md](docs/configuration.md). Every emailed link is built on `SITE_URL`, so
+set it (to `http://localhost:5173` while developing) before sending invitations, requests or
+envelopes. The edge functions accept browser requests from http://localhost:5173 while
+`ENVIRONMENT` is unset. When you serve the app from a real address, set `SITE_URL` to it and `ENVIRONMENT`
 to `production` with `npx supabase secrets set`, and redeploy. A live project needs both.
 
 ### Sign-in, passwords and two-factor
@@ -287,7 +305,8 @@ npm ci
 npm test
 ```
 
-Other checks: `npm run typecheck`, `npm run lint`, `npm run build`.
+Other checks: `npm run typecheck`, `npm run lint`, `npm run build`, `npm run deno:check` and
+`npm run deno:lint` (Deno comes with `npm ci`). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Stack
 
