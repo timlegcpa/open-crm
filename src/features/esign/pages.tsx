@@ -1,3 +1,4 @@
+import { Suspense } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Loader2, Plus } from 'lucide-react';
@@ -6,19 +7,24 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { isUuid } from '@/api/contacts';
+import { lazyNamed } from '@/features/lazy';
 import { links } from '@/features/links';
 import type { ContactTabProps } from '@/features/types';
 import { getErrorMessage } from '@/lib/errors';
 import { formatDate, NO_VALUE_TEXT } from '@/lib/format';
 import { getEnvelope, listEnvelopesForContact } from './api';
 import { envelopeRefetchInterval } from './contract';
-import { Composer } from './components/Composer';
-import { EnvelopeDetail } from './components/EnvelopeDetail';
 import { EnvelopeList } from './components/EnvelopeList';
 import { NewEnvelopeForm } from './components/NewEnvelopeForm';
 import { EsignStatusBadge } from './components/StatusBadge';
 import { esignKeys } from './keys';
 import { resolveSignerName } from './lib/signerName';
+
+// The composer and the envelope detail render PDF pages, so they bring pdf.js (and drag and
+// drop). Only an open envelope shows them; the envelope list, the new-envelope form and the
+// contact tab must not pay for either.
+const Composer = lazyNamed(() => import('./components/Composer'), 'Composer');
+const EnvelopeDetail = lazyNamed(() => import('./components/EnvelopeDetail'), 'EnvelopeDetail');
 
 function Loading() {
   return (
@@ -102,7 +108,9 @@ export function EnvelopePage() {
   return (
     <div className={PAGE}>
       <PageHeader title={row.title} subtitle={row.status === 'draft' ? 'Draft' : undefined} />
-      {row.status === 'draft' ? <Composer key={row.id} envelope={row} /> : <EnvelopeDetail envelope={row} />}
+      <Suspense fallback={<Loading />}>
+        {row.status === 'draft' ? <Composer key={row.id} envelope={row} /> : <EnvelopeDetail envelope={row} />}
+      </Suspense>
     </div>
   );
 }

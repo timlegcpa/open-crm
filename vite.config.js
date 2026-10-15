@@ -22,6 +22,7 @@ export default defineConfig({
     // static block reaches the entry chunk and older Safari renders a blank page.
     target: ['es2020', 'edge88', 'firefox78', 'chrome87', 'safari14', 'ios14'],
     sourcemap: false,
+    manifest: true,
     rollupOptions: {
       output: {
         chunkFileNames: (chunk) =>
@@ -34,6 +35,10 @@ export default defineConfig({
         codeSplitting: {
           groups: [
             { name: 'preload-helper', test: /vite\/preload-helper/ },
+            // The syntax-lowering helpers (class fields, private members) are shared by
+            // everything. Left loose, Rolldown parks them in whichever vendor chunk used them
+            // first, and every page that needs one helper then loads all of pdf.js with it.
+            { name: 'lowering-helpers', test: /@oxc-project\+runtime@[^/]+\/helpers\// },
             { name: 'vendor-shared-utils', test: /node_modules\/(?:tslib|use-sidecar|use-callback-ref|react-style-singleton|aria-hidden|get-nonce)\// },
             { name: 'vendor-react', test: /node_modules\/(?:react|react-dom|scheduler|react-router|react-router-dom|@remix-run)\// },
             { name: 'vendor-supabase', test: /node_modules\/@supabase\// },
