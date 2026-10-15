@@ -29,10 +29,12 @@ export const allowlist: DomainAllowlist = {
     'mcp_request_snapshot(uuid,uuid,integer)',
     'mcp_list_requests(uuid,integer,uuid,text,text)',
     'mcp_request_keys_active(jsonb)',
+    'mcp_request_audit(uuid,text,jsonb,text,text)',
     'mcp_create_request(uuid,text,text,jsonb,uuid,text,text)',
-    'mcp_update_request(uuid,uuid,text,text,jsonb,uuid,text,text)',
+    'mcp_update_request(uuid,uuid,integer,text,text,jsonb,uuid,text,text)',
     'mcp_delete_request(uuid,uuid,integer,uuid,text,text)',
     'mcp_claim_reminder(uuid,uuid)',
+    'mcp_release_reminder(uuid,timestamp with time zone,timestamp with time zone)',
   ],
   definerWriteExempt: {
     'mcp_revoke_grant(uuid)':

@@ -985,9 +985,10 @@ $$;
 --   * Every item write goes through needs_replace_draft, the requests domain's one draft
 --     writer, which locks the list before its status check: an edit racing a send either
 --     lands on the draft or is refused, never rewrites a sent request's items.
---   * An outward act (send, remind) needs a review token: an HMAC over the request's exact
---     client-visible content, its recipient and each item's fulfilment, minted only from
---     what mcp_request_snapshot returns (mcp-crm/review-token.ts). The minter and the
+--   * An outward act (send, remind), a rewrite and a delete need a review token: an HMAC
+--     over the request's exact client-visible content, its recipient and each item's
+--     fulfilment, minted only from what mcp_request_snapshot returns
+--     (mcp-crm/review-token.ts). The minter and the
 --     verifier read through that one function, so they cannot compute fulfilment
 --     differently.
 --   * Answers never leave the database here: answer_text and answer_ciphertext are read
@@ -1059,6 +1060,23 @@ BEGIN
 END;
 $$;
 
+-- The request tools' audit row: mcp_audit_row, with any failure of the insert raised as
+-- one fixed sentinel. The row is written in the same transaction as the act, so a failed
+-- insert rolls the act back, and the sentinel tells the server that the act did not
+-- happen for want of its record (it retries the whole call, then tells the owner) rather
+-- than for a reason of its own.
+CREATE FUNCTION public.mcp_request_audit(p_actor uuid, p_action text, p_details jsonb, p_ip text, p_user_agent text)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  PERFORM public.mcp_audit_row(p_actor, p_action, p_details, p_ip, p_user_agent);
+EXCEPTION WHEN OTHERS THEN
+  RAISE EXCEPTION 'mcp_request_audit: failed';
+END;
+$$;
+
 -- list_requests: the snapshot, audited in the same transaction with the contact, the
 -- count and whether it was cut short. NULL (and no audit row) when there is no contact.
 CREATE FUNCTION public.mcp_list_requests(p_contact_id uuid, p_limit integer, p_actor uuid, p_ip text, p_user_agent text)
@@ -1072,7 +1090,7 @@ BEGIN
   IF v_out IS NULL THEN
     RETURN NULL;
   END IF;
-  PERFORM public.mcp_audit_row(
+  PERFORM public.mcp_request_audit(
     p_actor, 'mcp_list_requests',
     jsonb_build_object('contact_id', p_contact_id, 'returned', jsonb_array_length(v_out -> 'lists'),
                        'truncated', v_out -> 'truncated'),
@@ -1124,7 +1142,7 @@ BEGIN
 
   v_count := public.needs_replace_draft(v_id, p_title, p_items, p_intro, p_contact_id);
 
-  PERFORM public.mcp_audit_row(
+  PERFORM public.mcp_request_audit(
     p_actor, 'mcp_create_request',
     jsonb_build_object('contact_id', p_contact_id, 'list_id', v_id, 'item_count', v_count,
                        'sensitive_item_count', (SELECT count(*) FROM jsonb_to_recordset(p_items) AS x(sensitive boolean) WHERE x.sensitive)),
@@ -1135,10 +1153,13 @@ END;
 $$;
 
 -- A FULL replacement of a draft's title, intro and items, audited in the same
--- transaction. needs_replace_draft's sentinels (not_found, not_draft) pass through. The
--- contact-confirm switch is not the connector's to set and keeps its value.
+-- transaction, and only at the content version its review token was verified over: the
+-- list is locked first, so an owner's edit landing after the connector read the draft
+-- refuses as 'changed' instead of being silently overwritten. needs_replace_draft's
+-- sentinels (not_found, not_draft) pass through. The contact-confirm switch is not the
+-- connector's to set and keeps its value.
 CREATE FUNCTION public.mcp_update_request(
-  p_list_id uuid, p_contact_id uuid, p_title text, p_intro text, p_items jsonb,
+  p_list_id uuid, p_contact_id uuid, p_expected_version integer, p_title text, p_intro text, p_items jsonb,
   p_actor uuid, p_ip text, p_user_agent text)
 RETURNS integer
 LANGUAGE plpgsql
@@ -1146,14 +1167,25 @@ SET search_path = ''
 AS $$
 DECLARE
   v_count integer;
+  v_list record;
 BEGIN
   IF NOT public.mcp_request_keys_active(p_items) THEN
     RAISE EXCEPTION 'mcp_update_request: inactive_key';
   END IF;
 
+  SELECT l.status, l.content_version INTO v_list
+    FROM public.needs_lists l
+   WHERE l.id = p_list_id AND l.contact_id = p_contact_id
+     FOR UPDATE;
+  -- No list, or one sent since, falls through to needs_replace_draft's not_found or
+  -- not_draft, the truer refusal.
+  IF v_list.status = 'draft' AND v_list.content_version IS DISTINCT FROM p_expected_version THEN
+    RAISE EXCEPTION 'mcp_update_request: changed';
+  END IF;
+
   v_count := public.needs_replace_draft(p_list_id, p_title, p_items, p_intro, p_contact_id);
 
-  PERFORM public.mcp_audit_row(
+  PERFORM public.mcp_request_audit(
     p_actor, 'mcp_update_request',
     jsonb_build_object('contact_id', p_contact_id, 'list_id', p_list_id, 'item_count', v_count,
                        'sensitive_item_count', (SELECT count(*) FROM jsonb_to_recordset(p_items) AS x(sensitive boolean) WHERE x.sensitive)),
@@ -1189,7 +1221,7 @@ BEGIN
 
   PERFORM public.needs_delete_draft(p_list_id, p_contact_id, p_expected_version, p_actor, v_ip, p_user_agent);
 
-  PERFORM public.mcp_audit_row(
+  PERFORM public.mcp_request_audit(
     p_actor, 'mcp_delete_request',
     jsonb_build_object('contact_id', p_contact_id, 'list_id', p_list_id, 'item_count', v_items,
                        'content_version', p_expected_version),
@@ -1202,21 +1234,50 @@ $$;
 -- The connector's reminder interval: at most one reminder a day per request, claimed with
 -- one guarded write so two concurrent calls cannot both pass a read-then-send check. A
 -- review token binds content, not a count, so without this one token would license a
--- reminder on every call. A claim whose email then fails still holds the day; the owner's
--- own reminder in the CRM is not bound by it. false: not this contact's sent request, or
--- reminded within the last day.
+-- reminder on every call. The claim writes last_reminded_at, the column the automatic
+-- reminders schedule from, so it returns the stamp it wrote and the value it replaced: a
+-- claim whose reminder then does not go out is handed back with mcp_release_reminder and
+-- never delays the automatic one. The row lock makes a second concurrent claim wait and
+-- then read the first one's stamp. The owner's own reminder in the CRM is not bound by
+-- it. {"claimed": false}: not this contact's sent request, or reminded within the last
+-- day.
 CREATE FUNCTION public.mcp_claim_reminder(p_list_id uuid, p_contact_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_previous timestamptz;
+  v_stamp timestamptz := now();
+BEGIN
+  SELECT l.last_reminded_at INTO v_previous
+    FROM public.needs_lists l
+   WHERE l.id = p_list_id
+     AND l.contact_id = p_contact_id
+     AND l.status = 'sent'
+     FOR UPDATE;
+  IF NOT FOUND OR (v_previous IS NOT NULL AND v_previous >= v_stamp - interval '24 hours') THEN
+    RETURN jsonb_build_object('claimed', false);
+  END IF;
+  UPDATE public.needs_lists l SET last_reminded_at = v_stamp WHERE l.id = p_list_id;
+  -- As text, so both come back to the release at full precision.
+  RETURN jsonb_build_object('claimed', true, 'stamp', v_stamp::text, 'previous', v_previous::text);
+END;
+$$;
+
+-- Hand back a claim whose reminder did not go out: last_reminded_at returns to the value
+-- the claim replaced, but only while it still holds this claim's stamp. A reminder that
+-- did go out has recorded itself (needs_record_reminder moves the stamp), and anything
+-- else that wrote the column since wins. false: nothing was handed back.
+CREATE FUNCTION public.mcp_release_reminder(p_list_id uuid, p_stamp timestamptz, p_previous timestamptz)
 RETURNS boolean
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 BEGIN
   UPDATE public.needs_lists l
-     SET last_reminded_at = now()
-   WHERE l.id = p_list_id
-     AND l.contact_id = p_contact_id
-     AND l.status = 'sent'
-     AND (l.last_reminded_at IS NULL OR l.last_reminded_at < now() - interval '24 hours');
+     SET last_reminded_at = p_previous
+   WHERE l.id = p_list_id AND l.last_reminded_at = p_stamp;
   RETURN FOUND;
 END;
 $$;
@@ -1303,10 +1364,12 @@ REVOKE ALL ON FUNCTION
   public.mcp_request_snapshot(uuid, uuid, integer),
   public.mcp_list_requests(uuid, integer, uuid, text, text),
   public.mcp_request_keys_active(jsonb),
+  public.mcp_request_audit(uuid, text, jsonb, text, text),
   public.mcp_create_request(uuid, text, text, jsonb, uuid, text, text),
-  public.mcp_update_request(uuid, uuid, text, text, jsonb, uuid, text, text),
+  public.mcp_update_request(uuid, uuid, integer, text, text, jsonb, uuid, text, text),
   public.mcp_delete_request(uuid, uuid, integer, uuid, text, text),
   public.mcp_claim_reminder(uuid, uuid),
+  public.mcp_release_reminder(uuid, timestamptz, timestamptz),
   public.mcp_list_grants(),
   public.mcp_revoke_grant(uuid)
 FROM PUBLIC, anon, authenticated, service_role;
@@ -1336,10 +1399,12 @@ GRANT EXECUTE ON FUNCTION
   public.mcp_request_snapshot(uuid, uuid, integer),
   public.mcp_list_requests(uuid, integer, uuid, text, text),
   public.mcp_request_keys_active(jsonb),
+  public.mcp_request_audit(uuid, text, jsonb, text, text),
   public.mcp_create_request(uuid, text, text, jsonb, uuid, text, text),
-  public.mcp_update_request(uuid, uuid, text, text, jsonb, uuid, text, text),
+  public.mcp_update_request(uuid, uuid, integer, text, text, jsonb, uuid, text, text),
   public.mcp_delete_request(uuid, uuid, integer, uuid, text, text),
-  public.mcp_claim_reminder(uuid, uuid)
+  public.mcp_claim_reminder(uuid, uuid),
+  public.mcp_release_reminder(uuid, timestamptz, timestamptz)
 TO service_role;
 
 -- The owner's two (each refuses anyone else itself).

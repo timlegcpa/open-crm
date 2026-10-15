@@ -112,7 +112,11 @@ const CONFIRMED = ['correct_contact_email', 'delete_quote', 'delete_request', 'r
 /** The tools that email a client. Each spends the per-request send budget. */
 const OUTWARD = ['remind_request', 'send_request'];
 /** The tools that act on a request someone read: each takes and verifies a review token. */
-const REVIEWED = ['delete_request', 'remind_request', 'send_request'];
+const REVIEWED = ['delete_request', 'remind_request', 'send_request', 'update_request'];
+/** The tools that record every refusal (through one `refuse` bound to their own action). */
+const REFUSING = ['delete_request', 'remind_request', 'send_request'];
+/** The body with its leading `const refuse = ...;` binding removed: what runs first. */
+const afterRefuse = (body: string) => body.replace(/^\{\s*/, '').replace(/^const refuse = [^\n]*\n\s*/, '');
 const destructive = Object.keys(required).filter((n) => n.startsWith('delete_'));
 const confirming = Object.keys(required).filter((n) => required[n].includes('confirmed_with_user'));
 
@@ -155,7 +159,9 @@ describe('the destructive tool contract', () => {
   });
 
   it.each(REVIEWED)('%s requires a review token and verifies it against the request as stored', (tool) => {
-    expect(required[tool]).toEqual(['list_id', 'contact_id', 'review_token', 'confirmed_with_user']);
+    expect(required[tool]).toEqual(
+      tool === 'update_request' ? ['list_id', 'contact_id', 'review_token', 'title', 'items'] : ['list_id', 'contact_id', 'review_token', 'confirmed_with_user'],
+    );
     const body = bodies[tool];
     expect(body).toContain('reviewToken(args.review_token)');
     expect(body).toContain('readRequest(ctx, args.contact_id, args.list_id)');
@@ -170,22 +176,48 @@ describe('the destructive tool contract', () => {
       return i;
     };
     // First statement of the block: nothing is read or checked before the budget.
-    expect(body.replace(/^\{\s*/, '').startsWith('if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST)')).toBe(true);
+    expect(afterRefuse(body).startsWith('if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST)')).toBe(true);
     expect(at('ctx.review.verify(')).toBeLessThan(at('ctx.budget.sends++'));
     expect(at('args.confirmed_with_user !== true')).toBeLessThan(at('ctx.budget.sends++'));
     expect(at('ctx.budget.sends++')).toBeLessThan(at(`ctx.outward.${tool === 'send_request' ? 'send' : 'remind'}(`));
+    // The attempt row is written, and checked, before anything goes out.
+    expect(at(`if (!(await attemptRow(ctx, 'mcp_${tool}'`)).toBeLessThan(at(`ctx.outward.${tool === 'send_request' ? 'send' : 'remind'}(`));
+  });
+
+  it.each(REFUSING)('%s records its refusals under its own action, never returning a bare tool error', (tool) => {
+    const body = bodies[tool];
+    expect(afterRefuse(body)).not.toBe(body.replace(/^\{\s*/, ''));
+    expect(body).toContain(`refused(ctx, 'mcp_${tool}', reason, args, message)`);
+    // Every early exit goes through refuse; only the outcomes after an attempt are bare errors.
+    const beforeAct = body.slice(0, body.indexOf(tool === 'delete_request' ? "auditedRpc(ctx, 'mcp_delete_request'" : 'ctx.budget.sends++;'));
+    expect(beforeAct.replace(/^\{\s*/, '')).not.toMatch(/return toolError\(/);
+  });
+
+  it('remind_request hands its claim back on every exit after the claim but a reminder that went out', () => {
+    const body = bodies.remind_request;
+    const afterClaim = body.slice(body.indexOf("if (claim?.claimed !== true)"));
+    // The attempt-row failure, a throw and a non-reminded outcome.
+    expect(afterClaim.match(/await releaseClaim\(ctx, list\.id, claim\)/g)).toHaveLength(3);
+    expect(afterClaim.slice(afterClaim.indexOf("if (reminded.status !== 'reminded')"))).toMatch(/^if \(reminded\.status !== 'reminded'\) \{\s*await releaseClaim/);
+  });
+
+  it('update_request rewrites at the verified version only', () => {
+    const body = bodies.update_request;
+    expect(body.indexOf('ctx.review.verify(')).toBeLessThan(body.indexOf("auditedRpc(ctx, 'mcp_update_request'"));
+    expect(body).toContain('p_expected_version: list.content_version');
+    expect(body).toContain("sentinel(error, 'mcp_update_request: changed')");
   });
 
   it('the outward tools pass the reviewed version and address on, and record every outcome', () => {
     expect(bodies.send_request).toContain('version: list.content_version, email: contact.email');
-    expect(bodies.remind_request).toContain('email: contact.email');
+    expect(bodies.remind_request).toContain('version: list.content_version, email: contact.email');
     expect(bodies.remind_request).toContain("ctx.db.rpc('mcp_claim_reminder'");
     for (const tool of OUTWARD) expect(bodies[tool]).toContain(`auditDelegated(ctx, 'mcp_${tool}'`);
   });
 
   it('delete_request deletes through the audited function at the verified version, mapping every sentinel without echoing', () => {
     const body = bodies.delete_request;
-    expect(body.indexOf('ctx.review.verify(')).toBeLessThan(body.indexOf("rpc('mcp_delete_request'"));
+    expect(body.indexOf('ctx.review.verify(')).toBeLessThan(body.indexOf("auditedRpc(ctx, 'mcp_delete_request'"));
     expect(body).toContain('p_expected_version: list.content_version');
     for (const code of ['not_found', 'not_draft', 'stale_content', 'has_answers', 'has_documents']) {
       expect(body).toContain(`exactSentinel(error, '${code}')`);
@@ -207,7 +239,7 @@ describe('the destructive tool contract', () => {
       'if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST) {',
       'if (false) {',
     ));
-    expect(late.send_request.replace(/^\{\s*/, '').startsWith('if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST)')).toBe(false);
+    expect(afterRefuse(late.send_request).startsWith('if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST)')).toBe(false);
     const unrequired = SOURCE.replace(
       "required: ['contact_id', 'quote_id', 'service_type', 'confirmed_with_user']",
       "required: ['contact_id', 'quote_id', 'service_type']",

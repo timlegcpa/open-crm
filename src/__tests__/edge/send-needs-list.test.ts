@@ -350,4 +350,19 @@ describe('send-needs-list: the connector arm (sendList and remindList with what 
     const ok = await remindList(pgliteStore(sent), SITE, list, null, log, { email: `ADA-${n}@example.com` });
     expect(ok).toMatchObject({ status: 'reminded', email: 'sent' });
   });
+
+  it('a reminder refuses a version other than the reviewed one, sending and counting nothing; none passed is the owner path', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(withAccount);
+    await call(deps([]), { list_id: id });
+    const list = await load(id);
+    const stale = await remindList(pgliteStore(sent), SITE, list, null, log, { version: list.content_version - 1, email: `ada-${n}@example.com` });
+    expect(stale).toEqual({ status: 'changed' });
+    expect([sent, (await listRow(id)).reminder_count]).toEqual([[], 0]);
+    const reviewed = await remindList(pgliteStore(sent), SITE, list, null, log, { version: list.content_version, email: `ada-${n}@example.com` });
+    expect(reviewed).toMatchObject({ status: 'reminded', email: 'sent' });
+    // The owner's reminder carries nothing reviewed and is not version-bound.
+    const owner = await remindList(pgliteStore(sent), SITE, { ...list, content_version: list.content_version + 7, reminder_count: 1 }, null, log);
+    expect(owner).toMatchObject({ status: 'reminded' });
+  });
 });

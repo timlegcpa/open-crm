@@ -108,6 +108,9 @@ describe('KEY_RE', () => {
 });
 
 describe('the tool handlers refuse bad input before any database call', () => {
+  /** The calls made, less the refusal records: send, remind and delete record each refusal and touch nothing else. */
+  const acting = (rpc: ReturnType<typeof vi.fn>) =>
+    rpc.mock.calls.filter(([fn, params]) => !(fn === 'mcp_audit_row' && (params as { p_details: { outcome?: string } }).p_details.outcome === 'refused'));
   function ctx(): ToolContext & { rpc: ReturnType<typeof vi.fn>; outwardCalls: ReturnType<typeof vi.fn> } {
     const rpc = vi.fn(async () => ({ data: null, error: null }));
     const outwardCalls = vi.fn(async () => {
@@ -178,8 +181,10 @@ describe('the tool handlers refuse bad input before any database call', () => {
     ['create_request', { contact_id: ID, title: 'T', items: Array.from({ length: MAX_REQUEST_ITEMS + 1 }, () => ITEM) }],
     ['create_request', { contact_id: ID, title: 'T', items: [{ label: 'x', category: 'made_up' }] }],
     ['create_request', { contact_id: ID, title: 'T', items: [{ label: 'x', kind: 'transaction' }] }],
-    ['update_request', { list_id: 'nope', contact_id: ID, title: 'T', items: [ITEM] }],
-    ['update_request', { list_id: ID, contact_id: ID, title: 'T', items: [{ label: 'x', tag: 'made_up' }] }],
+    ['update_request', { list_id: 'nope', contact_id: ID, review_token: TOKEN, title: 'T', items: [ITEM] }],
+    ['update_request', { list_id: ID, contact_id: ID, review_token: TOKEN, title: 'T', items: [{ label: 'x', tag: 'made_up' }] }],
+    ['update_request', { list_id: ID, contact_id: ID, title: 'T', items: [ITEM] }],
+    ['update_request', { list_id: ID, contact_id: ID, review_token: 'A'.repeat(32), title: 'T', items: [ITEM] }],
     ['list_requests', { contact_id: 'nope' }],
     ['send_request', { ...OUTWARD, review_token: undefined }],
     ['send_request', { ...OUTWARD, review_token: 'A'.repeat(32) }],
@@ -195,7 +200,9 @@ describe('the tool handlers refuse bad input before any database call', () => {
     const c = ctx();
     const result = await callTool(name, args as Record<string, unknown>, c);
     expect(result.isError).toBe(true);
-    expect(c.rpc).not.toHaveBeenCalled();
+    expect(acting(c.rpc)).toEqual([]);
+    // Only the three that record refusals write anything at all.
+    if (!['send_request', 'remind_request', 'delete_request'].includes(name)) expect(c.rpc).not.toHaveBeenCalled();
     expect(c.outwardCalls).not.toHaveBeenCalled();
   });
 
@@ -204,7 +211,8 @@ describe('the tool handlers refuse bad input before any database call', () => {
     c.budget.sends = 1;
     const result = await callTool(name, { list_id: 'nope' }, c);
     expect(result).toEqual({ isError: true, content: [{ type: 'text', text: expect.stringMatching(/^Only one email to a contact can go out per call/) }] });
-    expect(c.rpc).not.toHaveBeenCalled();
+    // Recorded, with no id: 'nope' is not one.
+    expect(c.rpc.mock.calls).toEqual([['mcp_audit_row', expect.objectContaining({ p_action: `mcp_${name}`, p_details: { outcome: 'refused', reason: 'budget' } })]]);
   });
 
   it('create_request sends the validated items, never a status', async () => {

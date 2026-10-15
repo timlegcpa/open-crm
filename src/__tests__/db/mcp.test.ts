@@ -190,10 +190,12 @@ const SERVER_FUNCTIONS = [
   'mcp_request_snapshot(uuid,uuid,integer)',
   'mcp_list_requests(uuid,integer,uuid,text,text)',
   'mcp_request_keys_active(jsonb)',
+  'mcp_request_audit(uuid,text,jsonb,text,text)',
   'mcp_create_request(uuid,text,text,jsonb,uuid,text,text)',
-  'mcp_update_request(uuid,uuid,text,text,jsonb,uuid,text,text)',
+  'mcp_update_request(uuid,uuid,integer,text,text,jsonb,uuid,text,text)',
   'mcp_delete_request(uuid,uuid,integer,uuid,text,text)',
   'mcp_claim_reminder(uuid,uuid)',
+  'mcp_release_reminder(uuid,timestamp with time zone,timestamp with time zone)',
 ];
 const OWNER_FUNCTIONS = ['mcp_list_grants()', 'mcp_revoke_grant(uuid)'];
 
@@ -1034,9 +1036,10 @@ describe('mcp_create_request and mcp_update_request', () => {
     call<{ id: string; status: string; item_count: number }>(tx, 'mcp_create_request', {
       p_contact_id: contact, p_title: 'Onboarding', p_intro: 'Thanks!', p_items: items, ...audit,
     });
-  const update = (tx: Tx, list: string, items: unknown, over: Record<string, unknown> = {}) =>
+  const update = async (tx: Tx, list: string, items: unknown, over: Record<string, unknown> = {}) =>
     call<number>(tx, 'mcp_update_request', {
-      p_list_id: list, p_contact_id: contactA, p_title: 'Onboarding v2', p_intro: null, p_items: items, ...audit, ...over,
+      p_list_id: list, p_contact_id: contactA, p_expected_version: 'p_expected_version' in over ? over.p_expected_version : await versionOf(tx, list), p_title: 'Onboarding v2', p_intro: null, p_items: items,
+      ...audit, ...over,
     });
 
   it('creates a DRAFT with its items in order, attributed to the actor, invisible to the client, audited with counts', async () => {
@@ -1120,6 +1123,28 @@ describe('mcp_create_request and mcp_update_request', () => {
     });
     expect(out.err).toMatch(/needs_replace_draft: not_draft/);
     expect(out.n).toBe(3);
+  });
+
+  it('rewrites only the version that was read: an edit since refuses as changed, rewriting and auditing nothing', async () => {
+    const out = await asServerTx(async (tx) => {
+      const { id } = await create(tx);
+      const read = await versionOf(tx, id);
+      // The owner's edit lands after the connector read the draft.
+      await tx.query(`UPDATE public.needs_lists SET title = 'Owner edit' WHERE id = $1`, [id]);
+      const err = await attempt(tx, () => update(tx, id, [ITEMS[2]], { p_expected_version: read }));
+      return {
+        moved: (await versionOf(tx, id)) !== read,
+        err,
+        title: (await tx.query<{ title: string }>(`SELECT title FROM public.needs_lists WHERE id = $1`, [id])).rows[0].title,
+        n: (await tx.query(`SELECT 1 FROM public.needs_items WHERE list_id = $1`, [id])).rows.length,
+        rows: await auditRows(tx, 'mcp_update_request'),
+      };
+    });
+    expect(out).toEqual({ moved: true, err: expect.stringMatching(/mcp_update_request: changed/), title: 'Owner edit', n: 3, rows: [] });
+  });
+
+  it('a missing list is not_found, never changed', async () => {
+    await expect(asServerTx((tx) => update(tx, randomUUID(), [ITEMS[2]], { p_expected_version: 0 }))).rejects.toThrow(/needs_replace_draft: not_found/);
   });
 });
 
@@ -1271,16 +1296,25 @@ describe('mcp_delete_request', () => {
       err: await attempt(tx, () => del(tx, id, v, { p_actor: null })),
       left: (await tx.query(`SELECT 1 FROM public.needs_lists WHERE id = $1`, [id])).rows.length,
     }));
-    expect(out.err).toMatch(/user_id/);
+    expect(out.err).toMatch(/^mcp_request_audit: failed$/);
     expect(out.left).toBe(1);
   });
 });
 
-describe('mcp_claim_reminder', () => {
+describe('mcp_claim_reminder and mcp_release_reminder', () => {
+  interface Claim { claimed: boolean; stamp?: string; previous?: string | null }
+  const sentList = async (tx: Tx) => {
+    const { id } = await call<{ id: string }>(tx, 'mcp_create_request', { p_contact_id: contactA, p_title: 'Chase', p_intro: null, p_items: ITEMS, ...audit });
+    await call(tx, 'needs_send_list', { p_list_id: id, p_expected_version: await versionOf(tx, id) });
+    return id;
+  };
+  const stampOf = async (tx: Tx, id: string) =>
+    (await tx.query<{ at: string | null }>(`SELECT last_reminded_at::text AS at FROM public.needs_lists WHERE id = $1`, [id])).rows[0].at;
+
   it('claims a sent request once a day, never a draft or another contact’s, and moves no content version', async () => {
     const out = await asServerTx(async (tx) => {
       const { id } = await call<{ id: string }>(tx, 'mcp_create_request', { p_contact_id: contactA, p_title: 'Chase', p_intro: null, p_items: ITEMS, ...audit });
-      const claim = (contact = contactA) => call<boolean>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contact });
+      const claim = async (contact = contactA) => (await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contact })).claimed;
       const draft = await claim();
       const v = await versionOf(tx, id);
       await call(tx, 'needs_send_list', { p_list_id: id, p_expected_version: v });
@@ -1292,6 +1326,49 @@ describe('mcp_claim_reminder', () => {
       return { draft, other, first, again, nextDay, moved: (await versionOf(tx, id)) !== v };
     });
     expect(out).toEqual({ draft: false, other: false, first: true, again: false, nextDay: true, moved: false });
+  });
+
+  it('returns the stamp it wrote and the value it replaced; a release puts the old value back, NULL included', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await sentList(tx);
+      const fresh = await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contactA });
+      const held = await stampOf(tx, id);
+      const released = await call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_stamp: fresh.stamp, p_previous: fresh.previous });
+      const afterNull = await stampOf(tx, id);
+      // Microseconds included: the release compares and restores at full precision.
+      const OLD = '2026-01-02 03:04:05.123456+00';
+      await tx.query(`UPDATE public.needs_lists SET last_reminded_at = $2 WHERE id = $1`, [id, OLD]);
+      const old = await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contactA });
+      await call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_stamp: old.stamp, p_previous: old.previous });
+      const same = async (sql: string, params: unknown[]) => (await tx.query<{ ok: boolean }>(sql, params)).rows[0].ok;
+      return {
+        fresh: { claimed: fresh.claimed, previous: fresh.previous, held: held === fresh.stamp },
+        released,
+        afterNull,
+        previous: await same(`SELECT $1::timestamptz = $2::timestamptz AS ok`, [old.previous, OLD]),
+        afterOld: await same(`SELECT last_reminded_at = $2::timestamptz AS ok FROM public.needs_lists WHERE id = $1`, [id, OLD]),
+      };
+    });
+    expect(out).toEqual({
+      fresh: { claimed: true, previous: null, held: true },
+      released: true,
+      afterNull: null,
+      previous: true,
+      afterOld: true,
+    });
+  });
+
+  it('never releases over a reminder that went out: once the stamp moved, the release changes nothing', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await sentList(tx);
+      const claim = await call<Claim>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contactA });
+      // The reminder went out and recorded itself.
+      await tx.query(`UPDATE public.needs_lists SET last_reminded_at = now() + interval '1 second', reminder_count = reminder_count + 1 WHERE id = $1`, [id]);
+      const recorded = await stampOf(tx, id);
+      const released = await call<boolean>(tx, 'mcp_release_reminder', { p_list_id: id, p_stamp: claim.stamp, p_previous: claim.previous });
+      return { released, kept: (await stampOf(tx, id)) === recorded };
+    });
+    expect(out).toEqual({ released: false, kept: true });
   });
 });
 

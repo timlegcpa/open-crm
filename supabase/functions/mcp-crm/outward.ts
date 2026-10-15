@@ -6,8 +6,8 @@
 // second credential the send-needs-list endpoint accepts, so nothing a browser could
 // present reaches the connector's path; and no gateway setting or secret header has to
 // be kept right. What the connector reviewed travels with the call (Reviewed): the content
-// version its token was verified over, which the publish compares, and the address it read
-// back, which the send re-checks against the contact it loads.
+// version its token was verified over, which the publish and the reminder compare, and
+// the address it read back, which both re-check against the contact they load.
 //
 // Every message leaves through the store's sendEmail (the outbound adapter). The owner's
 // copy is how the owner sees what an assistant mailed a client with no person in the loop;
@@ -25,6 +25,12 @@ export type OutwardSend =
 export type OutwardRemind =
   | { status: 'reminded'; email: 'sent' | 'unknown'; remaining: number }
   | { status: 'not_sent' | 'nothing_open' | 'no_email' | 'email_failed' | 'changed' | 'gone' };
+
+/** Whether the owner's copy went: 'failed' covers no owner address too. */
+export type OwnerCopy = 'sent' | 'failed' | 'unknown';
+
+/** The publish refusals this arm knows. Any other is reported as 'changed': nothing was sent. */
+const SEND_REFUSED = ['already_sent', 'changed', 'gone', 'no_items', 'no_email', 'not_draft'] as const;
 
 /** What the owner's copy says went out. */
 export interface Receipt {
@@ -44,9 +50,12 @@ export interface Receipt {
 
 export interface RequestOutward {
   send(input: { listId: string; actor: string; version: number; email: string }, log: Logger): Promise<OutwardSend>;
-  remind(input: { listId: string; actor: string; email: string }, log: Logger): Promise<OutwardRemind & { reminderCount?: number }>;
-  /** The owner's copy of what went out. true only when the provider accepted it. */
-  receipt(receipt: Receipt): Promise<boolean>;
+  remind(
+    input: { listId: string; actor: string; version: number; email: string; recheck: () => Promise<boolean> },
+    log: Logger,
+  ): Promise<OutwardRemind & { reminderCount?: number }>;
+  /** The owner's copy of what went out, as the provider answered: 'unknown' when its answer was lost. */
+  receipt(receipt: Receipt): Promise<OwnerCopy>;
   /** An out-of-band note to the owner (an outward act whose audit row could not be written). */
   alert(subject: string, lines: readonly string[], key: string): Promise<boolean>;
 }
@@ -64,12 +73,12 @@ export function createRequestOutward(deps: {
     return deps.siteUrl;
   };
 
-  async function toOwner(subject: string, content: EmailContent, key: string): Promise<boolean> {
+  async function toOwner(subject: string, content: EmailContent, key: string): Promise<OwnerCopy> {
     const to = await deps.ownerEmail();
-    if (!to) return false;
+    if (!to) return 'failed';
     const org = await store.loadOrg();
     const result = await store.sendEmail({ to, subject, content, fromName: org.senderName, idempotencyKey: key });
-    return result.status === 'sent';
+    return result.status;
   }
 
   return {
@@ -77,13 +86,15 @@ export function createRequestOutward(deps: {
       const list = await store.loadList(listId);
       if (!list) return { status: 'gone' };
       const result = await sendList(store, site(), list, actor, log, { version, email });
-      return result.status === 'sent' ? { status: 'sent', email: result.email } : { status: result.status };
+      if (result.status === 'sent') return { status: 'sent', email: result.email };
+      // A refusal this arm does not know (a newer publish check, say) still published nothing.
+      return { status: (SEND_REFUSED as readonly string[]).includes(result.status) ? result.status : 'changed' };
     },
 
-    async remind({ listId, actor, email }, log) {
+    async remind({ listId, actor, version, email, recheck }, log) {
       const list = await store.loadList(listId);
       if (!list) return { status: 'gone' };
-      const result = await remindList(store, site(), list, actor, log, { email });
+      const result = await remindList(store, site(), list, actor, log, { version, email, recheck });
       if (result.status !== 'reminded') return { status: result.status };
       return { status: 'reminded', email: result.email, remaining: result.remaining, reminderCount: list.reminder_count };
     },
@@ -108,8 +119,9 @@ export function createRequestOutward(deps: {
       return toOwner(subject, { preheader: 'A copy of what went out.', blocks }, r.key);
     },
 
-    alert(subject, lines, key) {
-      return toOwner(subject, { blocks: lines.map((text) => ({ kind: 'paragraph' as const, text })) }, key);
+    async alert(subject, lines, key) {
+      // Only an accepted alert is reported as one.
+      return (await toOwner(subject, { blocks: lines.map((text) => ({ kind: 'paragraph' as const, text })) }, key)) === 'sent';
     },
   };
 }

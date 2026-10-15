@@ -143,6 +143,12 @@ const emailStatus = (r: SendResult): boolean | null => (r.status === 'sent' ? tr
 export interface Reviewed {
   version?: number;
   email: string;
+  /**
+   * A reminder's last check that the request still reads as reviewed, fulfilment
+   * included: run after the open count is read and before any link is minted or email
+   * sent, so an answer landing after the connector's own check sends nothing.
+   */
+  recheck?: () => Promise<boolean>;
 }
 
 export type RemindResult =
@@ -167,6 +173,7 @@ export async function remindList(
   reviewed?: Reviewed,
 ): Promise<RemindResult> {
   if (list.status !== 'sent') return { status: 'not_sent' };
+  if (reviewed?.version !== undefined && reviewed.version !== list.content_version) return { status: 'changed' };
   const progress = await store.progress(list.id);
   const remaining = Math.max(progress.actionable - progress.fulfilled, 0);
   if (remaining === 0) return { status: 'nothing_open' };
@@ -174,6 +181,7 @@ export async function remindList(
   const email = contact?.email?.trim().toLowerCase() ?? '';
   if (!email || !isValidEmail(email)) return { status: 'no_email' };
   if (reviewed && reviewed.email.trim().toLowerCase() !== email) return { status: 'changed' };
+  if (reviewed?.recheck && !(await reviewed.recheck())) return { status: 'changed' };
 
   const { url, startLinkId } = await destination(store, siteUrl, list, email, actorId, true);
   const org = await store.loadOrg();
