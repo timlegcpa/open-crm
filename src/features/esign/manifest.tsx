@@ -5,8 +5,12 @@ import type { FeatureManifest } from '@/features/types';
 const EsignPage = lazyNamed(() => import('./pages'), 'EsignPage');
 const NewEnvelopePage = lazyNamed(() => import('./pages'), 'NewEnvelopePage');
 const EnvelopePage = lazyNamed(() => import('./pages'), 'EnvelopePage');
-const PortalSignPage = lazyNamed(() => import('./pages'), 'PortalSignPage');
 const EsignTab = lazyNamed(() => import('./pages'), 'EsignTab');
+const PortalSignPage = lazyNamed(() => import('./portal'), 'PortalSignPage');
+const SignatureNeededCard = lazyNamed(() => import('./portal'), 'SignatureNeededCard');
+const EsignContactBadge = lazyNamed(() => import('./badges'), 'EsignContactBadge');
+const EsignHeaderAction = lazyNamed(() => import('./badges'), 'EsignHeaderAction');
+const EsignSettings = lazyNamed(() => import('./settings'), 'EsignSettings');
 const SignPage = lazyNamed(() => import('./public/SignPage'), 'SignPage');
 const VerifyPage = lazyNamed(() => import('./public/VerifyPage'), 'VerifyPage');
 
@@ -19,9 +23,12 @@ export const manifest: FeatureManifest = {
     { path: 'esign/:id', element: <EnvelopePage /> },
   ],
   portalRoutes: [{ path: 'sign', element: <PortalSignPage /> }],
+  portalHomeCards: [{ key: 'esign', order: 15, Component: SignatureNeededCard }],
   publicRoutes: [
     { path: 'sign/*', element: <SignPage /> },
     { path: 'esign/verify', element: <VerifyPage /> },
   ],
-  contactTabs: [{ key: 'esign', label: 'E-sign', order: 50, Component: EsignTab }],
+  contactTabs: [{ key: 'esign', label: 'E-sign', order: 50, Component: EsignTab, badge: EsignContactBadge }],
+  contactHeaderActions: [{ key: 'esign', order: 50, Component: EsignHeaderAction }],
+  settingsSections: [{ key: 'esign', label: 'E-sign', order: 60, Component: EsignSettings }],
 };
