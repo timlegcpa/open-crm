@@ -467,3 +467,9 @@ verify_jwt = false
 
 [functions.mcp-crm]
 verify_jwt = false
+
+[functions.accept-start-link]
+verify_jwt = false
+
+[functions.needs-reminder-dispatcher]
+verify_jwt = false
