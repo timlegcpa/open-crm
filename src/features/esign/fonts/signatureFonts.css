@@ -1,0 +1,35 @@
+/* The six script fonts a typed signature previews in, on /sign and /portal/sign. The server
+ * stamps with the matching TTFs in supabase/functions/_shared/esign-fonts/fonts/; the keys and
+ * families are held equal to ../lib/signatureFonts.ts by signatureFonts.test.ts. Licences sit
+ * beside each file (SIL OFL 1.1; Homemade Apple, Apache 2.0). */
+
+@font-face {
+  font-family: 'Allison';
+  src: url('./allison.woff2') format('woff2');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Dancing Script';
+  src: url('./dancing-script.woff2') format('woff2');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Sacramento';
+  src: url('./sacramento.woff2') format('woff2');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Great Vibes';
+  src: url('./great-vibes.woff2') format('woff2');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Pacifico';
+  src: url('./pacifico.woff2') format('woff2');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Homemade Apple';
+  src: url('./homemade-apple.woff2') format('woff2');
+  font-display: swap;
+}
