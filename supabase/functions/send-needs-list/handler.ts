@@ -1,8 +1,11 @@
 // send-needs-list: send a draft request to its contact, or remind them about a sent one.
 //
-// Owner only. The AI connector reaches this logic through the injected actor resolver
-// (resolveActor): its own door decides who the caller is, and this file never assumes the
-// caller is a browser session.
+// Owner only over HTTP. The AI connector (mcp-crm) never calls this endpoint: it runs the
+// same send and reminder in its own process, through the exported sendList and remindList
+// below, with the content version and address its review token was checked against
+// (Reviewed). So there is no second credential this endpoint accepts and nothing a
+// browser could present to reach the connector's path. resolveActor stays the seam for
+// who acted.
 //
 // Sending, in order, each step before anything becomes visible to the client:
 //   1. The list is a draft with at least one item, and its contact has an address.
@@ -166,6 +169,25 @@ async function expireQuietly(store: NeedsSendStore, linkId: string | null, log: 
 
 const emailStatus = (r: SendResult): boolean | null => (r.status === 'sent' ? true : r.status === 'failed' ? false : null);
 
+/**
+ * What the AI connector reviewed before asking for a send or a reminder: the content
+ * version its review token was verified over, and the address it read back. Both are
+ * re-checked against the rows loaded here, so an edit (or a changed address) landing
+ * between the connector's check and this call sends nothing. The owner's own send passes
+ * none: the owner is looking at the request in the CRM.
+ */
+export interface Reviewed {
+  version?: number;
+  email: string;
+  /**
+   * A reminder's last check that the request still reads as reviewed, fulfilment
+   * included: run after the open count is read and before the count is claimed or any
+   * link minted or email sent, so an answer landing after the connector's own check
+   * sends nothing.
+   */
+  recheck?: () => Promise<boolean>;
+}
+
 export type RemindResult =
   | { status: 'reminded'; email: 'sent' | 'unknown'; remaining: number; startLink: boolean }
   | { status: 'nothing_open' }
@@ -186,14 +208,18 @@ export async function remindList(
   list: NeedsListRow,
   actorId: string | null,
   log: Logger,
+  reviewed?: Reviewed,
 ): Promise<RemindResult> {
   if (list.status !== 'sent') return { status: 'not_sent' };
+  if (reviewed?.version !== undefined && reviewed.version !== list.content_version) return { status: 'changed' };
   const progress = await store.progress(list.id);
   const remaining = Math.max(progress.actionable - progress.fulfilled, 0);
   if (remaining === 0) return { status: 'nothing_open' };
   const contact = await store.loadContact(list.contact_id);
   const email = contact?.email?.trim().toLowerCase() ?? '';
   if (!email || !isValidEmail(email)) return { status: 'no_email' };
+  if (reviewed && reviewed.email.trim().toLowerCase() !== email) return { status: 'changed' };
+  if (reviewed?.recheck && !(await reviewed.recheck())) return { status: 'changed' };
 
   // Claim this reminder's number before minting or sending anything.
   const number = list.reminder_count;
@@ -252,6 +278,64 @@ export async function remindList(
   return { status: 'reminded', email: result.status, remaining, startLink: startLinkId !== null };
 }
 
+export type SendListResult =
+  | { status: 'sent'; email: boolean | null; itemCount: number; startLink: boolean }
+  | { status: 'no_items' | 'no_email' | 'changed' | 'already_sent' | 'gone' | 'not_draft' };
+
+/**
+ * Publish one draft and email its contact. Shared by the owner's send and the AI
+ * connector's, so both check, link, publish and word it the same way. A list or address
+ * that moved (contact_changed, address_changed, a lost version race, a refused link) is
+ * one result, 'changed': nothing was published. A refusal is a result; a database error
+ * propagates. Writes no audit row: each caller records its own.
+ */
+export async function sendList(
+  store: NeedsSendStore,
+  siteUrl: string,
+  list: NeedsListRow,
+  actorId: string | null,
+  log: Logger,
+  reviewed?: Reviewed,
+): Promise<SendListResult> {
+  if (list.status !== 'draft') return { status: 'already_sent' };
+  // The connector's version is checked before anything is minted, and it is the version
+  // the publish below compares against.
+  if (reviewed?.version !== undefined && reviewed.version !== list.content_version) return { status: 'changed' };
+  const itemCount = await store.countItems(list.id);
+  if (itemCount === 0) return { status: 'no_items' };
+  const contact = await store.loadContact(list.contact_id);
+  const email = contact?.email?.trim().toLowerCase() ?? '';
+  if (!email || !isValidEmail(email)) return { status: 'no_email' };
+  if (reviewed && reviewed.email.trim().toLowerCase() !== email) return { status: 'changed' };
+
+  const target = await destination(store, siteUrl, list, email, actorId);
+  if (!target) return { status: 'changed' };
+  const { url, startLinkId } = target;
+  const outcome = await store.sendList(list.id, reviewed?.version ?? list.content_version, { contactId: list.contact_id, email });
+  if (outcome !== 'sent') {
+    // Nothing was published by this call, so its link is never emailed: retire it.
+    await expireQuietly(store, startLinkId, log);
+    if (outcome === 'already_sent' || outcome === 'gone' || outcome === 'not_draft') return { status: outcome };
+    // changed, contact_changed, address_changed, or a refusal this code does not know yet.
+    return { status: 'changed' };
+  }
+
+  let emailSent: boolean | null = false;
+  try {
+    const org = await store.loadOrg();
+    const { subject, content } = requestSentEmail({
+      org, clientName: clientFirstName(contact), title: list.title, itemCount, intro: list.intro_message, url,
+      startLink: startLinkId !== null,
+    });
+    const result = await store.sendEmail({ to: email, subject, content, fromName: org.senderName, idempotencyKey: `needs-send:${list.id}` });
+    emailSent = emailStatus(result);
+    if (result.status === 'failed') log.warn('request email not sent', { reason: result.reason });
+  } catch (err) {
+    log.error('request email failed', err);
+  }
+  return { status: 'sent', email: emailSent, itemCount, startLink: startLinkId !== null };
+}
+
 export function createSendNeedsListHandler(deps: SendNeedsDeps): (req: Request) => Promise<Response> {
   const resolveActor = deps.resolveActor ?? ((p: Principal) => (p.kind === 'owner' ? p.userId : null));
   return createHandler({
@@ -289,49 +373,22 @@ export function createSendNeedsListHandler(deps: SendNeedsDeps): (req: Request) 
         return json(200, { status: 'reminded', email_sent: result.email === 'sent' ? true : null, remaining: result.remaining });
       }
 
-      if (list.status !== 'draft') refuse(409, 'This request was already sent.', 'already_sent');
-      const itemCount = await deps.countItems(list.id);
-      if (itemCount === 0) refuse(400, 'Add at least one item before sending.', 'no_items');
-      const contact = await deps.loadContact(list.contact_id);
-      const email = contact?.email?.trim().toLowerCase() ?? '';
-      if (!email || !isValidEmail(email)) refuse(400, 'This contact has no email address.', 'no_email');
+      const sent = await sendList(deps, siteUrl, list, actorId, log);
+      if (sent.status === 'already_sent') refuse(409, 'This request was already sent.', 'already_sent');
+      if (sent.status === 'no_items') refuse(400, 'Add at least one item before sending.', 'no_items');
+      if (sent.status === 'no_email') refuse(400, 'This contact has no email address.', 'no_email');
+      if (sent.status === 'changed') refuse(409, 'The request changed while sending. Review it, then send again.', 'changed');
+      if (sent.status === 'gone') refuse(404, 'This request no longer exists.', 'not_found');
+      if (sent.status !== 'sent') refuse(409, 'This request can no longer be sent.', 'not_draft');
 
-      const target = await destination(deps, siteUrl, list, email, actorId);
-      if (!target) refuse(409, 'The request changed while sending. Review it, then send again.', 'changed');
-      const { url, startLinkId } = target;
-      const outcome = await deps.sendList(list.id, list.content_version, { contactId: list.contact_id, email });
-      if (outcome !== 'sent') {
-        // Nothing was published by this call, so its link is never emailed: retire it.
-        await expireQuietly(deps, startLinkId, log);
-        if (outcome === 'already_sent') refuse(409, 'This request was already sent.', 'already_sent');
-        if (outcome === 'changed' || outcome === 'contact_changed' || outcome === 'address_changed') {
-          refuse(409, 'The request changed while sending. Review it, then send again.', 'changed');
-        }
-        if (outcome === 'gone') refuse(404, 'This request no longer exists.', 'not_found');
-        refuse(409, 'This request can no longer be sent.', 'not_draft');
-      }
-
-      let emailSent: boolean | null = false;
-      try {
-        const org = await deps.loadOrg();
-        const { subject, content } = requestSentEmail({
-          org, clientName: clientFirstName(contact), title: list.title, itemCount, intro: list.intro_message, url,
-          startLink: startLinkId !== null,
-        });
-        const result = await deps.sendEmail({ to: email, subject, content, fromName: org.senderName, idempotencyKey: `needs-send:${list.id}` });
-        emailSent = emailStatus(result);
-        if (result.status === 'failed') log.warn('request email not sent', { reason: result.reason });
-      } catch (err) {
-        log.error('request email failed', err);
-      }
       await writeAudit(deps, log, {
         actorId, action: 'needs_list_sent', ip, userAgent,
         details: {
-          list_id: list.id, contact_id: list.contact_id, item_count: itemCount, start_link: startLinkId !== null,
-          email_status: emailSent === true ? 'sent' : emailSent === false ? 'failed' : 'unknown',
+          list_id: list.id, contact_id: list.contact_id, item_count: sent.itemCount, start_link: sent.startLink,
+          email_status: sent.email === true ? 'sent' : sent.email === false ? 'failed' : 'unknown',
         },
       });
-      return json(200, { status: 'sent', email_sent: emailSent, start_link: startLinkId !== null });
+      return json(200, { status: 'sent', email_sent: sent.email, start_link: sent.startLink });
     },
   });
 }

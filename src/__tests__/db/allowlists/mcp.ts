@@ -25,6 +25,16 @@ export const allowlist: DomainAllowlist = {
     'mcp_log_call_note(uuid,text,text,uuid,text,text)',
     'mcp_upsert_quote(uuid,uuid,text,text,numeric,uuid,text,text)',
     'mcp_delete_quote(uuid,uuid,uuid,text,uuid,text,text)',
+    // The request tools (wave 6b).
+    'mcp_request_snapshot(uuid,uuid,integer)',
+    'mcp_list_requests(uuid,integer,uuid,text,text)',
+    'mcp_request_keys_active(jsonb)',
+    'mcp_request_audit(uuid,text,jsonb,text,text)',
+    'mcp_create_request(uuid,text,text,jsonb,uuid,text,text)',
+    'mcp_update_request(uuid,uuid,integer,text,text,jsonb,uuid,text,text)',
+    'mcp_delete_request(uuid,uuid,integer,uuid,text,text)',
+    'mcp_claim_reminder(uuid,uuid)',
+    'mcp_release_reminder(uuid,integer,timestamp with time zone)',
   ],
   definerWriteExempt: {
     'mcp_revoke_grant(uuid)':

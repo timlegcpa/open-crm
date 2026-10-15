@@ -21,7 +21,8 @@
 //      for every request: it is what bounds a guessing campaign. A failed authentication is
 //      logged with the caller's address.
 //   5. Every read and every write is audited with source 'mcp', inside the same transaction
-//      (see tools.ts and 0007_mcp.sql).
+//      (see tools.ts and 0007_mcp.sql). The two tools that email a client audit after the
+//      fact, since an email cannot be rolled back, and allow one such email per request.
 //   6. A request is bounded: 100,000 bytes of body, 20 messages per batch, 20 tool calls per
 //      request. Batches run serially and each element can cost a database round trip, so
 //      an uncapped batch would turn one request into any number of writes.
@@ -32,6 +33,8 @@ import type { Logger, LogSink } from '../_shared/log.ts';
 import { checkPublicLimits, type RateLimitOutcome } from '../_shared/rate-limit.ts';
 import { sha256Hex } from '../_shared/crypto.ts';
 import { ACCESS_TOKEN_RE, SCOPE, endpointOf, mcpResourceUrl, protectedResourceMetadataUrl } from '../mcp-oauth/tokens.ts';
+import type { RequestOutward } from './outward.ts';
+import type { ReviewSigner } from './review-token.ts';
 import { TOOL_NAMES, callTool, toolCatalog, type ToolDb, type Vocabulary } from './tools.ts';
 
 export const PROTOCOL_VERSION = '2025-11-25';
@@ -55,6 +58,12 @@ export interface McpCrmDeps {
   db: ToolDb;
   /** org_profile.display_name, for the metadata's resource_name. */
   orgName(): Promise<string>;
+  /** Mints and verifies the request tools' review tokens (createReviewSigner over a server secret). */
+  review: ReviewSigner;
+  /** Sends and reminds a request in process, and emails the owner (createRequestOutward). */
+  outward: RequestOutward;
+  /** The wait between audit attempts of an outward act; tests pass a no-op. */
+  sleep?: (ms: number) => Promise<void>;
   /** The rate limiter; checkPublicLimits against db when omitted. Tests pass a fake. */
   limit?: (action: string, ctx: RequestContext) => Promise<RateLimitOutcome>;
   logSink?: LogSink;
@@ -163,7 +172,10 @@ export function createMcpCrmEndpoints(deps: McpCrmDeps) {
           if (error) throw error;
           return data as Vocabulary;
         })());
-      const ctx = { db: deps.db, actor: grant.actor, ip, userAgent, vocabulary, budget: { sends: 0 } };
+      const ctx = {
+        db: deps.db, actor: grant.actor, ip, userAgent, vocabulary, budget: { sends: 0 },
+        review: deps.review, outward: deps.outward, log, sleep: deps.sleep,
+      };
       let toolCalls = 0;
       const responses: unknown[] = [];
 

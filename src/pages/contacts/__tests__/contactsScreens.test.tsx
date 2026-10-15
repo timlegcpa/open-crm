@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 
 vi.mock('@/lib/supabase', async () => (await import('@/__tests__/fakeSupabase')).supabaseModule);
 
@@ -103,6 +103,11 @@ function setWide(wide: boolean) {
 beforeAll(async () => {
   await Promise.all([import('@/pages/contacts/ContactsList'), import('@/pages/contacts/ContactWorkspace'), import('@/pages/contacts/ContactIntake')]);
 }, 30_000);
+
+// Under a full parallel run these screens render slowly enough to miss the shared 3 s find
+// window now and then. More time, same assertions: each find and each test may wait longer.
+vi.setConfig({ testTimeout: 20_000 });
+configure({ asyncUtilTimeout: 10_000 });
 
 beforeEach(() => {
   fake.reset();

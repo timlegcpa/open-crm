@@ -58,6 +58,12 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   mcp_log_call_note: 'Agent logged a call note',
   mcp_upsert_quote: 'Agent saved a quote',
   mcp_delete_quote: 'Agent deleted a quote',
+  mcp_create_request: 'Agent drafted a request',
+  mcp_update_request: 'Agent rewrote a draft request',
+  mcp_list_requests: "Agent read a contact's requests",
+  mcp_send_request: 'Agent sent a request',
+  mcp_remind_request: 'Agent sent a request reminder',
+  mcp_delete_request: 'Agent deleted a draft request',
 };
 
 /** The portal's activity actions (0002_contacts.sql), every one. */

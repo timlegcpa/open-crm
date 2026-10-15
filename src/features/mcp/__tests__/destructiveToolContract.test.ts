@@ -1,8 +1,11 @@
 // The safety contract of the connector's destructive tools, mechanized over the source.
 //
-// Two tools need the user's explicit go-ahead (confirmed_with_user): delete_quote, which
-// destroys a row, and correct_contact_email, which moves a routing address. delete_quote
-// destroys a row permanently. It is bounded by a state gate (proposed only, in
+// Five tools need the user's explicit go-ahead (confirmed_with_user): delete_quote and
+// delete_request, which destroy a row; correct_contact_email, which moves a routing
+// address; and send_request and remind_request, which email a client and cannot be
+// recalled. The three request tools also need a review token, checked against the request
+// as it stands, and the two outward ones spend the one client email an HTTP request
+// allows, before they act. delete_quote destroys a row permanently. It is bounded by a state gate (proposed only, in
 // the database), an explicit confirmed_with_user, a content binding (service and business
 // re-checked against the locked row) and refusals that send the caller to the CRM. The
 // behaviour is tested against the database in src/__tests__/db/mcp.test.ts; this pins the
@@ -12,7 +15,7 @@
 // Parsed as an AST and printed WITHOUT comments: a comment is text, and a detector that
 // reads comments goes green over a deleted guard whose explanation was left behind.
 // Structural, not nominal: any tool named delete_* is held to the same rules the moment it
-// exists (the request tools arrive in a later wave). The MCP annotations are pinned too, so
+// exists. The MCP annotations are pinned too, so
 // an assistant is told the truth about which tools only read and which destroy.
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -105,15 +108,23 @@ function stripSqlComments(sql: string): string {
 const required = requiredByTool(SOURCE);
 const bodies = handlerBodies(SOURCE);
 /** The tools that act only on the user's explicit go-ahead. Every delete_* tool must be one. */
-const CONFIRMED = ['correct_contact_email', 'delete_quote'];
+const CONFIRMED = ['correct_contact_email', 'delete_quote', 'delete_request', 'remind_request', 'send_request'];
+/** The tools that email a client. Each spends the per-request send budget. */
+const OUTWARD = ['remind_request', 'send_request'];
+/** The tools that act on a request someone read: each takes and verifies a review token. */
+const REVIEWED = ['delete_request', 'remind_request', 'send_request', 'update_request'];
+/** The tools that record every refusal (through one `refuse` bound to their own action). */
+const REFUSING = ['delete_request', 'remind_request', 'send_request'];
+/** The body with its leading `const refuse = ...;` binding removed: what runs first. */
+const afterRefuse = (body: string) => body.replace(/^\{\s*/, '').replace(/^const refuse = [^\n]*\n\s*/, '');
 const destructive = Object.keys(required).filter((n) => n.startsWith('delete_'));
 const confirming = Object.keys(required).filter((n) => required[n].includes('confirmed_with_user'));
 
 describe('the destructive tool contract', () => {
   it('finds every tool and the guarded ones (the parser still works)', () => {
-    expect(Object.keys(required)).toHaveLength(9);
+    expect(Object.keys(required)).toHaveLength(15);
     expect(Object.keys(bodies).sort()).toEqual(Object.keys(required).sort());
-    expect(destructive).toEqual(['delete_quote']);
+    expect(destructive).toEqual(['delete_quote', 'delete_request']);
     for (const tool of destructive) expect(CONFIRMED).toContain(tool);
   });
 
@@ -147,6 +158,73 @@ describe('the destructive tool contract', () => {
     expect(SOURCE).not.toMatch(/\.from\(|\.delete\(/);
   });
 
+  it.each(REVIEWED)('%s requires a review token and verifies it against the request as stored', (tool) => {
+    expect(required[tool]).toEqual(
+      tool === 'update_request' ? ['list_id', 'contact_id', 'review_token', 'title', 'items'] : ['list_id', 'contact_id', 'review_token', 'confirmed_with_user'],
+    );
+    const body = bodies[tool];
+    expect(body).toContain('reviewToken(args.review_token)');
+    expect(body).toContain('readRequest(ctx, args.contact_id, args.list_id)');
+    expect(body).toContain('ctx.review.verify(token.token, list.id, canonicalRequest(list, contact))');
+  });
+
+  it.each(OUTWARD)('%s checks the send budget first, and spends it after verifying and before sending', (tool) => {
+    const body = bodies[tool];
+    const at = (needle: string) => {
+      const i = body.indexOf(needle);
+      expect(i, needle).toBeGreaterThanOrEqual(0);
+      return i;
+    };
+    // First statement of the block: nothing is read or checked before the budget.
+    expect(afterRefuse(body).startsWith('if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST)')).toBe(true);
+    expect(at('ctx.review.verify(')).toBeLessThan(at('ctx.budget.sends++'));
+    expect(at('args.confirmed_with_user !== true')).toBeLessThan(at('ctx.budget.sends++'));
+    expect(at('ctx.budget.sends++')).toBeLessThan(at(`ctx.outward.${tool === 'send_request' ? 'send' : 'remind'}(`));
+    // The attempt row is written, and checked, before anything goes out.
+    expect(at(`if (!(await attemptRow(ctx, 'mcp_${tool}'`)).toBeLessThan(at(`ctx.outward.${tool === 'send_request' ? 'send' : 'remind'}(`));
+  });
+
+  it.each(REFUSING)('%s records its refusals under its own action, never returning a bare tool error', (tool) => {
+    const body = bodies[tool];
+    expect(afterRefuse(body)).not.toBe(body.replace(/^\{\s*/, ''));
+    expect(body).toContain(`refused(ctx, 'mcp_${tool}', reason, args, message)`);
+    // Every early exit goes through refuse; only the outcomes after an attempt are bare errors.
+    const beforeAct = body.slice(0, body.indexOf(tool === 'delete_request' ? "auditedRpc(ctx, 'mcp_delete_request'" : 'ctx.budget.sends++;'));
+    expect(beforeAct.replace(/^\{\s*/, '')).not.toMatch(/return toolError\(/);
+  });
+
+  it('remind_request hands its claim back on every exit after the claim but a reminder that went out', () => {
+    const body = bodies.remind_request;
+    const afterClaim = body.slice(body.indexOf("if (claim?.claimed !== true)"));
+    // The attempt-row failure, a throw and a non-reminded outcome.
+    expect(afterClaim.match(/await releaseClaim\(ctx, list\.id, claim\)/g)).toHaveLength(3);
+    expect(afterClaim.slice(afterClaim.indexOf("if (reminded.status !== 'reminded')"))).toMatch(/^if \(reminded\.status !== 'reminded'\) \{\s*await releaseClaim/);
+  });
+
+  it('update_request rewrites at the verified version only', () => {
+    const body = bodies.update_request;
+    expect(body.indexOf('ctx.review.verify(')).toBeLessThan(body.indexOf("auditedRpc(ctx, 'mcp_update_request'"));
+    expect(body).toContain('p_expected_version: list.content_version');
+    expect(body).toContain("sentinel(error, 'mcp_update_request: changed')");
+  });
+
+  it('the outward tools pass the reviewed version and address on, and record every outcome', () => {
+    expect(bodies.send_request).toContain('version: list.content_version, email: contact.email');
+    expect(bodies.remind_request).toContain('version: list.content_version, email: contact.email');
+    expect(bodies.remind_request).toContain("ctx.db.rpc('mcp_claim_reminder'");
+    for (const tool of OUTWARD) expect(bodies[tool]).toContain(`auditDelegated(ctx, 'mcp_${tool}'`);
+  });
+
+  it('delete_request deletes through the audited function at the verified version, mapping every sentinel without echoing', () => {
+    const body = bodies.delete_request;
+    expect(body.indexOf('ctx.review.verify(')).toBeLessThan(body.indexOf("auditedRpc(ctx, 'mcp_delete_request'"));
+    expect(body).toContain('p_expected_version: list.content_version');
+    for (const code of ['not_found', 'not_draft', 'stale_content', 'has_answers', 'has_documents']) {
+      expect(body).toContain(`exactSentinel(error, '${code}')`);
+    }
+    expect(body).not.toMatch(/error\.message|\$\{error/);
+  });
+
   it('the detectors go red when the guards are removed', () => {
     const broken = handlerBodies(
       SOURCE.replaceAll('args.confirmed_with_user !== true', 'args.confirmed_with_user === false').replace(
@@ -156,6 +234,12 @@ describe('the destructive tool contract', () => {
     );
     for (const tool of CONFIRMED) expect(broken[tool]).not.toContain('args.confirmed_with_user !== true');
     expect(broken.delete_quote).not.toContain("sentinel(error, 'mcp_delete_quote: accepted_quote')");
+    // The budget moved after the send: the ordering check reads the moved statement.
+    const late = handlerBodies(SOURCE.replace(
+      'if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST) {',
+      'if (false) {',
+    ));
+    expect(afterRefuse(late.send_request).startsWith('if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST)')).toBe(false);
     const unrequired = SOURCE.replace(
       "required: ['contact_id', 'quote_id', 'service_type', 'confirmed_with_user']",
       "required: ['contact_id', 'quote_id', 'service_type']",
@@ -179,8 +263,8 @@ describe('the tool annotations', () => {
     for (const t of TOOLS) expect([t.name, hints[t.name]?.openWorldHint]).toEqual([t.name, false]);
   });
 
-  it('only the two reads are read-only', () => {
-    expect(TOOLS.filter((t) => hints[t.name]?.readOnlyHint === true).map((t) => t.name).sort()).toEqual(['get_contact', 'search_contacts']);
+  it('only the three reads are read-only', () => {
+    expect(TOOLS.filter((t) => hints[t.name]?.readOnlyHint === true).map((t) => t.name).sort()).toEqual(['get_contact', 'list_requests', 'search_contacts']);
   });
 
   it('every write states destructiveHint, since the protocol presumes true when it is absent', () => {
@@ -192,7 +276,13 @@ describe('the tool annotations', () => {
 
   it('every confirmed and every delete_* tool is marked destructive; the append-only writes are not', () => {
     for (const tool of [...CONFIRMED, ...destructive]) expect([tool, hints[tool]?.destructiveHint]).toEqual([tool, true]);
-    for (const tool of ['create_contact', 'add_business', 'log_call_note']) expect([tool, hints[tool]?.destructiveHint]).toEqual([tool, false]);
+    for (const tool of ['create_contact', 'add_business', 'log_call_note', 'create_request']) expect([tool, hints[tool]?.destructiveHint]).toEqual([tool, false]);
+    // A full replacement removes what it is not sent.
+    expect(hints.update_request?.destructiveHint).toBe(true);
+  });
+
+  it('an email to a client is never marked idempotent: a retry is a second email', () => {
+    for (const tool of OUTWARD) expect([tool, hints[tool]?.idempotentHint]).toEqual([tool, false]);
   });
 });
 

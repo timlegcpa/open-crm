@@ -7,6 +7,8 @@ import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDb, seedContact, seedCore, seedPortalAccount } from '../db/harness';
 import {
   createSendNeedsListHandler,
+  remindList,
+  sendList,
   type NeedsSendStore,
   type SendNeedsDeps,
 } from '../../../supabase/functions/send-needs-list/handler';
@@ -492,5 +494,67 @@ describe('send-needs-list: remind', () => {
     await call(d, { list_id: id, remind: true });
     expect((await links(id)).map((r) => r.status)).toEqual(['superseded', 'pending']);
     expect(sent[1].text).toContain(`/start#token=${'2'.padStart(43, 'R')}`);
+  });
+});
+
+describe('send-needs-list: the connector arm (sendList and remindList with what was reviewed)', () => {
+  const log = { error() {}, warn() {}, info() {} };
+  const load = async (id: string) => (await pgliteStore([]).loadList(id))!;
+
+  it('sends at the reviewed version to the reviewed address, the address compared without case', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(noAccount);
+    const list = await load(id);
+    const result = await sendList(pgliteStore(sent), SITE, list, null, log, { version: list.content_version, email: ` GRACE-${n}@example.com ` });
+    expect(result).toMatchObject({ status: 'sent', email: true, itemCount: 2, startLink: true });
+    expect(sent.map((m) => m.to)).toEqual([`grace-${n}@example.com`]);
+  });
+
+  it('refuses a version other than the reviewed one before minting a link', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(noAccount);
+    const list = await load(id);
+    const result = await sendList(pgliteStore(sent), SITE, list, null, log, { version: list.content_version - 1, email: `grace-${n}@example.com` });
+    expect(result).toEqual({ status: 'changed' });
+    expect(await links(id)).toEqual([]);
+    expect((await listRow(id)).status).toBe('draft');
+    expect(sent).toEqual([]);
+  });
+
+  it('refuses an address other than the reviewed one, publishing nothing', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(withAccount);
+    const list = await load(id);
+    const result = await sendList(pgliteStore(sent), SITE, list, null, log, { version: list.content_version, email: 'someone-else@example.com' });
+    expect(result).toEqual({ status: 'changed' });
+    expect((await listRow(id)).status).toBe('draft');
+    expect(sent).toEqual([]);
+  });
+
+  it('a reminder refuses an address other than the reviewed one, sending and counting nothing', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(withAccount);
+    await call(deps([]), { list_id: id });
+    const list = await load(id);
+    expect(await remindList(pgliteStore(sent), SITE, list, null, log, { email: 'someone-else@example.com' })).toEqual({ status: 'changed' });
+    expect(sent).toEqual([]);
+    expect((await listRow(id)).reminder_count).toBe(0);
+    const ok = await remindList(pgliteStore(sent), SITE, list, null, log, { email: `ADA-${n}@example.com` });
+    expect(ok).toMatchObject({ status: 'reminded', email: 'sent' });
+  });
+
+  it('a reminder refuses a version other than the reviewed one, sending and counting nothing; none passed is the owner path', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(withAccount);
+    await call(deps([]), { list_id: id });
+    const list = await load(id);
+    const stale = await remindList(pgliteStore(sent), SITE, list, null, log, { version: list.content_version - 1, email: `ada-${n}@example.com` });
+    expect(stale).toEqual({ status: 'changed' });
+    expect([sent, (await listRow(id)).reminder_count]).toEqual([[], 0]);
+    const reviewed = await remindList(pgliteStore(sent), SITE, list, null, log, { version: list.content_version, email: `ada-${n}@example.com` });
+    expect(reviewed).toMatchObject({ status: 'reminded', email: 'sent' });
+    // The owner's reminder carries nothing reviewed and is not version-bound.
+    const owner = await remindList(pgliteStore(sent), SITE, { ...list, content_version: list.content_version + 7, reminder_count: 1 }, null, log);
+    expect(owner).toMatchObject({ status: 'reminded' });
   });
 });
