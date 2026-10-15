@@ -47,7 +47,6 @@ never changes an existing value. Do not edit them, and do not copy them between 
 | `CRON_SHARED_SECRET` | 64 hex characters. Scheduled calls send it in the `x-cron-secret` header; `schedules:install` copies it into Vault. | Every scheduled call is refused (an unset or shorter-than-32-character secret refuses all callers), so reminders, digests, envelope expiry and clean-up never run. Run `schedules:install` again after changing it. |
 | `ESIGN_INTERNAL_TOKEN` | 64 hex characters, sent by `esign-signer-sign` to `esign-finalize-envelope`. | The last signature is recorded but finalize is skipped: no executed PDF, no completion emails. |
 | `ESIGN_SMS_CODE_KEY` | 32 bytes as 64 hex characters, the HMAC key for e-sign text message codes. | High-verification signing (a text message code) fails. |
-| `MCP_INTERNAL_SECRET` | 64 hex characters. | Nothing today: no function reads it yet. It is generated so a later function-to-function call has a secret ready. |
 
 ### Set by you
 

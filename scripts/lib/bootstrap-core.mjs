@@ -11,7 +11,6 @@ export const FUNCTION_SECRETS = [
   { name: 'DOCUMENT_ENCRYPTION_KEY', bytes: 32, encoding: 'base64' },
   { name: 'PII_ENCRYPTION_KEY', bytes: 32, encoding: 'base64' },
   { name: 'CRON_SHARED_SECRET', bytes: 32, encoding: 'hex' },
-  { name: 'MCP_INTERNAL_SECRET', bytes: 32, encoding: 'hex' },
   { name: 'ESIGN_INTERNAL_TOKEN', bytes: 32, encoding: 'hex' },
   // The HMAC key for e-sign text message codes: exactly 32 bytes as 64 hex characters.
   { name: 'ESIGN_SMS_CODE_KEY', bytes: 32, encoding: 'hex' },

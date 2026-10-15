@@ -36,7 +36,7 @@ import {
 } from './api';
 
 /**
- * The organization's name, sender name, postal address, brand colour and logo: what every
+ * The organization's name, sender name, postal address, contact email, brand colour and logo: what every
  * email, public page and the portal show. The logo goes through the org-logo function,
  * which checks the file's bytes; the browser checks type and size first only to say so
  * sooner.
@@ -44,13 +44,17 @@ import {
 
 const HEX = /^#[0-9a-f]{6}$/;
 
-const LIMITS = { display_name: 120, legal_name: 200, sender_name: 120, postal_address: 500 } as const;
+const LIMITS = { display_name: 120, legal_name: 200, sender_name: 120, postal_address: 500, contact_email: 254 } as const;
+
+/** The org_profile.contact_email CHECK, as the browser can say it before the save. */
+const CONTACT_EMAIL = /^[^\s\p{Cc}@<>"]+@[^\s\p{Cc}@<>"]+\.[^\s\p{Cc}@<>"]{2,}$/u;
 
 interface Draft {
   display_name: string;
   legal_name: string;
   sender_name: string;
   postal_address: string;
+  contact_email: string;
   primary_color: string;
 }
 
@@ -60,6 +64,7 @@ function draftFrom(profile: OrgProfile): Draft {
     legal_name: profile.legal_name ?? '',
     sender_name: profile.sender_name ?? '',
     postal_address: profile.postal_address ?? '',
+    contact_email: profile.contact_email ?? '',
     primary_color: brandColor(profile) ?? '',
   };
 }
@@ -72,6 +77,8 @@ export function identityProblem(draft: Draft): string | null {
   for (const [field, max] of Object.entries(LIMITS)) {
     if (draft[field as keyof typeof LIMITS].trim().length > max) return `Keep that field to ${max} characters.`;
   }
+  const email = draft.contact_email.trim();
+  if (email && !CONTACT_EMAIL.test(email)) return 'Write the contact email as a full address, such as hello@example.com.';
   const colour = draft.primary_color.trim().toLowerCase();
   if (colour && !HEX.test(colour)) return 'Write the colour as # and six hex digits, such as #1f6feb.';
   return null;
@@ -127,6 +134,7 @@ function IdentityForm({ profile }: { profile: OrgProfile }) {
         legal_name: orNull(draft.legal_name),
         sender_name: orNull(draft.sender_name),
         postal_address: orNull(draft.postal_address),
+        contact_email: orNull(draft.contact_email),
         primary_color: orNull(draft.primary_color.toLowerCase()),
       })
       .catch(() => undefined);
@@ -155,6 +163,20 @@ function IdentityForm({ profile }: { profile: OrgProfile }) {
           <Label htmlFor="identity-address">Postal address</Label>
           <Textarea id="identity-address" rows={3} value={draft.postal_address} onChange={set('postal_address')} maxLength={LIMITS.postal_address} />
           <p className="text-xs text-muted-foreground">Printed at the foot of marketing emails.</p>
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="identity-contact-email">Contact email</Label>
+          <Input
+            id="identity-contact-email"
+            type="email"
+            value={draft.contact_email}
+            onChange={set('contact_email')}
+            maxLength={LIMITS.contact_email}
+            placeholder="hello@example.com"
+          />
+          <p className="text-xs text-muted-foreground">
+            The address people can write to, shown on the e-signature consent and error pages. Optional; never your sign-in email.
+          </p>
         </div>
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="identity-colour">Brand colour</Label>

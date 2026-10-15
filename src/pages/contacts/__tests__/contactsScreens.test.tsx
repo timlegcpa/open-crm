@@ -290,6 +290,10 @@ describe('board and table (wide screens)', () => {
     const hot = await screen.findByRole('region', { name: 'Hot column' });
     fireEvent.click(within(hot).getByRole('button', { name: 'Show Cy Test' }));
     const bar = await screen.findByRole('complementary', { name: 'Cy Test details' });
+    // The bar opens before its Services editor: that is a lazy chunk behind a Suspense
+    // fallback, so the first test to open a bar in a run sees "Loading services..." first.
+    // Wait for the editor itself, never assert on it straight after the bar appears.
+    await within(bar).findByRole('button', { name: 'Edit Retainer quote' });
     return bar;
   }
 

@@ -222,11 +222,11 @@ async function enrollAndVerify() {
 }
 
 describe('writes that change no row', () => {
-  const profile = { display_name: 'Acme LLC', legal_name: null, sender_name: null, postal_address: null, logo_path: null, brand: {} };
+  const profile = { display_name: 'Acme LLC', legal_name: null, sender_name: null, postal_address: null, contact_email: null, logo_path: null, brand: {} };
 
   it('saveIdentity and removeLogo throw when org_profile has no row to change', async () => {
     fake.state.rows.org_profile = [];
-    await expect(saveIdentity(profile, { display_name: 'Acme', legal_name: null, sender_name: null, postal_address: null, primary_color: null })).rejects.toBeInstanceOf(NothingChangedError);
+    await expect(saveIdentity(profile, { display_name: 'Acme', legal_name: null, sender_name: null, postal_address: null, contact_email: null, primary_color: null })).rejects.toBeInstanceOf(NothingChangedError);
     await expect(removeLogo()).rejects.toBeInstanceOf(NothingChangedError);
     fake.state.rows.org_profile = [{ id: true, ...profile }];
     await expect(removeLogo()).resolves.toBeUndefined();
@@ -242,6 +242,40 @@ describe('writes that change no row', () => {
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Nothing was saved. Reload the page and try again.'));
     expect(toast.success).not.toHaveBeenCalled();
     expect(api.recordAudit).not.toHaveBeenCalled();
+  });
+});
+
+describe('identity contact email', () => {
+  const profile = { display_name: 'Acme LLC', legal_name: null, sender_name: null, postal_address: null, contact_email: 'old@example.com', logo_path: null, brand: {} };
+
+  it('shows the saved contact email and saves a new one with the other identity fields', async () => {
+    fake.state.rows.org_profile = [{ id: true, ...profile }];
+    wrap(<IdentitySection />);
+    const email = await screen.findByLabelText('Contact email');
+    expect(email).toHaveValue('old@example.com');
+    fireEvent.change(email, { target: { value: '  hello@example.com ' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Saved.'));
+    const write = fake.state.writes.find((w) => w.table === 'org_profile' && w.op === 'update');
+    expect(write?.payload).toMatchObject({ display_name: 'Acme LLC', contact_email: 'hello@example.com' });
+  });
+
+  it('an emptied contact email saves as not set', async () => {
+    fake.state.rows.org_profile = [{ id: true, ...profile }];
+    wrap(<IdentitySection />);
+    fireEvent.change(await screen.findByLabelText('Contact email'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+    expect(fake.state.writes.find((w) => w.table === 'org_profile')?.payload).toMatchObject({ contact_email: null });
+  });
+
+  it('a malformed contact email is refused before anything is written', async () => {
+    fake.state.rows.org_profile = [{ id: true, ...profile }];
+    wrap(<IdentitySection />);
+    fireEvent.change(await screen.findByLabelText('Contact email'), { target: { value: 'hello@example' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/full address/)));
+    expect(fake.state.writes.filter((w) => w.table === 'org_profile')).toHaveLength(0);
   });
 });
 

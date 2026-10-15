@@ -122,12 +122,22 @@ describe('small helpers', () => {
   });
 
   it('identityProblem requires a name and a hex colour', () => {
-    const draft = { display_name: 'Acme LLC', legal_name: '', sender_name: '', postal_address: '', primary_color: '' };
+    const draft = { display_name: 'Acme LLC', legal_name: '', sender_name: '', postal_address: '', contact_email: '', primary_color: '' };
     expect(identityProblem(draft)).toBeNull();
     expect(identityProblem({ ...draft, display_name: '  ' })).toMatch(/required/);
     expect(identityProblem({ ...draft, primary_color: 'blue' })).toMatch(/six hex digits/);
     expect(identityProblem({ ...draft, primary_color: '#1F6FEB' })).toBeNull();
     expect(identityProblem({ ...draft, legal_name: 'x'.repeat(201) })).toMatch(/200/);
+  });
+
+  it('identityProblem takes an optional contact email the database CHECK accepts', () => {
+    const draft = { display_name: 'Acme LLC', legal_name: '', sender_name: '', postal_address: '', contact_email: '', primary_color: '' };
+    expect(identityProblem({ ...draft, contact_email: '  ' })).toBeNull();
+    expect(identityProblem({ ...draft, contact_email: 'hello@example.com' })).toBeNull();
+    for (const bad of ['hello', 'hello@example', 'hello@example.c', 'a b@example.com', 'a@b@example.com', '<a>@example.com', 'a"b@example.com']) {
+      expect(identityProblem({ ...draft, contact_email: bad }), bad).toMatch(/full address/);
+    }
+    expect(identityProblem({ ...draft, contact_email: `${'a'.repeat(243)}@example.com` })).toMatch(/254/);
   });
 });
 

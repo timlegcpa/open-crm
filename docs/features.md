@@ -105,7 +105,7 @@ connections and revokes them.
 
 ## Settings (`settings`, `0011_control_center`)
 
-**Owner.** Identity (names, postal address, brand colour, logo), Lists (pipeline stages,
+**Owner.** Identity (names, postal address, the public contact email shown on the e-signature consent and error pages, brand colour, logo), Lists (pipeline stages,
 lead sources, services and organization types: labels, colours, order, and which are active), Lead intake (the key another system
 posts new leads with), Security (password, sign-in email, sessions, two-factor and backup codes), Appearance,
 and the sections other domains add: Requests (reminders, request categories and tags), Secure

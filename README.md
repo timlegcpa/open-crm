@@ -136,9 +136,11 @@ to `production` with `npx supabase secrets set`, and redeploy. A live project ne
 
 ### Client portal
 
-- Invitations are emailed through the email provider (see Email). Without one, and with
-  `ENVIRONMENT` not `production`, they land in the dev outbox (System, Outbox). When an
-  invitation is not sent, the contact's Portal panel shows its link for the owner to copy.
+- `SITE_URL` is required for invitations: the invitation link is built on it, so without it
+  sending or resending an invitation is refused (`site_url_missing`) and no link is made.
+- With `SITE_URL` set, invitations are emailed through the email provider (see Email). Without
+  one, and with `ENVIRONMENT` not `production`, they land in the dev outbox (System, Outbox).
+  When an invitation is not sent, the contact's Portal panel shows its link for the owner to copy.
 - During View as client, and for one hour after it ends, the client being viewed cannot change
   their password or email or add a two-factor factor. That hour is the life of a sign-in token
   issued before the view ended, so nothing the owner could have done in the view outlives it.

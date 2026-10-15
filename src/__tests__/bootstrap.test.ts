@@ -37,10 +37,10 @@ describe('projectProblems', () => {
 describe('mergeEnv', () => {
   it('adds only what is missing and never changes an existing value', () => {
     const before = '# local\nCRON_SHARED_SECRET=keep-me\n';
-    const { text, added } = mergeEnv(before, { CRON_SHARED_SECRET: 'new', MCP_INTERNAL_SECRET: 'abc' });
-    expect(added).toEqual(['MCP_INTERNAL_SECRET']);
+    const { text, added } = mergeEnv(before, { CRON_SHARED_SECRET: 'new', ESIGN_INTERNAL_TOKEN: 'abc' });
+    expect(added).toEqual(['ESIGN_INTERNAL_TOKEN']);
     expect(parseEnv(text).get('CRON_SHARED_SECRET')).toBe('keep-me');
-    expect(parseEnv(text).get('MCP_INTERNAL_SECRET')).toBe('abc');
+    expect(parseEnv(text).get('ESIGN_INTERNAL_TOKEN')).toBe('abc');
     expect(text.startsWith('# local\n')).toBe(true);
   });
   it('is a no-op on a second run', () => {

@@ -89,6 +89,7 @@ const orgProfileSchema = z.object({
   legal_name: z.string().nullable(),
   sender_name: z.string().nullable(),
   postal_address: z.string().nullable(),
+  contact_email: z.string().nullable(),
   logo_path: z.string().nullable(),
   brand: z.record(z.string(), z.unknown()).nullable().transform((b) => b ?? {}),
 });
@@ -100,6 +101,7 @@ export interface IdentityPatch {
   legal_name: string | null;
   sender_name: string | null;
   postal_address: string | null;
+  contact_email: string | null;
   primary_color: string | null;
 }
 
@@ -111,7 +113,7 @@ export function brandColor(profile: OrgProfile): string | null {
 export async function fetchOrgProfile(): Promise<OrgProfile | null> {
   const { data, error } = await getSupabase()
     .from('org_profile')
-    .select('display_name, legal_name, sender_name, postal_address, logo_path, brand')
+    .select('display_name, legal_name, sender_name, postal_address, contact_email, logo_path, brand')
     .maybeSingle();
   if (error) throw error;
   return data ? orgProfileSchema.parse(data) : null;
@@ -129,6 +131,7 @@ export async function saveIdentity(current: OrgProfile, patch: IdentityPatch): P
       legal_name: patch.legal_name,
       sender_name: patch.sender_name,
       postal_address: patch.postal_address,
+      contact_email: patch.contact_email,
       brand,
     })
     .eq('id', true)

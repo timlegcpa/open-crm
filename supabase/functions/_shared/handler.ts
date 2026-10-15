@@ -74,7 +74,7 @@ export interface AuthModes {
   client?: (token: string) => Promise<AuthOutcome<ClientPrincipal>>;
   /** CRON_SHARED_SECRET's value. Unset or shorter than 32 characters refuses every call. */
   cron?: { secret: string | null | undefined };
-  /** A function-to-function secret, e.g. { header: 'x-internal-secret', secret: env MCP_INTERNAL_SECRET }. */
+  /** A function-to-function secret, e.g. { header: 'x-internal-token', secret: env ESIGN_INTERNAL_TOKEN }. */
   internal?: { header: string; secret: string | null | undefined };
   /** A server-to-server key. verify answers whether `presented` is the live key; a throw is 503. */
   apiKey?: { verify(presented: string): Promise<boolean> };

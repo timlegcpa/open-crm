@@ -60,7 +60,7 @@ rather than ask). It then:
    and a symbol). Nothing is written if any check fails.
 2. Writes the edge-function secrets into `supabase/functions/.env` (created with owner-only file permissions):
    `DOCUMENT_ENCRYPTION_KEY`, `PII_ENCRYPTION_KEY`, `CRON_SHARED_SECRET`,
-   `MCP_INTERNAL_SECRET`, `ESIGN_INTERNAL_TOKEN` and `ESIGN_SMS_CODE_KEY`, each from a secure
+   `ESIGN_INTERNAL_TOKEN` and `ESIGN_SMS_CODE_KEY`, each from a secure
    random source. Only missing ones are added; an existing value is never changed, because a
    changed encryption key makes everything encrypted under the old one unreadable.
 3. Writes `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` into `.env.local`, again only if
@@ -130,7 +130,7 @@ Open http://localhost:5173 and sign in as the owner. Then, first:
 1. Settings, Security: **Turn on two-factor** with an authenticator app, and keep the backup
    codes it shows somewhere safe. From then on every owner session needs the code, and the
    database refuses owner data to a session without it.
-2. Settings, Identity: your organization's name, legal name, email sender name, postal address, brand colour and logo.
+2. Settings, Identity: your organization's name, legal name, email sender name, postal address, contact email (optional, shown on the e-signature consent and error pages), brand colour and logo.
 3. Messages: choose the encryption password and keep the recovery key. Losing both makes
    client messages unreadable for good.
 

@@ -11,7 +11,7 @@ import type { FieldInput, FieldType } from '../contract';
 import { esignKeys } from '../keys';
 import { canvasToPdf, pdfToCanvas, type CanvasRect } from '../lib/coords';
 import { moveRect, newServerFields, placeAt, resizeRect, type Handle, type PlacedField } from '../lib/fieldPlacement';
-import { openPdf, type RenderedPage } from '../lib/pdfRender';
+import { isRenderCancelled, openPdf, type RenderedPage } from '../lib/pdfRender';
 import { colorForIndex, type SignerColor } from '../lib/signerColors';
 import { resolveSignerName } from '../lib/signerName';
 import { TemplateControls } from './TemplateControls';
@@ -94,25 +94,25 @@ export function FieldPlacer({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!activePage || !activeUrl || !canvas) return;
-    let cancelled = false;
+    const controller = new AbortController();
     setRendering(true);
     setRenderError(null);
     const pdf = openPdf({ url: activeUrl });
     pdf
-      .renderPage(activePage.source_page_index, targetWidth, canvas)
+      .renderPage(activePage.source_page_index, targetWidth, canvas, controller.signal)
       .then((meta) => {
-        if (cancelled) return;
+        if (controller.signal.aborted) return;
         setRendered(meta);
         setRendering(false);
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
+        if (controller.signal.aborted || isRenderCancelled(err)) return;
         // A wedged decoder is torn down by the watchdog, which lands here: no endless spinner.
         setRenderError(getErrorMessage(err, 'This page could not be shown.'));
         setRendering(false);
       });
     return () => {
-      cancelled = true;
+      controller.abort();
       pdf.destroy();
     };
   }, [activePage, activeUrl, targetWidth]);

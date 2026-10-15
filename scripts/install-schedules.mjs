@@ -188,10 +188,11 @@ export function scrub(text, secrets) {
 /**
  * Runs `sql` on the linked project. The SQL goes through a private temporary file, never
  * the command line (where a secret would show in the process list, and a shell would
- * mangle the quoting), and the file is deleted however the run ends.
+ * mangle the quoting), and the file is deleted however the run ends. A failure throws with
+ * the CLI's output (secrets scrubbed) in the message. `npm run demo:seed` uses it too.
  */
-function query(sql, secrets = []) {
-  const dir = mkdtempSync(join(tmpdir(), 'open-crm-schedules-'));
+export function query(sql, secrets = []) {
+  const dir = mkdtempSync(join(tmpdir(), 'open-crm-query-'));
   try {
     const file = join(dir, 'query.sql');
     writeFileSync(file, sql, { mode: 0o600 });

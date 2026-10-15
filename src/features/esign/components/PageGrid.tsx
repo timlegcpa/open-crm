@@ -11,7 +11,7 @@ import { getDocuments, getPages, reorderPages } from '../api';
 import type { PageRow, ReorderOp } from '../contract';
 import { esignKeys } from '../keys';
 import { reorderOperations } from '../lib/pageOrder';
-import { openPdf } from '../lib/pdfRender';
+import { isRenderCancelled, openPdf } from '../lib/pdfRender';
 import { useWorkingUrls } from './useWorkingUrls';
 
 const THUMB_WIDTH = 140;
@@ -27,15 +27,15 @@ function PageThumbnail({ page, position, url, onDelete }: { page: PageRow; posit
     if (!url || !canvas) return;
     setState('loading');
     const pdf = openPdf({ url });
-    let cancelled = false;
+    const controller = new AbortController();
     pdf
-      .renderPage(page.source_page_index, THUMB_WIDTH, canvas)
-      .then(() => !cancelled && setState('ready'))
+      .renderPage(page.source_page_index, THUMB_WIDTH, canvas, controller.signal)
+      .then(() => !controller.signal.aborted && setState('ready'))
       // A JBIG2 or JPX page needs the decoders @/lib/pdfjs points at; a wedged decoder is
       // destroyed by the watchdog, which rejects here, so a tile never spins forever.
-      .catch(() => !cancelled && setState('error'));
+      .catch((err: unknown) => !controller.signal.aborted && !isRenderCancelled(err) && setState('error'));
     return () => {
-      cancelled = true;
+      controller.abort();
       pdf.destroy();
     };
   }, [url, page.source_page_index]);

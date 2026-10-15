@@ -7,7 +7,7 @@ import { downloadBlob } from '@/lib/download';
 import { cn } from '@/lib/utils';
 import type { AdoptedSignature, ResolvedSigner } from '../../contract';
 import { pdfToCanvas } from '../../lib/coords';
-import { openPdf, type OpenedPdf, type RenderedPage } from '../../lib/pdfRender';
+import { isRenderCancelled, openPdf, type OpenedPdf, type RenderedPage } from '../../lib/pdfRender';
 import { esignSafeFilename } from '../../lib/safeFilename';
 import { fontFamilyForKey, SIGNATURE_INK } from '../../lib/signatureFonts';
 import '../../fonts/signatureFonts.css';
@@ -41,7 +41,7 @@ function useColumnWidth(ref: React.RefObject<HTMLElement | null>): number {
   return width;
 }
 
-function PageView({
+export function PageView({
   pdf,
   index,
   width,
@@ -65,14 +65,15 @@ function PageView({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || width <= 0) return;
-    let cancelled = false;
+    // A width change re-runs this while the previous draw may still be going on the same
+    // canvas: abort it, and treat the cancellation as what it is, not a failure.
+    const controller = new AbortController();
+    setFailed(false);
     pdf
-      .renderPage(index, width, canvas)
-      .then((m) => !cancelled && setMeta(m))
-      .catch(() => !cancelled && setFailed(true));
-    return () => {
-      cancelled = true;
-    };
+      .renderPage(index, width, canvas, controller.signal)
+      .then((m) => !controller.signal.aborted && setMeta(m))
+      .catch((err: unknown) => !controller.signal.aborted && !isRenderCancelled(err) && setFailed(true));
+    return () => controller.abort();
   }, [pdf, index, width]);
 
   return (
