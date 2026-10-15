@@ -187,6 +187,13 @@ const SERVER_FUNCTIONS = [
   'mcp_log_call_note(uuid,text,text,uuid,text,text)',
   'mcp_upsert_quote(uuid,uuid,text,text,numeric,uuid,text,text)',
   'mcp_delete_quote(uuid,uuid,uuid,text,uuid,text,text)',
+  'mcp_request_snapshot(uuid,uuid,integer)',
+  'mcp_list_requests(uuid,integer,uuid,text,text)',
+  'mcp_request_keys_active(jsonb)',
+  'mcp_create_request(uuid,text,text,jsonb,uuid,text,text)',
+  'mcp_update_request(uuid,uuid,text,text,jsonb,uuid,text,text)',
+  'mcp_delete_request(uuid,uuid,integer,uuid,text,text)',
+  'mcp_claim_reminder(uuid,uuid)',
 ];
 const OWNER_FUNCTIONS = ['mcp_list_grants()', 'mcp_revoke_grant(uuid)'];
 
@@ -994,6 +1001,311 @@ describe('mcp_upsert_quote and mcp_delete_quote', () => {
       return (await tx.query(`SELECT 1 FROM public.contact_services WHERE id = $1`, [ids.personal])).rows.length;
     });
     expect(left).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The request tools (wave 6b)
+// ---------------------------------------------------------------------------
+
+interface SnapshotItem { sort_order: number; kind: string; label: string; description: string | null; required: boolean; sensitive: boolean; category: string; tag: string; fulfilled: boolean }
+interface SnapshotList { id: string; status: string; title: string; intro_message: string | null; include_contact_confirm: boolean; content_version: number; items: SnapshotItem[] }
+interface Snapshot { contact: { id: string; email: string | null }; lists: SnapshotList[]; truncated: boolean }
+
+const ITEMS = [
+  { kind: 'document', label: 'Signed contract', description: null, required: true, category: 'contract', tag: 'business', sensitive: false, sort_order: 0 },
+  { kind: 'question', label: 'Account number', description: 'Typed, stored encrypted', required: true, category: 'general', tag: 'general', sensitive: true, sort_order: 1 },
+  { kind: 'todo', label: 'Book a call', description: null, required: false, category: 'general', tag: 'general', sensitive: false, sort_order: 2 },
+];
+
+const versionOf = async (tx: Tx, id: string) =>
+  (await tx.query<{ v: number }>(`SELECT content_version AS v FROM public.needs_lists WHERE id = $1`, [id])).rows[0].v;
+
+/** Run `fn`, rolled back to a savepoint, resolving to its error message (null on success). */
+async function attempt(tx: Tx, fn: () => Promise<unknown>): Promise<string | null> {
+  await tx.query('SAVEPOINT attempt');
+  const err = await fn().then(() => null, (e: Error) => e.message);
+  await tx.query('ROLLBACK TO SAVEPOINT attempt');
+  return err;
+}
+
+describe('mcp_create_request and mcp_update_request', () => {
+  const create = (tx: Tx, items: unknown = ITEMS, contact = contactA) =>
+    call<{ id: string; status: string; item_count: number }>(tx, 'mcp_create_request', {
+      p_contact_id: contact, p_title: 'Onboarding', p_intro: 'Thanks!', p_items: items, ...audit,
+    });
+  const update = (tx: Tx, list: string, items: unknown, over: Record<string, unknown> = {}) =>
+    call<number>(tx, 'mcp_update_request', {
+      p_list_id: list, p_contact_id: contactA, p_title: 'Onboarding v2', p_intro: null, p_items: items, ...audit, ...over,
+    });
+
+  it('creates a DRAFT with its items in order, attributed to the actor, invisible to the client, audited with counts', async () => {
+    const out = await asServerTx(async (tx) => {
+      const created = await create(tx);
+      const list = (await tx.query(`SELECT status, sent_at, created_by, title, intro_message FROM public.needs_lists WHERE id = $1`, [created.id])).rows[0];
+      const items = (await tx.query(`SELECT kind, label, sort_order, sensitive, status FROM public.needs_items WHERE list_id = $1 ORDER BY sort_order`, [created.id])).rows;
+      const rows = await auditRows(tx, 'mcp_create_request');
+      await become(tx, clientA);
+      const seen = (await tx.query(`SELECT 1 FROM public.needs_lists WHERE id = $1`, [created.id])).rows.length;
+      return { created, list, items, rows, seen };
+    });
+    expect(out.created).toMatchObject({ status: 'draft', item_count: 3 });
+    expect(out.list).toEqual({ status: 'draft', sent_at: null, created_by: OWNER_ID, title: 'Onboarding', intro_message: 'Thanks!' });
+    expect(out.items).toEqual([
+      { kind: 'document', label: 'Signed contract', sort_order: 0, sensitive: false, status: 'pending' },
+      { kind: 'question', label: 'Account number', sort_order: 1, sensitive: true, status: 'pending' },
+      { kind: 'todo', label: 'Book a call', sort_order: 2, sensitive: false, status: 'pending' },
+    ]);
+    expect(out.rows).toEqual([{ user_id: OWNER_ID, ip_address: '203.0.113.7', details: { source: 'mcp', contact_id: contactA, list_id: out.created.id, item_count: 3, sensitive_item_count: 1 } }]);
+    expect(out.seen).toBe(0);
+  });
+
+  it('is atomic: an item the table refuses leaves no list behind', async () => {
+    const out = await asServerTx(async (tx) => ({
+      err: await attempt(tx, () => create(tx, [{ ...ITEMS[0], sensitive: true }])),
+      lists: (await tx.query(`SELECT 1 FROM public.needs_lists WHERE contact_id = $1`, [contactA])).rows.length,
+    }));
+    expect(out.err).toMatch(/needs_items_sensitive_question_only/);
+    expect(out.lists).toBe(0);
+  });
+
+  it('refuses a missing contact, and an inactive category or tag on create and on update', async () => {
+    await expect(asServerTx((tx) => create(tx, ITEMS, randomUUID()))).rejects.toThrow(/mcp_create_request: not_found/);
+    for (const [table, key, field] of [['request_categories', 'invoice', 'category'], ['request_tags', 'personal', 'tag']] as const) {
+      const deactivate = async (tx: Tx) => {
+        await becomeSuperuser(tx);
+        await tx.query(`UPDATE public.${table} SET is_active = false WHERE key = $1`, [key]);
+        await become(tx, asServer);
+      };
+      await expect(asServerTx(async (tx) => {
+        await deactivate(tx);
+        return create(tx, [{ ...ITEMS[2], [field]: key }]);
+      })).rejects.toThrow(/mcp_create_request: inactive_key/);
+      await expect(asServerTx(async (tx) => {
+        const { id } = await create(tx);
+        await deactivate(tx);
+        return update(tx, id, [{ ...ITEMS[2], [field]: key }]);
+      })).rejects.toThrow(/mcp_update_request: inactive_key/);
+    }
+  });
+
+  it('replaces the whole draft: the omitted items go, a NULL intro clears it, the contact-confirm switch is kept', async () => {
+    const out = await asServerTx(async (tx) => {
+      const { id } = await create(tx);
+      await tx.query(`UPDATE public.needs_lists SET include_contact_confirm = true WHERE id = $1`, [id]);
+      const count = await update(tx, id, [ITEMS[2]]);
+      return {
+        count,
+        list: (await tx.query(`SELECT title, intro_message, include_contact_confirm, status FROM public.needs_lists WHERE id = $1`, [id])).rows[0],
+        labels: (await tx.query(`SELECT label FROM public.needs_items WHERE list_id = $1`, [id])).rows,
+        rows: await auditRows(tx, 'mcp_update_request'),
+      };
+    });
+    expect(out.count).toBe(1);
+    expect(out.list).toEqual({ title: 'Onboarding v2', intro_message: null, include_contact_confirm: true, status: 'draft' });
+    expect(out.labels).toEqual([{ label: 'Book a call' }]);
+    expect(out.rows[0].details).toMatchObject({ source: 'mcp', item_count: 1, sensitive_item_count: 0 });
+  });
+
+  it('refuses another contact’s draft as not_found and a sent request as not_draft, changing nothing', async () => {
+    await expect(asServerTx(async (tx) => {
+      const { id } = await create(tx);
+      return update(tx, id, [ITEMS[2]], { p_contact_id: contactB });
+    })).rejects.toThrow(/needs_replace_draft: not_found/);
+    const out = await asServerTx(async (tx) => {
+      const { id } = await create(tx);
+      await call(tx, 'needs_send_list', { p_list_id: id, p_expected_version: await versionOf(tx, id) });
+      const err = await attempt(tx, () => update(tx, id, [ITEMS[2]]));
+      return { err, n: (await tx.query(`SELECT 1 FROM public.needs_items WHERE list_id = $1`, [id])).rows.length };
+    });
+    expect(out.err).toMatch(/needs_replace_draft: not_draft/);
+    expect(out.n).toBe(3);
+  });
+});
+
+describe('mcp_request_snapshot and mcp_list_requests', () => {
+  /** Three lists for contact A (a draft, a sent one partly answered, a closed one) and one for B. */
+  async function withLists<T>(fn: (tx: Tx, ids: { draft: string; sent: string; closed: string; other: string }) => Promise<T>) {
+    return asServerTx(async (tx) => {
+      const mk = async (contact: string, title: string) =>
+        (await call<{ id: string }>(tx, 'mcp_create_request', { p_contact_id: contact, p_title: title, p_intro: null, p_items: ITEMS, ...audit })).id;
+      const draft = await mk(contactA, 'Draft one');
+      const sent = await mk(contactA, 'Sent one');
+      const closed = await mk(contactA, 'Closed one');
+      const other = await mk(contactB, 'Other contact');
+      // One transaction is one now(): distinct times, so newest first is a fact of the data.
+      for (const [id, ago] of [[draft, 3], [sent, 2], [closed, 1]] as const) {
+        await tx.query(`UPDATE public.needs_lists SET created_at = now() - make_interval(mins => $2) WHERE id = $1`, [id, ago]);
+      }
+      for (const id of [sent, closed]) await call(tx, 'needs_send_list', { p_list_id: id, p_expected_version: await versionOf(tx, id) });
+      await tx.query(`UPDATE public.needs_lists SET status = 'closed' WHERE id = $1`, [closed]);
+      // The sent list: the question answered (encrypted), the document uploaded, the to-do open.
+      await tx.query(`UPDATE public.needs_items SET answer_ciphertext = '\x01'::bytea, status = 'fulfilled' WHERE list_id = $1 AND kind = 'question'`, [sent]);
+      const doc = (await tx.query<{ id: string }>(
+        `INSERT INTO public.client_documents (contact_id, filename, original_filename, storage_path, file_size, mime_type)
+         VALUES ($1, 'a.pdf', 'a.pdf', 'p', 1, 'application/pdf') RETURNING id`, [contactA])).rows[0].id;
+      await tx.query(`INSERT INTO public.needs_item_documents (item_id, document_id) SELECT id, $2 FROM public.needs_items WHERE list_id = $1 AND kind = 'document'`, [sent, doc]);
+      return fn(tx, { draft, sent, closed, other });
+    });
+  }
+  const snapshot = (tx: Tx, contact: string, list: string | null = null, limit = 25) =>
+    call<Snapshot | null>(tx, 'mcp_request_snapshot', { p_contact_id: contact, p_list_id: list, p_limit: limit });
+
+  it('returns the recipient and each list newest first, with every client-visible field and a fulfilled flag', async () => {
+    const out = await withLists(async (tx, ids) => ({ ids, snap: await snapshot(tx, contactA) }));
+    expect(out.snap!.contact).toEqual({ id: contactA, first_name: 'Ada', last_name: 'Lovelace', email: 'ada@example.com' });
+    expect(out.snap!.truncated).toBe(false);
+    expect(out.snap!.lists.map((l) => l.id)).toEqual([out.ids.closed, out.ids.sent, out.ids.draft]);
+    const sent = out.snap!.lists.find((l) => l.id === out.ids.sent)!;
+    expect(sent).toMatchObject({ status: 'sent', title: 'Sent one', intro_message: null, include_contact_confirm: false });
+    expect(sent.items.map((i) => [i.kind, i.fulfilled])).toEqual([['document', true], ['question', true], ['todo', false]]);
+    expect(sent.items[1]).toEqual({ ...ITEMS[1], fulfilled: true });
+  });
+
+  it('never returns an answer, typed or encrypted', async () => {
+    const text = await withLists(async (tx, ids) => {
+      await tx.query(`UPDATE public.needs_items SET answer_text = 'secret-answer-0451' WHERE list_id = $1 AND kind = 'todo'`, [ids.sent]);
+      return JSON.stringify(await snapshot(tx, contactA));
+    });
+    expect(text).not.toContain('secret-answer-0451');
+    expect(text).not.toMatch(/answer_text|answer_ciphertext/);
+  });
+
+  it('fulfilment item by item agrees with needs_list_progress', async () => {
+    const rows = await withLists(async (tx, ids) => {
+      // Whitespace is no answer, typed or not: one question holds only spaces, one an answer.
+      await tx.query(`INSERT INTO public.needs_items (list_id, kind, label, answer_text, sort_order) VALUES ($1, 'question', 'Blank', '  ', 3), ($1, 'question', 'Typed', 'Yes', 4)`, [ids.draft]);
+      const snap = await snapshot(tx, contactA);
+      const progress = (await tx.query<{ list_id: string; actionable: number; fulfilled: number }>(
+        `SELECT list_id, actionable, fulfilled FROM public.needs_list_progress($1::uuid[])`, [[ids.draft, ids.sent, ids.closed]])).rows;
+      return { snap, progress };
+    });
+    expect(rows.progress).toHaveLength(3);
+    for (const p of rows.progress) {
+      const list = rows.snap!.lists.find((l) => l.id === p.list_id)!;
+      const actionable = list.items.filter((i) => i.kind !== 'info');
+      expect([p.list_id, actionable.length, actionable.filter((i) => i.fulfilled).length]).toEqual([p.list_id, p.actionable, p.fulfilled]);
+    }
+  });
+
+  it('one list of that contact only; another contact’s list reads as none; NULL for no contact', async () => {
+    const out = await withLists(async (tx, ids) => ({
+      one: await snapshot(tx, contactA, ids.sent),
+      cross: await snapshot(tx, contactA, ids.other),
+      none: await snapshot(tx, randomUUID()),
+      ids,
+    }));
+    expect(out.one!.lists.map((l) => l.id)).toEqual([out.ids.sent]);
+    expect(out.cross!.lists).toEqual([]);
+    expect(out.none).toBeNull();
+  });
+
+  it('marks a cut-short answer truncated, never silently', async () => {
+    const out = await withLists(async (tx) => ({ two: await snapshot(tx, contactA, null, 2), three: await snapshot(tx, contactA, null, 3) }));
+    expect([out.two!.lists.length, out.two!.truncated]).toEqual([2, true]);
+    expect([out.three!.lists.length, out.three!.truncated]).toEqual([3, false]);
+  });
+
+  it('list_requests audits the read in its transaction, and nothing for a missing contact', async () => {
+    const out = await withLists(async (tx) => {
+      await call(tx, 'mcp_list_requests', { p_contact_id: contactA, p_limit: 2, ...audit });
+      const missing = await call(tx, 'mcp_list_requests', { p_contact_id: randomUUID(), p_limit: 2, ...audit });
+      return { missing, rows: await auditRows(tx, 'mcp_list_requests') };
+    });
+    expect(out.missing).toBeNull();
+    expect(out.rows.map((r) => r.details)).toEqual([{ source: 'mcp', contact_id: contactA, returned: 2, truncated: true }]);
+  });
+});
+
+describe('mcp_delete_request', () => {
+  async function withDraft<T>(fn: (tx: Tx, id: string, version: number) => Promise<T>) {
+    return asServerTx(async (tx) => {
+      const { id } = await call<{ id: string }>(tx, 'mcp_create_request', { p_contact_id: contactA, p_title: 'To delete', p_intro: null, p_items: ITEMS, ...audit });
+      return fn(tx, id, await versionOf(tx, id));
+    });
+  }
+  const del = (tx: Tx, id: string, version: number, over: Record<string, unknown> = {}) =>
+    call<Record<string, unknown>>(tx, 'mcp_delete_request', { p_list_id: id, p_contact_id: contactA, p_expected_version: version, ...audit, ...over });
+
+  it('deletes a draft at the reviewed version, with the requests row and the connector row', async () => {
+    const out = await withDraft(async (tx, id, v) => ({
+      id, v,
+      result: await del(tx, id, v),
+      left: (await tx.query(`SELECT 1 FROM public.needs_lists WHERE id = $1`, [id])).rows.length,
+      mcp: await auditRows(tx, 'mcp_delete_request'),
+      server: await auditRows(tx, 'needs_list_deleted'),
+    }));
+    expect(out.result).toEqual({ list_id: out.id, item_count: 3 });
+    expect(out.left).toBe(0);
+    expect(out.mcp).toEqual([{ user_id: OWNER_ID, ip_address: '203.0.113.7', details: { source: 'mcp', contact_id: contactA, list_id: out.id, item_count: 3, content_version: out.v } }]);
+    expect(out.server).toHaveLength(1);
+    expect(out.server[0]).toMatchObject({ user_id: OWNER_ID, ip_address: '203.0.113.7' });
+  });
+
+  const refusals: Array<[string, string, (tx: Tx, id: string, v: number) => Promise<{ version?: number; over?: Record<string, unknown> }>]> = [
+    ['a moved version', 'stale_content', async (_tx, _id, v) => ({ version: v + 1 })],
+    ['another contact', 'not_found', async () => ({ over: { p_contact_id: contactB } })],
+    ['a sent request', 'not_draft', async (tx, id, v) => {
+      await call(tx, 'needs_send_list', { p_list_id: id, p_expected_version: v });
+      return {};
+    }],
+    ['an answer on the draft', 'has_answers', async (tx, id) => {
+      await tx.query(`UPDATE public.needs_items SET status = 'fulfilled' WHERE list_id = $1 AND kind = 'todo'`, [id]);
+      return {};
+    }],
+  ];
+  it.each(refusals)('refuses %s (%s), deleting nothing', async (_label, sentinel, prepare) => {
+    const out = await withDraft(async (tx, id, v) => {
+      const p = await prepare(tx, id, v);
+      return {
+        err: await attempt(tx, () => del(tx, id, p.version ?? v, p.over)),
+        left: (await tx.query(`SELECT 1 FROM public.needs_lists WHERE id = $1`, [id])).rows.length,
+      };
+    });
+    expect(out.err).toBe(sentinel);
+    expect(out.left).toBe(1);
+  });
+
+  it('a delete whose connector audit row cannot be written does not commit', async () => {
+    const out = await withDraft(async (tx, id, v) => ({
+      err: await attempt(tx, () => del(tx, id, v, { p_actor: null })),
+      left: (await tx.query(`SELECT 1 FROM public.needs_lists WHERE id = $1`, [id])).rows.length,
+    }));
+    expect(out.err).toMatch(/user_id/);
+    expect(out.left).toBe(1);
+  });
+});
+
+describe('mcp_claim_reminder', () => {
+  it('claims a sent request once a day, never a draft or another contact’s, and moves no content version', async () => {
+    const out = await asServerTx(async (tx) => {
+      const { id } = await call<{ id: string }>(tx, 'mcp_create_request', { p_contact_id: contactA, p_title: 'Chase', p_intro: null, p_items: ITEMS, ...audit });
+      const claim = (contact = contactA) => call<boolean>(tx, 'mcp_claim_reminder', { p_list_id: id, p_contact_id: contact });
+      const draft = await claim();
+      const v = await versionOf(tx, id);
+      await call(tx, 'needs_send_list', { p_list_id: id, p_expected_version: v });
+      const other = await claim(contactB);
+      const first = await claim();
+      const again = await claim();
+      await tx.query(`UPDATE public.needs_lists SET last_reminded_at = now() - interval '25 hours' WHERE id = $1`, [id]);
+      const nextDay = await claim();
+      return { draft, other, first, again, nextDay, moved: (await versionOf(tx, id)) !== v };
+    });
+    expect(out).toEqual({ draft: false, other: false, first: true, again: false, nextDay: true, moved: false });
+  });
+});
+
+describe('mcp_tool_vocabulary: the request pick-lists', () => {
+  it('offers only the active request categories and tags', async () => {
+    const vocab = await asServerTx(async (tx) => {
+      await becomeSuperuser(tx);
+      await tx.query(`UPDATE public.request_categories SET is_active = false WHERE key = 'invoice'`);
+      await become(tx, asServer);
+      return call<{ request_categories: string[]; request_tags: string[] }>(tx, 'mcp_tool_vocabulary');
+    });
+    expect(vocab.request_categories).toContain('general');
+    expect(vocab.request_categories).not.toContain('invoice');
+    expect(vocab.request_tags).toEqual(['general', 'personal', 'business']);
   });
 });
 

@@ -3,13 +3,14 @@
 -- Belongs here: the OAuth server's tables (registered clients, authorization requests and
 -- their codes, grants, access and refresh tokens, every secret stored as a SHA-256 hash),
 -- the mcp_oauth_* functions the mcp-oauth and mcp-crm edge functions call, and the audited
--- read and write functions behind the contact tools (mcp_* and mcp_audit_row). OAuth only:
--- there is no static bearer token. The owner's two connector functions (mcp_list_grants,
+-- read and write functions behind the contact and request tools (mcp_* and mcp_audit_row).
+-- OAuth only: there is no static bearer token. The owner's two connector functions (mcp_list_grants,
 -- mcp_revoke_grant) back the AI connector section of Settings.
 --
 -- Depends on: 0001_core (org_profile, audit_logs, is_owner), 0002_contacts (contacts and
--- their businesses, quotes, notes, portal accounts and pick-lists). The request tools and
--- their functions arrive with the requests domain in a later wave and are added here then.
+-- their businesses, quotes, notes, portal accounts and pick-lists), 0005_requests (the
+-- request tables, pick-lists and draft functions the request tools call; see the request
+-- tools section).
 --
 -- Rules, as for every migration in this schema. src/__tests__/db/invariants.test.ts reads
 -- the migrated catalog and fails the build when a table or function here breaks one:
@@ -513,7 +514,8 @@ $$;
 
 -- The pick-list keys the tool schemas offer, read when a client lists the tools: every
 -- contact status (a search filter only; no tool sets a status), and the ACTIVE business
--- types and services. A write refuses an inactive key itself, since a foreign key accepts one.
+-- types, services, request categories and request tags. A write refuses an inactive key
+-- itself, since a foreign key accepts one.
 CREATE FUNCTION public.mcp_tool_vocabulary()
 RETURNS jsonb
 LANGUAGE sql
@@ -525,7 +527,11 @@ AS $$
     'organization_types', COALESCE((SELECT jsonb_agg(t.key ORDER BY t.sort_order, t.key)
                                        FROM public.organization_types t WHERE t.is_active), '[]'::jsonb),
     'service_types', COALESCE((SELECT jsonb_agg(t.key ORDER BY t.sort_order, t.key)
-                                  FROM public.service_types t WHERE t.is_active), '[]'::jsonb));
+                                  FROM public.service_types t WHERE t.is_active), '[]'::jsonb),
+    'request_categories', COALESCE((SELECT jsonb_agg(t.key ORDER BY t.sort_order, t.key)
+                                       FROM public.request_categories t WHERE t.is_active), '[]'::jsonb),
+    'request_tags', COALESCE((SELECT jsonb_agg(t.key ORDER BY t.sort_order, t.key)
+                                 FROM public.request_tags t WHERE t.is_active), '[]'::jsonb));
 $$;
 
 -- A case-insensitive substring match over the names, email and business name. position()
@@ -969,6 +975,253 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- The request tools (wave 6b). Depend on 0005_requests: needs_lists, needs_items,
+-- needs_item_documents, the request pick-lists, needs_replace_draft and needs_delete_draft.
+--
+-- What the connector may do with a request, and what it may not:
+--   * It writes DRAFTS only. A draft is invisible to the client (the client reads every
+--     status but draft), so nothing a model composes reaches a client unreviewed. No
+--     function here takes a status or sets sent_at; publishing is send-needs-list's.
+--   * Every item write goes through needs_replace_draft, the requests domain's one draft
+--     writer, which locks the list before its status check: an edit racing a send either
+--     lands on the draft or is refused, never rewrites a sent request's items.
+--   * An outward act (send, remind) needs a review token: an HMAC over the request's exact
+--     client-visible content, its recipient and each item's fulfilment, minted only from
+--     what mcp_request_snapshot returns (mcp-crm/review-token.ts). The minter and the
+--     verifier read through that one function, so they cannot compute fulfilment
+--     differently.
+--   * Answers never leave the database here: answer_text and answer_ciphertext are read
+--     only to compute a fulfilled flag.
+-- ---------------------------------------------------------------------------
+
+-- A contact's requests as a client sees them, newest first (id as the tiebreak): the
+-- recipient, each list's client-visible fields and content version, and each item's
+-- content with a fulfilled flag. Fulfilment is needs_list_progress's rule, item by item
+-- (src/__tests__/db/mcp.test.ts holds the two equal). p_list_id narrows to one list of
+-- that contact; a list of another contact reads as no list. NULL when there is no such
+-- contact. Not audited: list_requests audits through mcp_list_requests, and the outward
+-- tools read through here to verify a token, recording the act itself.
+CREATE FUNCTION public.mcp_request_snapshot(p_contact_id uuid, p_list_id uuid, p_limit integer)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SET search_path = ''
+AS $$
+DECLARE
+  v_limit integer := least(greatest(COALESCE(p_limit, 25), 1), 100);
+  v_contact jsonb;
+  v_lists jsonb;
+  v_found integer;
+BEGIN
+  SELECT jsonb_build_object('id', c.id, 'first_name', c.first_name, 'last_name', c.last_name, 'email', c.email)
+    INTO v_contact
+    FROM public.contacts c
+   WHERE c.id = p_contact_id;
+  IF v_contact IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  -- One more than the limit is read, only to learn whether more exist: a silent cap would
+  -- let a model call 25 requests "all of them".
+  SELECT count(*)::integer,
+         COALESCE(jsonb_agg(m.obj ORDER BY m.created_at DESC, m.id DESC) FILTER (WHERE m.n <= v_limit), '[]'::jsonb)
+    INTO v_found, v_lists
+    FROM (
+      SELECT l.id, l.created_at,
+             row_number() OVER (ORDER BY l.created_at DESC, l.id DESC) AS n,
+             jsonb_build_object(
+               'id', l.id, 'status', l.status, 'title', l.title, 'intro_message', l.intro_message,
+               'include_contact_confirm', l.include_contact_confirm, 'created_at', l.created_at,
+               'sent_at', l.sent_at, 'content_version', l.content_version,
+               'items', COALESCE((
+                 SELECT jsonb_agg(jsonb_build_object(
+                          'sort_order', i.sort_order, 'kind', i.kind, 'label', i.label,
+                          'description', i.description, 'required', i.required, 'sensitive', i.sensitive,
+                          'category', i.category, 'tag', i.tag,
+                          'fulfilled', CASE i.kind
+                            WHEN 'document' THEN EXISTS (SELECT 1 FROM public.needs_item_documents d WHERE d.item_id = i.id)
+                            WHEN 'todo' THEN i.status IN ('fulfilled', 'reviewed')
+                            WHEN 'question' THEN i.answer_ciphertext IS NOT NULL
+                                                 OR (i.answer_text IS NOT NULL AND i.answer_text ~ '[^[:space:]]')
+                            ELSE false
+                          END)
+                        ORDER BY i.sort_order, i.id)
+                   FROM public.needs_items i
+                  WHERE i.list_id = l.id), '[]'::jsonb)) AS obj
+        FROM public.needs_lists l
+       WHERE l.contact_id = p_contact_id
+         AND (p_list_id IS NULL OR l.id = p_list_id)
+       ORDER BY l.created_at DESC, l.id DESC
+       LIMIT v_limit + 1
+    ) m;
+
+  RETURN jsonb_build_object('contact', v_contact, 'lists', v_lists, 'truncated', v_found > v_limit);
+END;
+$$;
+
+-- list_requests: the snapshot, audited in the same transaction with the contact, the
+-- count and whether it was cut short. NULL (and no audit row) when there is no contact.
+CREATE FUNCTION public.mcp_list_requests(p_contact_id uuid, p_limit integer, p_actor uuid, p_ip text, p_user_agent text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_out jsonb := public.mcp_request_snapshot(p_contact_id, NULL, p_limit);
+BEGIN
+  IF v_out IS NULL THEN
+    RETURN NULL;
+  END IF;
+  PERFORM public.mcp_audit_row(
+    p_actor, 'mcp_list_requests',
+    jsonb_build_object('contact_id', p_contact_id, 'returned', jsonb_array_length(v_out -> 'lists'),
+                       'truncated', v_out -> 'truncated'),
+    p_ip, p_user_agent);
+  RETURN v_out;
+END;
+$$;
+
+-- Every item's category and tag (absent means general) must be an ACTIVE key: the foreign
+-- keys accept an inactive one, and tools/list offers only the active ones.
+CREATE FUNCTION public.mcp_request_keys_active(p_items jsonb)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = ''
+AS $$
+  -- CASE, not AND: jsonb_to_recordset raises on anything but an array, and AND does not
+  -- promise to evaluate its left side first. Not an array (or NULL) is false, never NULL.
+  SELECT CASE WHEN jsonb_typeof(p_items) = 'array' THEN NOT EXISTS (
+           SELECT 1
+             FROM jsonb_to_recordset(p_items) AS x(category text, tag text)
+            WHERE NOT EXISTS (SELECT 1 FROM public.request_categories k WHERE k.key = COALESCE(x.category, 'general') AND k.is_active)
+               OR NOT EXISTS (SELECT 1 FROM public.request_tags k WHERE k.key = COALESCE(x.tag, 'general') AND k.is_active))
+         ELSE false END;
+$$;
+
+-- A new DRAFT request, its items and the audit row in one transaction. The status is
+-- written as 'draft' and never taken from the caller; there is no sent_at.
+CREATE FUNCTION public.mcp_create_request(
+  p_contact_id uuid, p_title text, p_intro text, p_items jsonb, p_actor uuid, p_ip text, p_user_agent text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_id uuid;
+  v_count integer;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.contacts c WHERE c.id = p_contact_id) THEN
+    RAISE EXCEPTION 'mcp_create_request: not_found';
+  END IF;
+  IF NOT public.mcp_request_keys_active(p_items) THEN
+    RAISE EXCEPTION 'mcp_create_request: inactive_key';
+  END IF;
+
+  INSERT INTO public.needs_lists (contact_id, title, intro_message, status, created_by)
+  VALUES (p_contact_id, p_title, p_intro, 'draft', p_actor)
+  RETURNING id INTO v_id;
+
+  v_count := public.needs_replace_draft(v_id, p_title, p_items, p_intro, p_contact_id);
+
+  PERFORM public.mcp_audit_row(
+    p_actor, 'mcp_create_request',
+    jsonb_build_object('contact_id', p_contact_id, 'list_id', v_id, 'item_count', v_count,
+                       'sensitive_item_count', (SELECT count(*) FROM jsonb_to_recordset(p_items) AS x(sensitive boolean) WHERE x.sensitive)),
+    p_ip, p_user_agent);
+
+  RETURN jsonb_build_object('id', v_id, 'title', p_title, 'status', 'draft', 'item_count', v_count);
+END;
+$$;
+
+-- A FULL replacement of a draft's title, intro and items, audited in the same
+-- transaction. needs_replace_draft's sentinels (not_found, not_draft) pass through. The
+-- contact-confirm switch is not the connector's to set and keeps its value.
+CREATE FUNCTION public.mcp_update_request(
+  p_list_id uuid, p_contact_id uuid, p_title text, p_intro text, p_items jsonb,
+  p_actor uuid, p_ip text, p_user_agent text)
+RETURNS integer
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_count integer;
+BEGIN
+  IF NOT public.mcp_request_keys_active(p_items) THEN
+    RAISE EXCEPTION 'mcp_update_request: inactive_key';
+  END IF;
+
+  v_count := public.needs_replace_draft(p_list_id, p_title, p_items, p_intro, p_contact_id);
+
+  PERFORM public.mcp_audit_row(
+    p_actor, 'mcp_update_request',
+    jsonb_build_object('contact_id', p_contact_id, 'list_id', p_list_id, 'item_count', v_count,
+                       'sensitive_item_count', (SELECT count(*) FROM jsonb_to_recordset(p_items) AS x(sensitive boolean) WHERE x.sensitive)),
+    p_ip, p_user_agent);
+
+  RETURN v_count;
+END;
+$$;
+
+-- Delete a DRAFT at the content version its review token was verified over.
+-- needs_delete_draft does the work (lock, status, version, the refusals on client data,
+-- its own needs_list_deleted row); this adds the connector's row in the same
+-- transaction, so the delete commits with both records or not at all. Its sentinels
+-- (not_found, not_draft, stale_content, has_answers, has_documents) pass through.
+CREATE FUNCTION public.mcp_delete_request(
+  p_list_id uuid, p_contact_id uuid, p_expected_version integer, p_actor uuid, p_ip text, p_user_agent text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_ip inet;
+  v_items integer;
+BEGIN
+  BEGIN
+    v_ip := NULLIF(btrim(p_ip), '')::inet;
+  EXCEPTION WHEN OTHERS THEN
+    v_ip := NULL;
+  END;
+  -- Counted before the lock below; any edit after this moves the version, and the delete
+  -- then refuses as stale_content, so a delete that commits counted the reviewed items.
+  SELECT count(*)::integer INTO v_items FROM public.needs_items i WHERE i.list_id = p_list_id;
+
+  PERFORM public.needs_delete_draft(p_list_id, p_contact_id, p_expected_version, p_actor, v_ip, p_user_agent);
+
+  PERFORM public.mcp_audit_row(
+    p_actor, 'mcp_delete_request',
+    jsonb_build_object('contact_id', p_contact_id, 'list_id', p_list_id, 'item_count', v_items,
+                       'content_version', p_expected_version),
+    p_ip, p_user_agent);
+
+  RETURN jsonb_build_object('list_id', p_list_id, 'item_count', v_items);
+END;
+$$;
+
+-- The connector's reminder interval: at most one reminder a day per request, claimed with
+-- one guarded write so two concurrent calls cannot both pass a read-then-send check. A
+-- review token binds content, not a count, so without this one token would license a
+-- reminder on every call. A claim whose email then fails still holds the day; the owner's
+-- own reminder in the CRM is not bound by it. false: not this contact's sent request, or
+-- reminded within the last day.
+CREATE FUNCTION public.mcp_claim_reminder(p_list_id uuid, p_contact_id uuid)
+RETURNS boolean
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  UPDATE public.needs_lists l
+     SET last_reminded_at = now()
+   WHERE l.id = p_list_id
+     AND l.contact_id = p_contact_id
+     AND l.status = 'sent'
+     AND (l.last_reminded_at IS NULL OR l.last_reminded_at < now() - interval '24 hours');
+  RETURN FOUND;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- The owner's view of connections (Settings, AI connector)
 -- ---------------------------------------------------------------------------
 
@@ -1047,6 +1300,13 @@ REVOKE ALL ON FUNCTION
   public.mcp_log_call_note(uuid, text, text, uuid, text, text),
   public.mcp_upsert_quote(uuid, uuid, text, text, numeric, uuid, text, text),
   public.mcp_delete_quote(uuid, uuid, uuid, text, uuid, text, text),
+  public.mcp_request_snapshot(uuid, uuid, integer),
+  public.mcp_list_requests(uuid, integer, uuid, text, text),
+  public.mcp_request_keys_active(jsonb),
+  public.mcp_create_request(uuid, text, text, jsonb, uuid, text, text),
+  public.mcp_update_request(uuid, uuid, text, text, jsonb, uuid, text, text),
+  public.mcp_delete_request(uuid, uuid, integer, uuid, text, text),
+  public.mcp_claim_reminder(uuid, uuid),
   public.mcp_list_grants(),
   public.mcp_revoke_grant(uuid)
 FROM PUBLIC, anon, authenticated, service_role;
@@ -1072,7 +1332,14 @@ GRANT EXECUTE ON FUNCTION
   public.mcp_add_business(uuid, text, text, uuid, text, text),
   public.mcp_log_call_note(uuid, text, text, uuid, text, text),
   public.mcp_upsert_quote(uuid, uuid, text, text, numeric, uuid, text, text),
-  public.mcp_delete_quote(uuid, uuid, uuid, text, uuid, text, text)
+  public.mcp_delete_quote(uuid, uuid, uuid, text, uuid, text, text),
+  public.mcp_request_snapshot(uuid, uuid, integer),
+  public.mcp_list_requests(uuid, integer, uuid, text, text),
+  public.mcp_request_keys_active(jsonb),
+  public.mcp_create_request(uuid, text, text, jsonb, uuid, text, text),
+  public.mcp_update_request(uuid, uuid, text, text, jsonb, uuid, text, text),
+  public.mcp_delete_request(uuid, uuid, integer, uuid, text, text),
+  public.mcp_claim_reminder(uuid, uuid)
 TO service_role;
 
 -- The owner's two (each refuses anyone else itself).

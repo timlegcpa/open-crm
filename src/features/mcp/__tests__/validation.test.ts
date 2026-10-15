@@ -7,13 +7,17 @@ import {
   EMAIL_MAX_LEN,
   KEY_RE,
   MAX_AMOUNT,
+  MAX_REQUEST_ITEMS,
   normalizeEmail,
   optionalId,
+  parseRequestItems,
+  parseRequestText,
   pickFrom,
   validateAmount,
   validateContactPatch,
 } from '../../../../supabase/functions/mcp-crm/validation';
 import { callTool, toolCatalog, TOOLS, type ToolContext } from '../../../../supabase/functions/mcp-crm/tools';
+import { createReviewSigner } from '../../../../supabase/functions/mcp-crm/review-token';
 import { isUuid } from '../../../../supabase/functions/_shared/http';
 
 const ID = 'a3bb189e-8bf9-4888-9912-ace4e6543002';
@@ -104,18 +108,32 @@ describe('KEY_RE', () => {
 });
 
 describe('the tool handlers refuse bad input before any database call', () => {
-  function ctx(): ToolContext & { rpc: ReturnType<typeof vi.fn> } {
+  function ctx(): ToolContext & { rpc: ReturnType<typeof vi.fn>; outwardCalls: ReturnType<typeof vi.fn> } {
     const rpc = vi.fn(async () => ({ data: null, error: null }));
+    const outwardCalls = vi.fn(async () => {
+      throw new Error('no outward call expected');
+    });
     return {
       rpc,
+      outwardCalls,
       db: { rpc },
       actor: ID,
       ip: null,
       userAgent: null,
-      vocabulary: async () => ({ statuses: ['new_lead'], organization_types: ['llc'], service_types: ['retainer'] }),
+      vocabulary: async () => ({
+        statuses: ['new_lead'], organization_types: ['llc'], service_types: ['retainer'],
+        request_categories: ['general', 'contract'], request_tags: ['general'],
+      }),
       budget: { sends: 0 },
+      review: createReviewSigner('test-review-secret-0123456789abcdef'),
+      outward: { send: outwardCalls, remind: outwardCalls, receipt: outwardCalls, alert: outwardCalls },
+      log: { error() {}, warn() {}, info() {} },
     };
   }
+
+  const ITEM = { label: 'Signed contract' };
+  const TOKEN = 'a'.repeat(32);
+  const OUTWARD = { list_id: ID, contact_id: ID, review_token: TOKEN, confirmed_with_user: true };
 
   it.each([
     ['get_contact', { contact_id: { a: 1 } }],
@@ -150,11 +168,54 @@ describe('the tool handlers refuse bad input before any database call', () => {
     ['delete_quote', { contact_id: ID, quote_id: ID, service_type: 'retainer', confirmed_with_user: 'true' }],
     ['delete_quote', { contact_id: ID, quote_id: ID, service_type: 'Retainer!', confirmed_with_user: true }],
     ['delete_quote', { contact_id: ID, quote_id: ID, service_type: 'retainer', organization_id: '', confirmed_with_user: true }],
+    ['create_request', { contact_id: 'nope', title: 'T', items: [ITEM] }],
+    ['create_request', { contact_id: ID, title: '  ', items: [ITEM] }],
+    ['create_request', { contact_id: ID, title: 'x'.repeat(201), items: [ITEM] }],
+    ['create_request', { contact_id: ID, title: 'T', intro_message: 5, items: [ITEM] }],
+    ['create_request', { contact_id: ID, title: 'T', intro_message: 'x'.repeat(5001), items: [ITEM] }],
+    ['create_request', { contact_id: ID, title: 'T' }],
+    ['create_request', { contact_id: ID, title: 'T', items: [] }],
+    ['create_request', { contact_id: ID, title: 'T', items: Array.from({ length: MAX_REQUEST_ITEMS + 1 }, () => ITEM) }],
+    ['create_request', { contact_id: ID, title: 'T', items: [{ label: 'x', category: 'made_up' }] }],
+    ['create_request', { contact_id: ID, title: 'T', items: [{ label: 'x', kind: 'transaction' }] }],
+    ['update_request', { list_id: 'nope', contact_id: ID, title: 'T', items: [ITEM] }],
+    ['update_request', { list_id: ID, contact_id: ID, title: 'T', items: [{ label: 'x', tag: 'made_up' }] }],
+    ['list_requests', { contact_id: 'nope' }],
+    ['send_request', { ...OUTWARD, review_token: undefined }],
+    ['send_request', { ...OUTWARD, review_token: 'A'.repeat(32) }],
+    ['send_request', { ...OUTWARD, confirmed_with_user: undefined }],
+    ['send_request', { ...OUTWARD, confirmed_with_user: 'true' }],
+    ['send_request', { ...OUTWARD, contact_id: '' }],
+    ['remind_request', { ...OUTWARD, review_token: 'x' }],
+    ['remind_request', { ...OUTWARD, confirmed_with_user: 1 }],
+    ['delete_request', { ...OUTWARD, review_token: '' }],
+    ['delete_request', { ...OUTWARD, confirmed_with_user: false }],
+    ['delete_request', { ...OUTWARD, list_id: { a: 1 } }],
   ])('%s %j', async (name, args) => {
     const c = ctx();
     const result = await callTool(name, args as Record<string, unknown>, c);
     expect(result.isError).toBe(true);
     expect(c.rpc).not.toHaveBeenCalled();
+    expect(c.outwardCalls).not.toHaveBeenCalled();
+  });
+
+  it.each(['send_request', 'remind_request'])('%s checks the spent send budget before anything else', async (name) => {
+    const c = ctx();
+    c.budget.sends = 1;
+    const result = await callTool(name, { list_id: 'nope' }, c);
+    expect(result).toEqual({ isError: true, content: [{ type: 'text', text: expect.stringMatching(/^Only one email to a contact can go out per call/) }] });
+    expect(c.rpc).not.toHaveBeenCalled();
+  });
+
+  it('create_request sends the validated items, never a status', async () => {
+    const c = ctx();
+    c.rpc.mockResolvedValueOnce({ data: { id: ID, status: 'draft', item_count: 1 }, error: null });
+    await callTool('create_request', { contact_id: ID, title: ' Onboarding ', intro_message: '  ', items: [{ label: ' Contract ', category: 'contract', status: 'sent' }], status: 'sent' }, c);
+    expect(c.rpc).toHaveBeenCalledWith('mcp_create_request', {
+      p_contact_id: ID, p_title: 'Onboarding', p_intro: null,
+      p_items: [{ kind: 'document', label: 'Contract', description: null, required: true, sensitive: false, category: 'contract', tag: 'general', sort_order: 0 }],
+      p_actor: ID, p_ip: null, p_user_agent: null,
+    });
   });
 
   it('create normalizes before validating: a padded valid address is accepted, trimmed', async () => {
@@ -185,14 +246,77 @@ describe('the tool handlers refuse bad input before any database call', () => {
 });
 
 describe('toolCatalog', () => {
-  it('fills the three pick lists and leaves the static catalog untouched', () => {
-    const vocab = { statuses: ['a'], organization_types: ['b'], service_types: ['c'] };
+  it('fills the pick lists and leaves the static catalog untouched', () => {
+    const vocab = { statuses: ['a'], organization_types: ['b'], service_types: ['c'], request_categories: ['d'], request_tags: ['e'] };
     const catalog = toolCatalog(vocab) as typeof TOOLS;
-    const prop = (tools: typeof TOOLS, tool: string, p: string) =>
-      (tools.find((t) => t.name === tool)!.inputSchema.properties as unknown as Record<string, { enum?: unknown }>)[p];
+    type Props = Record<string, { enum?: unknown; items?: { properties: Record<string, { enum?: unknown }> } }>;
+    const prop = (tools: typeof TOOLS, tool: string, p: string) => (tools.find((t) => t.name === tool)!.inputSchema.properties as unknown as Props)[p];
     expect(prop(catalog, 'search_contacts', 'status').enum).toEqual(['a']);
     expect(prop(catalog, 'add_business', 'organization_type').enum).toEqual(['b']);
     expect(prop(catalog, 'upsert_quote', 'service_type').enum).toEqual(['c']);
+    for (const tool of ['create_request', 'update_request']) {
+      expect(prop(catalog, tool, 'items').items!.properties.category.enum).toEqual(['d']);
+      expect(prop(catalog, tool, 'items').items!.properties.tag.enum).toEqual(['e']);
+    }
     expect(prop(TOOLS, 'upsert_quote', 'service_type').enum).toBeUndefined();
+    expect(prop(TOOLS, 'create_request', 'items').items!.properties.category.enum).toBeUndefined();
+  });
+});
+
+describe('parseRequestItems', () => {
+  const keys = { categories: ['general', 'contract'], tags: ['general', 'business'] };
+
+  it('fills the defaults, trims, and numbers the items in order', () => {
+    expect(parseRequestItems([{ label: ' A ' }, { label: 'B', kind: 'question', required: false, sensitive: true, description: ' why ', category: 'contract', tag: 'business' }], keys)).toEqual({
+      items: [
+        { kind: 'document', label: 'A', description: null, required: true, sensitive: false, category: 'general', tag: 'general', sort_order: 0 },
+        { kind: 'question', label: 'B', description: 'why', required: false, sensitive: true, category: 'contract', tag: 'business', sort_order: 1 },
+      ],
+    });
+  });
+
+  it('reads an explicit null as omitted', () => {
+    const out = parseRequestItems([{ label: 'A', kind: null, required: null, sensitive: null, category: null, tag: null, description: null }], keys);
+    expect(out).toEqual({ items: [{ kind: 'document', label: 'A', description: null, required: true, sensitive: false, category: 'general', tag: 'general', sort_order: 0 }] });
+  });
+
+  it.each([
+    [[{ label: 'A', required: 'false' }], /required must be true or false/],
+    [[{ label: 'A', sensitive: 'yes' }], /sensitive must be true or false/],
+    [[{ label: 'A', kind: 'transaction' }], /kind must be one of/],
+    [[{ label: 'A', category: 'made_up' }], /category must be one of: general, contract/],
+    [[{ label: 'A', tag: 7 }], /tag must be one of/],
+    [[{ label: 'A', sensitive: true }], /Item 1 cannot be sensitive with kind 'document'/],
+    [[{ label: 'A', description: 5 }], /description must be text/],
+    [[{ label: 'A', description: 'x'.repeat(2001) }], /description must be 2000/],
+    [[{ label: 'x'.repeat(501) }], /label must be 500/],
+    [[{ label: '   ' }], /Item 1 needs a label/],
+    [['A'], /Item 1 must be an object/],
+    [[{ label: 'A' }, null], /Item 2 must be an object/],
+    [[], /at least one item/],
+    ['A', /at least one item/],
+  ])('refuses %j instead of coercing it', (raw, message) => {
+    const out = parseRequestItems(raw, keys);
+    expect('error' in out && out.error).toMatch(message);
+  });
+
+  it('holds the item count bound', () => {
+    expect(parseRequestItems(Array.from({ length: MAX_REQUEST_ITEMS }, () => ({ label: 'A' })), keys)).toHaveProperty('items');
+    expect(parseRequestItems(Array.from({ length: MAX_REQUEST_ITEMS + 1 }, () => ({ label: 'A' })), keys)).toHaveProperty('error');
+  });
+});
+
+describe('parseRequestText', () => {
+  it('trims, and reads a blank or absent intro as none', () => {
+    expect(parseRequestText(' T ', undefined)).toEqual({ title: 'T', intro: null });
+    expect(parseRequestText('T', null)).toEqual({ title: 'T', intro: null });
+    expect(parseRequestText('T', ' \n ')).toEqual({ title: 'T', intro: null });
+    expect(parseRequestText('T', ' Hi ')).toEqual({ title: 'T', intro: 'Hi' });
+  });
+
+  it('refuses a missing, blank or long title and a long or non-text intro', () => {
+    for (const [title, intro] of [[undefined, null], ['  ', null], ['x'.repeat(201), null], ['T', 1], ['T', 'x'.repeat(5001)]]) {
+      expect(parseRequestText(title, intro)).toHaveProperty('error');
+    }
   });
 });

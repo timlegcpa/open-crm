@@ -102,3 +102,92 @@ export function optionalId(v: unknown, isId: (v: unknown) => v is string): { id:
   if (v === undefined || v === null) return { id: null };
   return isId(v) ? { id: v } : { error: true };
 }
+
+/**
+ * The item kinds a request tool may compose: needs_items.kind's CHECK in 0005, all of it.
+ * MCP_SENDABLE_KINDS is what the outward tools may send. A kind added to the table later
+ * is neither composable nor sendable here until someone decides it can be read back to a
+ * person meaningfully (a test holds the table's kinds inside the sendable set).
+ */
+export const REQUEST_ITEM_KINDS = ['document', 'question', 'todo', 'info'] as const;
+export const MCP_SENDABLE_KINDS: readonly string[] = REQUEST_ITEM_KINDS;
+
+export const MAX_REQUEST_ITEMS = 40;
+export const MAX_REQUEST_TITLE = 200;
+export const MAX_REQUEST_INTRO = 5000;
+/** needs_items' own bounds. */
+export const MAX_ITEM_LABEL = 500;
+export const MAX_ITEM_DESCRIPTION = 2000;
+
+/** One item as needs_replace_draft takes it. */
+export interface RequestItemInput {
+  kind: string;
+  label: string;
+  description: string | null;
+  required: boolean;
+  sensitive: boolean;
+  category: string;
+  tag: string;
+  sort_order: number;
+}
+
+/**
+ * The items of create_request and update_request, one parser for both, so the two doors
+ * enforce the same rules. Supplied values are VALIDATED, never coerced: folding an unknown
+ * category into general, or the string 'false' into required, would report success while
+ * building a different request from the one read out loud. null means omitted (models
+ * send an explicit null for an absent optional) and takes the default. Categories and
+ * tags are the ACTIVE keys tools/list offered; the database checks again.
+ */
+export function parseRequestItems(
+  raw: unknown,
+  keys: { categories: readonly string[]; tags: readonly string[] },
+): { items: RequestItemInput[] } | { error: string } {
+  if (!Array.isArray(raw) || raw.length === 0) return { error: 'items must list at least one item.' };
+  if (raw.length > MAX_REQUEST_ITEMS) return { error: `items may list at most ${MAX_REQUEST_ITEMS} items.` };
+  const items: RequestItemInput[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const it = raw[i] as Record<string, unknown> | null;
+    const n = `Item ${i + 1}`;
+    if (typeof it !== 'object' || it === null || Array.isArray(it)) return { error: `${n} must be an object.` };
+    if (typeof it.label !== 'string' || !it.label.trim()) return { error: `${n} needs a label.` };
+    const label = it.label.trim();
+    if (label.length > MAX_ITEM_LABEL) return { error: `${n} label must be ${MAX_ITEM_LABEL} characters or fewer.` };
+    const kind = it.kind ?? 'document';
+    if (typeof kind !== 'string' || !(REQUEST_ITEM_KINDS as readonly string[]).includes(kind)) {
+      return { error: `${n} kind must be one of: ${REQUEST_ITEM_KINDS.join(', ')}.` };
+    }
+    if (it.description != null && typeof it.description !== 'string') return { error: `${n} description must be text.` };
+    const description = typeof it.description === 'string' && it.description.trim() ? it.description.trim() : null;
+    if (description !== null && description.length > MAX_ITEM_DESCRIPTION) {
+      return { error: `${n} description must be ${MAX_ITEM_DESCRIPTION} characters or fewer.` };
+    }
+    if (it.required != null && typeof it.required !== 'boolean') return { error: `${n} required must be true or false.` };
+    if (it.sensitive != null && typeof it.sensitive !== 'boolean') return { error: `${n} sensitive must be true or false.` };
+    const category = it.category ?? 'general';
+    if (typeof category !== 'string' || !keys.categories.includes(category)) {
+      return { error: `${n} category must be one of: ${keys.categories.join(', ')}.` };
+    }
+    const tag = it.tag ?? 'general';
+    if (typeof tag !== 'string' || !keys.tags.includes(tag)) return { error: `${n} tag must be one of: ${keys.tags.join(', ')}.` };
+    const sensitive = it.sensitive === true;
+    // The table refuses this too; refusing here names the item instead of failing the batch.
+    if (sensitive && kind !== 'question') {
+      return {
+        error: `${n} cannot be sensitive with kind '${kind}'. Only a question can be sensitive: it means the client's typed answer is stored encrypted. An uploaded file is encrypted already.`,
+      };
+    }
+    items.push({ kind, label, description, required: it.required !== false, sensitive, category, tag, sort_order: i });
+  }
+  return { items };
+}
+
+/** A request's title and intro, as both draft tools take them. An absent or blank intro is none. */
+export function parseRequestText(title: unknown, intro: unknown): { title: string; intro: string | null } | { error: string } {
+  if (typeof title !== 'string' || !title.trim()) return { error: 'title is required.' };
+  if (title.trim().length > MAX_REQUEST_TITLE) return { error: `title must be ${MAX_REQUEST_TITLE} characters or fewer.` };
+  if (intro != null && typeof intro !== 'string') return { error: 'intro_message must be text.' };
+  const text = typeof intro === 'string' ? intro.trim() : '';
+  if (text.length > MAX_REQUEST_INTRO) return { error: `intro_message must be ${MAX_REQUEST_INTRO} characters or fewer.` };
+  return { title: title.trim(), intro: text || null };
+}
