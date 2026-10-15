@@ -130,7 +130,7 @@ export class MockSupabase {
   readonly scenario: Scenario;
   /** Every request the mock answered, in order. */
   readonly calls: Call[] = [];
-  /** Requests the scenario had no answer for (a table read is never one: unknown tables are empty). */
+  /** Requests the scenario had no answer for, including any call to a table it does not declare. */
   readonly unhandled: string[] = [];
   private nextId = 1;
 
@@ -138,8 +138,17 @@ export class MockSupabase {
     this.scenario = scenario;
   }
 
+  /** Whether the scenario declares `name`. Only a declared table exists, as in PostgREST. */
+  hasTable(name: string): boolean {
+    return Object.hasOwn(this.scenario.tables, name);
+  }
+
+  /**
+   * A declared table's rows. An undeclared name throws: a fixture or handler that misspells a
+   * table must fail loudly, never grow a new empty one.
+   */
   table(name: string): Row[] {
-    this.scenario.tables[name] ??= [];
+    if (!this.hasTable(name)) throw new Error(`The scenario declares no table named ${name}`);
     return this.scenario.tables[name];
   }
 
@@ -205,7 +214,13 @@ export class MockSupabase {
       result = await this.rpc(name, req, ctx);
     } else if (service === 'rest' && version === 'v1') {
       this.record('rest', req, tail, ctx);
-      result = this.rest(tail, req);
+      if (this.hasTable(tail)) {
+        result = this.rest(tail, req);
+      } else {
+        // PostgREST answers an unknown relation with 404 PGRST205; the guard reports it.
+        this.unhandled.push(`rest ${request.method()} ${tail}`);
+        result = json(404, { code: 'PGRST205', message: `Could not find the table 'public.${tail}' in the schema cache`, details: null, hint: null });
+      }
     } else if (service === 'functions' && version === 'v1') {
       this.record('functions', req, tail, ctx);
       const handler = this.scenario.functions[tail];

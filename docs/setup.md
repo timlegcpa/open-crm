@@ -52,7 +52,8 @@ It asks for the project URL, the anon key and the service role key (Project Sett
 your organization's name, and the owner's email and password. You can pass them instead:
 `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` in the environment, and
 `-- --org-name "Example Co" --email you@example.com --password '...'` (add `--yes` to fail
-rather than ask). It then:
+rather than ask). Prefer the hidden prompt for the password: a `--password` flag stays in your
+shell history. It then:
 
 1. Checks the values: an https project URL (or a local http one), keys without spaces, an anon
    key that is not the service role key, and a password that meets the Auth rules (at least

@@ -60,10 +60,39 @@ export async function samplePdf(): Promise<Buffer> {
   return pdf;
 }
 
+/**
+ * Tables the app reads (or writes) that start empty in the base scenario. The mock answers
+ * only declared tables, so each one is named here; a call to any other table is reported as
+ * unhandled and fails the test, as a misspelled table would fail against PostgREST.
+ */
+const EMPTY_TABLES = [
+  'app_settings',
+  'audit_logs',
+  'client_messages',
+  'contact_relationships',
+  'contact_upsells',
+  'crm_email_campaigns',
+  'document_annotations',
+  'esign_envelope_documents',
+  'esign_envelope_events',
+  'esign_envelope_fields',
+  'esign_envelope_pages',
+  'esign_envelope_signers',
+  'esign_templates',
+  'impersonation_sessions',
+  'lead_intake_deliveries',
+  'lead_intake_keys',
+  'monthly_goals',
+  'needs_items',
+  'needs_templates',
+  'organization_keys',
+] as const;
+
 export async function baseScenario(): Promise<Scenario> {
   return {
     users: [{ ...OWNER }, { ...CLIENT }],
     tables: structuredClone({
+      ...Object.fromEntries(EMPTY_TABLES.map((name) => [name, [] as Row[]])),
       ...pickLists,
       contacts,
       contact_services: contacts.flatMap((c) => c.contact_services as Row[]),

@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest';
 
 const DIST = path.resolve(__dirname, '..', '..', '..', 'dist');
 const MANIFEST = path.join(DIST, '.vite', 'manifest.json');
+const hasDist = existsSync(DIST);
 const built = existsSync(MANIFEST);
 
 /** The entry file every visitor downloads first (measured 18.4 KiB). */
@@ -41,11 +42,20 @@ interface ManifestChunk {
   imports?: string[];
 }
 
-// Without a build there is nothing to measure: locally the suite is skipped and its title
-// says why; on CI (which builds first) a missing build fails it instead.
-const SUITE = built ? 'bundle size budget (after npm run build)' : 'bundle size budget (no dist/: run npm run build, then npm test)';
+// Without a build there is nothing to measure: locally, with no dist/ at all, the suite is
+// skipped and its title says why. On CI (which builds first) it always runs, and wherever
+// dist/ exists a missing manifest is a failed build, never a reason to skip.
+const SUITE = built
+  ? 'bundle size budget (after npm run build)'
+  : hasDist
+    ? 'bundle size budget (dist/ has no manifest: the build is broken)'
+    : 'bundle size budget (no dist/: run npm run build, then npm test)';
 
-describe.runIf(built || Boolean(process.env.CI))(SUITE, () => {
+describe.runIf(hasDist || Boolean(process.env.CI))(SUITE, () => {
+  it('the build emitted a manifest', () => {
+    expect(built, 'build did not emit a manifest (dist/.vite/manifest.json)').toBe(true);
+  });
+
   // On CI with no build this stays empty and the first test fails, naming the missing entry.
   const manifest: Record<string, ManifestChunk> = built ? JSON.parse(readFileSync(MANIFEST, 'utf8')) : {};
   const sizes = new Map<string, number>();

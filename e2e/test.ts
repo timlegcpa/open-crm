@@ -7,9 +7,10 @@ export { ID, ORG_NAME, OWNER, CLIENT } from './mocks/scenario';
 
 /**
  * Every spec imports `test` from here. Each test gets its own mock project (`mock`), and an
- * automatic guard that fails the test if ANY request left for an origin other than the local
- * app server and the mock Supabase origin. Such a request is aborted before it leaves; the
- * guard then reports it.
+ * automatic guard that fails the test if ANY request or WebSocket left for an origin other
+ * than the local app server and the mock Supabase origin. Such a request is aborted, and such
+ * a socket closed, before it leaves; the guard then reports it. WebSockets need their own
+ * route: `context.on('request')` and `context.route` never see them.
  */
 
 function allowed(url: string, appOrigin: string): boolean {
@@ -36,6 +37,20 @@ export const test = base.extend<Fixtures>({
         if (!allowed(request.url(), appOrigin)) foreign.push(request.url());
       });
       await context.route((url) => !allowed(url.toString(), appOrigin), (route) => route.abort('blockedbyclient'));
+      // Never connected to a server: the socket is recorded and closed on the spot.
+      await context.routeWebSocket(
+        (url) => !allowed(url.toString(), appOrigin),
+        (ws) => {
+          foreign.push(ws.url());
+          void ws.close();
+        },
+      );
+      // Backstop: any socket a page opens, routed or not, is checked as it opens.
+      context.on('page', (page) =>
+        page.on('websocket', (ws) => {
+          if (!allowed(ws.url(), appOrigin) && !foreign.includes(ws.url())) foreign.push(ws.url());
+        }),
+      );
       await use(foreign);
       expect(foreign, 'requests to an origin other than the app and the mock Supabase').toEqual([]);
     },
