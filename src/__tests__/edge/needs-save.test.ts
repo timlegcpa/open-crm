@@ -282,27 +282,30 @@ describe('needs-save: submit', () => {
 });
 
 describe('needs-save: contact details', () => {
-  it('saves the allowed fields, and the primary address mirrors to the contact’s emails', async () => {
+  it('saves the allowed fields, and never an email address', async () => {
+    const before = (await q<{ email: string }>(`SELECT email FROM public.contacts WHERE id = $1`, [CLIENT_CONTACT_ID]))[0].email;
     const res = await save(deps([]), {
       action: 'save_contact', list_id: listId,
-      fields: { phone: '555-0100', email: `Ada.${n}@Example.com`, business_name: 'Acme LLC', spouse_first_name: '' },
+      fields: { phone: '555-0100', business_name: 'Acme LLC', spouse_first_name: '' },
     });
     expect(await result(res)).toEqual([200, 'saved']);
     const [c] = await q<Record<string, unknown>>(`SELECT phone, email, business_name, spouse_first_name FROM public.contacts WHERE id = $1`, [CLIENT_CONTACT_ID]);
-    expect(c).toEqual({ phone: '555-0100', email: `ada.${n}@example.com`, business_name: 'Acme LLC', spouse_first_name: null });
-    const mirrored = await q<{ email: string }>(
-      `SELECT email FROM public.contact_emails WHERE contact_id = $1 AND kind = 'primary' AND is_default`, [CLIENT_CONTACT_ID]);
-    expect(mirrored.map((r) => r.email)).toEqual([`ada.${n}@example.com`]);
+    expect(c).toEqual({ phone: '555-0100', email: before, business_name: 'Acme LLC', spouse_first_name: null });
     const activity = await q<{ details: Record<string, unknown> }>(
       `SELECT details FROM public.client_activity_log WHERE contact_id = $1 AND action = 'profile_update' ORDER BY created_at DESC LIMIT 1`, [CLIENT_CONTACT_ID]);
-    expect(activity[0].details).toEqual({ source: 'request', list_id: listId, fields: ['business_name', 'email', 'phone', 'spouse_first_name'], actor_role: 'client' });
+    expect(activity[0].details).toEqual({ source: 'request', list_id: listId, fields: ['business_name', 'phone', 'spouse_first_name'], actor_role: 'client' });
+    for (const field of ['email', 'spouse_email']) {
+      const r = await save(deps([]), { action: 'save_contact', list_id: listId, fields: { [field]: `someone-${n}@example.com` } });
+      expect(await result(r), field).toEqual([400, 'invalid_field']);
+    }
+    expect((await q<{ email: string }>(`SELECT email FROM public.contacts WHERE id = $1`, [CLIENT_CONTACT_ID]))[0].email).toBe(before);
   });
 
-  it('refuses a field outside the list, a blank name or address, a bad address, a list that does not ask', async () => {
+  it('refuses a field outside the list, a blank name, a list that does not ask', async () => {
     expect(() => contactUpdate({ status: 'client' })).toThrow();
     expect(() => contactUpdate({ first_name: ' ' })).toThrow();
-    expect(() => contactUpdate({ email: '' })).toThrow();
-    expect(() => contactUpdate({ email: 'not-an-address' })).toThrow();
+    expect(() => contactUpdate({ email: 'ada@example.com' })).toThrow();
+    expect(() => contactUpdate({ spouse_email: 'ada@example.com' })).toThrow();
     expect(() => contactUpdate({ phone: 5 })).toThrow();
     expect(() => contactUpdate({})).toThrow();
     expect(await result(await save(deps([]), { action: 'save_contact', list_id: listId, fields: { notes: 'x' } }))).toEqual([400, 'invalid_field']);

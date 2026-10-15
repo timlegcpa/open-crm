@@ -14,6 +14,9 @@ const h = vi.hoisted(() => ({
   request: null as unknown,
   viewing: false,
   saves: [] as Array<{ action: string; args: unknown[] }>,
+  /** When set, each answer save waits until the test lets it go (in the order made). */
+  hold: false,
+  release: [] as Array<() => void>,
 }));
 
 vi.mock('@/lib/auth', () => ({ useAuth: () => ({ clientContactId: CONTACT, isViewAsClientSession: h.viewing }) }));
@@ -31,6 +34,7 @@ vi.mock('../portalApi', () => ({
   saveContactDetails: async () => 'saved',
   saveAnswer: async (...args: unknown[]) => {
     h.saves.push({ action: 'save_answer', args });
+    if (h.hold) await new Promise<void>((resolve) => h.release.push(resolve));
     return 'fulfilled';
   },
   markItem: async (...args: unknown[]) => {
@@ -76,6 +80,8 @@ function renderPage() {
 beforeEach(() => {
   h.saves = [];
   h.viewing = false;
+  h.hold = false;
+  h.release = [];
 });
 afterEach(() => vi.useRealTimers());
 
@@ -94,6 +100,33 @@ describe('the portal request page', () => {
     await waitFor(() => expect(h.saves).toEqual([{ action: 'save_answer', args: ['q1', 'Yes'] }]));
     fireEvent.blur(box);
     expect(h.saves).toHaveLength(1);
+  });
+
+  it('sends one save at a time, only the newest waiting value next, and says Saved only for it', async () => {
+    h.request = request([item('q1', {})]);
+    h.hold = true;
+    renderPage();
+    const box = await screen.findByRole('textbox', { name: 'Item q1' });
+    fireEvent.change(box, { target: { value: 'a' } });
+    fireEvent.blur(box);
+    await waitFor(() => expect(h.saves).toHaveLength(1));
+    // Two more edits while the first is out: neither goes yet, and only the newest will.
+    fireEvent.change(box, { target: { value: 'ab' } });
+    fireEvent.blur(box);
+    fireEvent.change(box, { target: { value: 'abc' } });
+    fireEvent.blur(box);
+    expect(h.saves).toHaveLength(1);
+    await act(async () => {
+      h.release.shift()!();
+    });
+    await waitFor(() => expect(h.saves).toHaveLength(2));
+    expect(h.saves[1]).toEqual({ action: 'save_answer', args: ['q1', 'abc'] });
+    expect(screen.queryByText('Saved')).toBeNull(); // the older value landed, the newest has not
+    await act(async () => {
+      h.release.shift()!();
+    });
+    expect(await screen.findByText('Saved')).toBeTruthy();
+    expect(h.saves).toHaveLength(2);
   });
 
   it('never erases a stored sensitive answer with an empty box', async () => {

@@ -43,8 +43,14 @@ function store(sent: string[], status: () => SendResult): NeedsSendStore {
       throw new Error('a scheduled reminder never mints a start link');
     },
     expireStartLink: async () => {},
+    supersedeStartLinks: async () => {
+      throw new Error('a scheduled reminder never mints a start link');
+    },
     sendList: async () => 'not_draft',
-    recordReminder: async (id) => (await q<{ r: boolean }>(`SELECT public.needs_record_reminder($1) AS r`, [id]))[0].r,
+    claimReminder: async (id, n) => (await q<{ r: never }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, n]))[0].r,
+    releaseReminder: async (id, n) => {
+      await q(`SELECT public.needs_release_reminder($1, $2)`, [id, n]);
+    },
     loadOrg: async () => ORG,
     async sendEmail({ to }) {
       sent.push(to);
@@ -121,7 +127,7 @@ describe('needs-reminder-dispatcher', () => {
     await sentList(active, { daysAgo: 30 });
     const sent: string[] = [];
     expect(await run(deps(sent))).toEqual({
-      status: 200, body: { sent: 0, due: 0, failures: 0, skipped_zero_remaining: 0, not_counted: 0, enabled: false },
+      status: 200, body: { sent: 0, due: 0, failures: 0, skipped_zero_remaining: 0, skipped_in_progress: 0, enabled: false },
     });
     expect(sent).toEqual([]);
   });
@@ -137,7 +143,7 @@ describe('needs-reminder-dispatcher', () => {
     const sent: string[] = [];
     const { status, body } = await run(deps(sent));
     expect(status).toBe(200);
-    expect(body).toEqual({ sent: 1, due: 3, failures: 0, skipped_zero_remaining: 1, not_counted: 0, enabled: true });
+    expect(body).toEqual({ sent: 1, due: 3, failures: 0, skipped_zero_remaining: 1, skipped_in_progress: 0, enabled: true });
     expect(sent).toEqual(['ada@example.com']);
     expect((await q<{ n: number }>(`SELECT reminder_count AS n FROM public.needs_lists WHERE id = $1`, [due]))[0].n).toBe(1);
     // The next run waits for the interval again.
@@ -155,7 +161,7 @@ describe('needs-reminder-dispatcher', () => {
   it('nothing to do is a success with zero counts', async () => {
     await setSettings({ enabled: true });
     expect(await run(deps([]))).toEqual({
-      status: 200, body: { sent: 0, due: 0, failures: 0, skipped_zero_remaining: 0, not_counted: 0, enabled: true },
+      status: 200, body: { sent: 0, due: 0, failures: 0, skipped_zero_remaining: 0, skipped_in_progress: 0, enabled: true },
     });
   });
 

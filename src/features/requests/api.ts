@@ -240,26 +240,24 @@ export interface DeleteResult {
   cleanupOk: boolean;
 }
 
+const deletedDocumentIds = z.array(z.string());
+
 /**
- * Delete a request, at any status. The list row goes first (its items, answers and links
- * cascade, so the client's answers are gone even if what follows fails). With
- * `deleteFiles`, the documents uploaded to it are then removed as ROWS through the
- * documents API, and the list's upload folder is removed (anything else in it moves to the
- * section's root). Storage objects are never touched.
+ * Delete a request, at any status, in one audited call (needs_owner_delete_list): the list
+ * goes with its items, answers and links, the audit row is written in the same
+ * transaction, and the ids of the documents linked to it come back (each once). With
+ * `deleteFiles`, those documents are then removed as ROWS through the documents API, and
+ * the list's upload folder is removed (anything else in it moves to the section's root).
+ * Storage objects are never touched.
  */
 export async function deleteRequest(list: Pick<RequestList, 'id' | 'contact_id' | 'title' | 'sent_at' | 'created_at'>, opts: { deleteFiles: boolean }): Promise<DeleteResult> {
   const supabase = getSupabase();
-  // The links, read BEFORE the cascade removes them. One document linked twice counts once.
-  const { data: links, error: linksError } = await supabase
-    .from('needs_item_documents')
-    .select('document_id, needs_items!inner(list_id)')
-    .eq('needs_items.list_id', list.id);
-  if (linksError) throw linksError;
-  const documentIds = [...new Set(((links as { document_id: string }[] | null) ?? []).map((l) => l.document_id))];
-
-  const { data: deleted, error } = await supabase.from('needs_lists').delete().eq('id', list.id).select('id');
-  if (error) throw error;
-  if (!deleted || deleted.length === 0) throw new Error('The request was not deleted. It may already be gone.');
+  const { data, error } = await supabase.rpc('needs_owner_delete_list', { p_list_id: list.id });
+  if (error) {
+    if (/not_found/.test(error.message)) throw new Error('The request was not deleted. It may already be gone.');
+    throw error;
+  }
+  const documentIds = deletedDocumentIds.parse(data ?? []);
 
   let cleanupOk = true;
   let documentsDeleted = 0;
@@ -288,13 +286,15 @@ export async function deleteRequest(list: Pick<RequestList, 'id' | 'contact_id' 
       }
     }
   }
-  await writeAudit('needs_list_deleted', {
-    list_id: list.id,
-    contact_id: list.contact_id,
-    documents_deleted: documentsDeleted,
-    cleanup_ok: cleanupOk,
-    source: 'owner',
-  });
+  if (opts.deleteFiles) {
+    // The delete itself was audited in the database; this records what the file cleanup did.
+    await writeAudit('needs_list_files_deleted', {
+      list_id: list.id,
+      contact_id: list.contact_id,
+      documents_deleted: documentsDeleted,
+      cleanup_ok: cleanupOk,
+    });
+  }
   return { documentsDeleted, cleanupOk };
 }
 

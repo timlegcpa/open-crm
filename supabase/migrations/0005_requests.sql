@@ -38,13 +38,24 @@
 --     never-sent content to the client (the client reads every status but draft).
 --   * Items are edited only while their list is a draft (or by the server), so a builder
 --     save that lands after the list was sent is refused instead of replacing the items
---     a client is answering.
+--     a client is answering. The owner's builder writes a draft only through
+--     needs_owner_save_draft, which locks the list (as a send does), and deletes a list
+--     only through needs_owner_delete_list, which audits it. An answer is only ever the
+--     client's, written by the server.
+--   * A client write locks its list first (as submit does), so it never lands on a list
+--     submitted in between; a client cannot delete a file once its request was handed
+--     in or the item accepted, and an item that loses its last file is open again.
+--   * Reminders claim the count before sending (one at a time per list), and a reminder's
+--     link replaces the older ones only once its email went.
 --   * Pick-list keys an item names are foreign keys (a pick-list row in use cannot be
 --     deleted). Keys inside needs_templates.items and a draft function's p_items are not
 --     checked until an item row is written: the builder maps an unknown key to general.
 --   * A start link stores only the SHA-256 of its token. Redeeming one (accept-start-link)
 --     claims it, links one portal account, then retires it (status consumed, and the hash
 --     overwritten so the emailed token stops resolving), all through the functions below.
+--     It is issued only for the contact and address the send read, and stops working when
+--     its request is closed or deleted, the address changes, access is revoked, or the
+--     contact already has a sign-in.
 --
 -- Rules, as for every migration in this schema. src/__tests__/db/invariants.test.ts reads
 -- the migrated catalog and fails the build when a table or function here breaks one:
@@ -82,6 +93,8 @@
 -- Errors the server functions answer with, as text, so the edge functions can map each:
 --   needs_send_list            sent | already_sent | changed | gone | not_draft
 --   needs_client_submit        submitted | already_submitted | incomplete | not_open | not_found
+--   needs_claim_reminder       claimed | in_progress | not_sent
+--   needs_issue_start_link     raises contact_changed / address_changed
 -- and the draft functions raise not_found / not_draft (plus stale_content, has_answers,
 -- has_documents for a delete).
 
@@ -257,12 +270,14 @@ CREATE INDEX idx_pending_signup_created_by ON public.pending_signup_requests (cr
 -- ---------------------------------------------------------------------------
 
 -- Item rows: statement triggers with transition tables, so a replace of N items bumps the
--- version once per statement. Postgres refuses `UPDATE OF col` together with transition
+-- version once per statement. Definers: the version is no signed-in session's to write
+-- (the grants leave it out), yet an owner's accept fires these too. Postgres refuses `UPDATE OF col` together with transition
 -- tables, so the update trigger compares the content columns in its body. It must never
 -- compare status, answer_text or answer_ciphertext (see the header).
 CREATE FUNCTION public._needs_bump_version_new()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = ''
 AS $$
 BEGIN
@@ -276,6 +291,7 @@ $$;
 CREATE FUNCTION public._needs_bump_version_old()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = ''
 AS $$
 BEGIN
@@ -289,6 +305,7 @@ $$;
 CREATE FUNCTION public._needs_bump_version_upd()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = ''
 AS $$
 BEGIN
@@ -313,7 +330,8 @@ BEGIN
 END;
 $$;
 
--- The list's own client-visible columns.
+-- The list's own client-visible columns, and who it goes to: a draft reassigned to
+-- another contact is new content, so a send that read the old contact publishes nothing.
 CREATE FUNCTION public._needs_bump_version_self()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -322,7 +340,8 @@ AS $$
 BEGIN
   IF NEW.title IS DISTINCT FROM OLD.title
      OR NEW.intro_message IS DISTINCT FROM OLD.intro_message
-     OR NEW.include_contact_confirm IS DISTINCT FROM OLD.include_contact_confirm THEN
+     OR NEW.include_contact_confirm IS DISTINCT FROM OLD.include_contact_confirm
+     OR NEW.contact_id IS DISTINCT FROM OLD.contact_id THEN
     NEW.content_version := OLD.content_version + 1;
   END IF;
   RETURN NEW;
@@ -372,7 +391,10 @@ END;
 $$;
 
 -- Items change only while their list is a draft, except for the server. A missing parent
--- is the cascade of a list (or contact) delete, which is allowed.
+-- is the cascade of a list (or contact) delete, which is allowed. An answer is the
+-- client's alone: only the server writes one (through needs_client_set_answer), at any
+-- status, since nothing would record an owner's rewrite of it. (The grants already keep
+-- a signed-in session off every item column but status; this holds if they widen.)
 CREATE FUNCTION public.needs_items_guard_draft()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -384,6 +406,11 @@ BEGIN
   IF COALESCE((SELECT r.rolsuper OR r.rolbypassrls
                  FROM pg_catalog.pg_roles r WHERE r.rolname = current_user), false) THEN
     RETURN COALESCE(NEW, OLD);
+  END IF;
+  IF TG_OP = 'UPDATE' AND (NEW.answer_text IS DISTINCT FROM OLD.answer_text
+                           OR NEW.answer_ciphertext IS DISTINCT FROM OLD.answer_ciphertext) THEN
+    RAISE EXCEPTION 'needs_items: only the client answers'
+      USING ERRCODE = '42501';
   END IF;
   SELECT l.status INTO v_status FROM public.needs_lists l WHERE l.id = COALESCE(NEW.list_id, OLD.list_id);
   IF FOUND AND v_status <> 'draft' THEN
@@ -409,7 +436,8 @@ CREATE TRIGGER trg_needs_lists_version_self
   FOR EACH ROW EXECUTE FUNCTION public._needs_bump_version_self();
 
 CREATE TRIGGER trg_needs_items_guard_draft
-  BEFORE INSERT OR DELETE OR UPDATE OF list_id, kind, label, description, sort_order, required, sensitive, category, tag
+  BEFORE INSERT OR DELETE
+    OR UPDATE OF list_id, kind, label, description, sort_order, required, sensitive, category, tag, answer_text, answer_ciphertext
   ON public.needs_items
   FOR EACH ROW EXECUTE FUNCTION public.needs_items_guard_draft();
 CREATE TRIGGER trg_needs_items_version_ins
@@ -676,30 +704,59 @@ BEGIN
 END;
 $$;
 
--- Count one reminder against a sent list, in the row (a read-then-write lost counts).
-CREATE FUNCTION public.needs_record_reminder(p_list_id uuid)
+-- Claim the next reminder of a sent list: the count moves FIRST, and only from the count
+-- the caller read (a compare-and-swap), so two reminders at once cannot both go: the
+-- second finds the count moved and is refused. The claimed number keys the email and is
+-- what a failed email gives back (needs_release_reminder).
+--   claimed       this caller sends reminder number p_expected_count
+--   in_progress   the count moved since the caller read it: another reminder got there
+--   not_sent      the list is not (or no longer) sent
+CREATE FUNCTION public.needs_claim_reminder(p_list_id uuid, p_expected_count integer)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_status text;
+BEGIN
+  UPDATE public.needs_lists l
+     SET reminder_count = l.reminder_count + 1, last_reminded_at = now()
+   WHERE l.id = p_list_id AND l.status = 'sent' AND l.reminder_count = p_expected_count;
+  IF FOUND THEN
+    RETURN 'claimed';
+  END IF;
+  SELECT l.status INTO v_status FROM public.needs_lists l WHERE l.id = p_list_id;
+  RETURN CASE WHEN v_status = 'sent' THEN 'in_progress' ELSE 'not_sent' END;
+END;
+$$;
+
+-- A reminder whose email failed gives its count back, only while nothing claimed after it.
+CREATE FUNCTION public.needs_release_reminder(p_list_id uuid, p_claimed_count integer)
 RETURNS boolean
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 BEGIN
   UPDATE public.needs_lists l
-     SET reminder_count = l.reminder_count + 1, last_reminded_at = now()
-   WHERE l.id = p_list_id AND l.status = 'sent';
+     SET reminder_count = l.reminder_count - 1
+   WHERE l.id = p_list_id AND l.reminder_count = p_claimed_count + 1;
   RETURN FOUND;
 END;
 $$;
 
--- A start link for a list's contact. With p_supersede (a reminder), the list's earlier
--- pending links are superseded first, so one link is live at a time. The first send never
--- supersedes: a send that lost the publish race would otherwise kill the winner's link.
+-- A start link for the contact and address the caller read and is about to email. The list
+-- is locked and its contact re-checked under the lock, and the address must still be the
+-- contact's: a list reassigned (or an address corrected) after the caller's read gets no
+-- link, so one contact's address never carries a link into another contact's portal.
+--   contact_changed   the list now belongs to another contact (or is gone)
+--   address_changed   the address is no longer this contact's
 CREATE FUNCTION public.needs_issue_start_link(
   p_list_id uuid,
+  p_contact_id uuid,
   p_email text,
   p_token_hash text,
   p_expires_at timestamptz,
-  p_actor uuid,
-  p_supersede boolean DEFAULT false
+  p_actor uuid
 )
 RETURNS uuid
 LANGUAGE plpgsql
@@ -707,29 +764,54 @@ SET search_path = ''
 AS $$
 DECLARE
   v_contact uuid;
+  v_email text := lower(pg_catalog.btrim(p_email));
   v_id uuid;
 BEGIN
-  SELECT l.contact_id INTO v_contact FROM public.needs_lists l WHERE l.id = p_list_id;
-  IF NOT FOUND THEN
-    RAISE EXCEPTION 'needs_issue_start_link: not_found';
+  SELECT l.contact_id INTO v_contact FROM public.needs_lists l WHERE l.id = p_list_id FOR UPDATE;
+  IF NOT FOUND OR v_contact IS DISTINCT FROM p_contact_id THEN
+    RAISE EXCEPTION 'contact_changed';
   END IF;
-  IF p_supersede THEN
-    UPDATE public.pending_signup_requests r
-       SET status = 'superseded'
-     WHERE r.needs_list_id = p_list_id AND r.status = 'pending';
+  IF NOT EXISTS (SELECT 1 FROM public.contacts c
+                  WHERE c.id = p_contact_id AND lower(pg_catalog.btrim(c.email)) = v_email) THEN
+    RAISE EXCEPTION 'address_changed';
   END IF;
   INSERT INTO public.pending_signup_requests (email, contact_id, needs_list_id, token_hash, expires_at, created_by)
-  VALUES (lower(pg_catalog.btrim(p_email)), v_contact, p_list_id, p_token_hash, p_expires_at, p_actor)
+  VALUES (v_email, p_contact_id, p_list_id, p_token_hash, p_expires_at, p_actor)
   RETURNING id INTO v_id;
   RETURN v_id;
 END;
 $$;
 
+-- After a reminder's email was accepted: the list's OLDER pending links stop working, so
+-- the newest email holds the live one. Never before the email went (a failed reminder
+-- must not kill the link the client already holds), never the kept link, and never a
+-- newer one: a reminder that finishes after a later one must not kill the link in the
+-- later email. (Links issued in the same instant are treated as older.)
+CREATE FUNCTION public.needs_supersede_start_links(p_list_id uuid, p_keep uuid)
+RETURNS integer
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_count integer;
+BEGIN
+  UPDATE public.pending_signup_requests r
+     SET status = 'superseded'
+   WHERE r.needs_list_id = p_list_id AND r.status = 'pending' AND r.id <> p_keep
+     AND r.created_at <= (SELECT k.created_at FROM public.pending_signup_requests k WHERE k.id = p_keep);
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END;
+$$;
+
 -- ---------------------------------------------------------------------------
--- A client's writes (needs-save, the ONLY door for them). Each is one guarded statement:
--- the item must be the caller's (through its list), the list still sent, and the item not
--- accepted. NULL (or a refusal code) when the guard matched nothing; the function then
--- reports "already accepted" or the list's state.
+-- A client's writes (needs-save, the ONLY door for them). Each first takes the list row
+-- (FOR SHARE, the lock order submit uses: list, then items) and re-checks it is still
+-- sent, so a write and a submit run one after the other: a write never lands on a list
+-- that was submitted in between. Then one guarded statement: the item must be the
+-- caller's (through its list), the list still sent, and the item not accepted. NULL when
+-- the guard matched nothing; the function then reports "already accepted" or the list's
+-- state.
 -- ---------------------------------------------------------------------------
 
 -- Store a question's answer. A sensitive item takes only the ciphertext (encrypted by the
@@ -746,8 +828,16 @@ LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
+  v_list_status text;
   v_status text;
 BEGIN
+  SELECT l.status INTO v_list_status
+    FROM public.needs_items i JOIN public.needs_lists l ON l.id = i.list_id
+   WHERE i.id = p_item_id AND l.contact_id = p_contact_id
+     FOR SHARE OF l;
+  IF v_list_status IS DISTINCT FROM 'sent' THEN
+    RETURN NULL;
+  END IF;
   UPDATE public.needs_items i
      SET answer_text = CASE WHEN i.sensitive THEN NULL ELSE p_answer_text END,
          answer_ciphertext = CASE WHEN i.sensitive THEN p_answer_ciphertext ELSE NULL END,
@@ -773,8 +863,16 @@ LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
+  v_list_status text;
   v_status text;
 BEGIN
+  SELECT l.status INTO v_list_status
+    FROM public.needs_items i JOIN public.needs_lists l ON l.id = i.list_id
+   WHERE i.id = p_item_id AND l.contact_id = p_contact_id
+     FOR SHARE OF l;
+  IF v_list_status IS DISTINCT FROM 'sent' THEN
+    RETURN NULL;
+  END IF;
   UPDATE public.needs_items i
      SET status = CASE WHEN p_done THEN 'fulfilled' ELSE 'pending' END
     FROM public.needs_lists l
@@ -800,8 +898,16 @@ LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
+  v_list_status text;
   v_inserted integer;
 BEGIN
+  SELECT l.status INTO v_list_status
+    FROM public.needs_items i JOIN public.needs_lists l ON l.id = i.list_id
+   WHERE i.id = p_item_id AND l.contact_id = p_contact_id
+     FOR SHARE OF l;
+  IF v_list_status IS DISTINCT FROM 'sent' THEN
+    RETURN NULL;
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM public.client_documents d
                   WHERE d.id = p_document_id AND d.contact_id = p_contact_id AND d.held_by = 'client') THEN
     RETURN NULL;
@@ -898,11 +1004,16 @@ $$;
 -- Start links (accept-start-link)
 -- ---------------------------------------------------------------------------
 
--- Whether portal access for this address on this contact was taken away: the contact is
--- gone, or every account it has is suspended or deactivated (none active), or an account
--- for this very address is suspended or deactivated with none open for it. A link sent
--- before (or after) a revoke must not hand out a fresh login.
-CREATE FUNCTION public.start_link_access_revoked(p_contact_id uuid, p_email text)
+-- Whether this link may no longer create a sign-in. Any one of these refuses it:
+--   * the contact is gone;
+--   * portal access was taken away: every account the contact has is suspended or
+--     deactivated (none active), or an account for this very address is, with none open
+--     for it (a link sent before or after a revoke must not hand out a fresh login);
+--   * the request it was sent with is gone, closed, or now belongs to another contact;
+--   * the address is no longer one of the contact's (the owner corrected it);
+--   * the contact already has an active sign-in (redeeming would make a second login;
+--     the request is in the portal already).
+CREATE FUNCTION public.start_link_access_revoked(p_contact_id uuid, p_email text, p_list_id uuid)
 RETURNS boolean
 LANGUAGE sql
 STABLE
@@ -918,7 +1029,16 @@ AS $$
                      AND lower(a.invited_email) = lower(pg_catalog.btrim(p_email)))
           AND NOT EXISTS (SELECT 1 FROM public.client_portal_accounts a
                            WHERE a.contact_id = p_contact_id AND a.status IN ('invited', 'active')
-                             AND lower(a.invited_email) = lower(pg_catalog.btrim(p_email))));
+                             AND lower(a.invited_email) = lower(pg_catalog.btrim(p_email))))
+      OR NOT EXISTS (SELECT 1 FROM public.needs_lists l
+                      WHERE l.id = p_list_id AND l.contact_id = p_contact_id AND l.status <> 'closed')
+      OR NOT (EXISTS (SELECT 1 FROM public.contacts c
+                       WHERE c.id = p_contact_id AND lower(pg_catalog.btrim(c.email)) = lower(pg_catalog.btrim(p_email)))
+              OR EXISTS (SELECT 1 FROM public.contact_emails e
+                          WHERE e.contact_id = p_contact_id AND e.kind = 'primary'
+                            AND lower(pg_catalog.btrim(e.email)) = lower(pg_catalog.btrim(p_email))))
+      OR EXISTS (SELECT 1 FROM public.client_portal_accounts a
+                  WHERE a.contact_id = p_contact_id AND a.status = 'active' AND a.user_id IS NOT NULL);
 $$;
 
 -- The start link a token hashes to, with whether access was revoked since it was sent.
@@ -931,7 +1051,7 @@ STABLE
 SET search_path = ''
 AS $$
   SELECT r.id, r.email, r.contact_id, r.needs_list_id, r.status, r.expires_at,
-         public.start_link_access_revoked(r.contact_id, r.email)
+         public.start_link_access_revoked(r.contact_id, r.email, r.needs_list_id)
     FROM public.pending_signup_requests r
    WHERE r.token_hash = p_token_hash;
 $$;
@@ -1044,8 +1164,14 @@ DECLARE
 BEGIN
   SELECT * INTO v_link FROM public.pending_signup_requests r WHERE r.id = p_id FOR UPDATE;
   IF NOT FOUND OR v_link.status <> 'pending' OR v_link.expires_at <= now()
-     OR v_link.claim IS DISTINCT FROM p_claim OR v_link.contact_id IS NULL
-     OR public.start_link_access_revoked(v_link.contact_id, v_link.email) THEN
+     OR v_link.claim IS DISTINCT FROM p_claim OR v_link.contact_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+  -- The contact's accounts are locked BEFORE access is checked, so a revoke (a deactivate
+  -- or suspend) either landed already and is seen, or waits until this link is done: it
+  -- can never fall between the check and the write below and be undone by it.
+  PERFORM 1 FROM public.client_portal_accounts a WHERE a.contact_id = v_link.contact_id FOR UPDATE;
+  IF public.start_link_access_revoked(v_link.contact_id, v_link.email, v_link.needs_list_id) THEN
     RETURN NULL;
   END IF;
 
@@ -1065,6 +1191,13 @@ BEGIN
   RETURNING a.id INTO v_account;
   IF v_account IS NOT NULL THEN
     RETURN v_account;
+  END IF;
+
+  -- Never a fresh account beside one the owner took away for this address.
+  IF EXISTS (SELECT 1 FROM public.client_portal_accounts c
+              WHERE c.contact_id = v_link.contact_id AND c.status IN ('suspended', 'deactivated')
+                AND lower(c.invited_email) = v_link.email) THEN
+    RETURN NULL;
   END IF;
 
   INSERT INTO public.client_portal_accounts (user_id, contact_id, role, status, activated_at, invited_email)
@@ -1132,6 +1265,148 @@ BEGIN
    WHERE r.expires_at < now() - interval '30 days' AND r.consumed_at IS NULL;
   GET DIAGNOSTICS v_count = ROW_COUNT;
   RETURN jsonb_build_object('start_links', v_count);
+END;
+$$;
+
+-- A start link stops working when what it was sent for goes away: its request closed or
+-- deleted (BEFORE the delete: after it the foreign key has already cleared needs_list_id),
+-- or the contact's address changed (every pending link to another address). The lookup
+-- refuses those links anyway (start_link_access_revoked); this makes them read as expired.
+-- Definer: the owner closes, deletes and edits, and never writes start links itself.
+CREATE FUNCTION public._needs_expire_start_links()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'needs_lists' THEN
+    UPDATE public.pending_signup_requests r SET status = 'expired'
+     WHERE r.needs_list_id = OLD.id AND r.status = 'pending';
+  ELSE
+    UPDATE public.pending_signup_requests r SET status = 'expired'
+     WHERE r.contact_id = OLD.id AND r.status = 'pending'
+       AND r.email IS DISTINCT FROM lower(pg_catalog.btrim(NEW.email));
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_needs_lists_expire_start_links_close
+  AFTER UPDATE OF status ON public.needs_lists
+  FOR EACH ROW WHEN (NEW.status = 'closed' AND OLD.status IS DISTINCT FROM 'closed')
+  EXECUTE FUNCTION public._needs_expire_start_links();
+CREATE TRIGGER trg_needs_lists_expire_start_links_delete
+  BEFORE DELETE ON public.needs_lists
+  FOR EACH ROW EXECUTE FUNCTION public._needs_expire_start_links();
+CREATE TRIGGER trg_contacts_expire_start_links
+  AFTER UPDATE OF email ON public.contacts
+  FOR EACH ROW WHEN (OLD.email IS DISTINCT FROM NEW.email)
+  EXECUTE FUNCTION public._needs_expire_start_links();
+
+-- ---------------------------------------------------------------------------
+-- Answers a client cannot take back by deleting a file
+-- ---------------------------------------------------------------------------
+
+-- A client deletes its own uploads (0003), and a delete cascades to the item links here.
+-- Once the request was handed in or closed, or the item accepted, that file is part of
+-- the answer: a client's delete of it is refused. While the request is open and the item
+-- not accepted the client may still remove it (the item is then re-checked below). The
+-- owner and the server delete as before. Definer, so the check sees every link whatever
+-- the caller may read.
+CREATE FUNCTION public.needs_guard_document_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF current_setting('role', true) IS DISTINCT FROM 'authenticated' OR public.is_owner() THEN
+    RETURN OLD;
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.needs_item_documents d
+               JOIN public.needs_items i ON i.id = d.item_id
+               JOIN public.needs_lists l ON l.id = i.list_id
+              WHERE d.document_id = OLD.id AND (l.status <> 'sent' OR i.status = 'reviewed')) THEN
+    RAISE EXCEPTION 'This file was handed in with a request, so it cannot be deleted.'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_client_documents_needs_guard
+  BEFORE DELETE ON public.client_documents
+  FOR EACH ROW EXECUTE FUNCTION public.needs_guard_document_delete();
+
+-- A document item that lost its last file is open again, in the same transaction as the
+-- delete (a client's own delete, or the owner unlinking). An accepted item stays accepted.
+-- Definer: the delete may be a client's, whose session cannot update items.
+CREATE FUNCTION public._needs_recheck_document_item()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  UPDATE public.needs_items i
+     SET status = 'pending'
+   WHERE i.id = OLD.item_id AND i.kind = 'document' AND i.status = 'fulfilled'
+     AND NOT EXISTS (SELECT 1 FROM public.needs_item_documents d WHERE d.item_id = OLD.item_id);
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER trg_needs_item_documents_recheck
+  AFTER DELETE ON public.needs_item_documents
+  FOR EACH ROW EXECUTE FUNCTION public._needs_recheck_document_item();
+
+-- ---------------------------------------------------------------------------
+-- The owner's delete
+-- ---------------------------------------------------------------------------
+
+-- Delete a request at any status, with an audit row in the same transaction (ids, counts
+-- and the status it had; never a title or an answer). Returns the ids of the documents
+-- that were linked to it, read before the cascade removes the links, so the browser can
+-- delete those files through the documents API when asked. Never touches a file itself.
+CREATE FUNCTION public.needs_owner_delete_list(p_list_id uuid)
+RETURNS uuid[]
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  -- A record, not the row type: nothing in public is named before the owner refusal.
+  v_list record;
+  v_items integer;
+  v_documents uuid[];
+BEGIN
+  IF NOT public.is_owner() THEN
+    RAISE EXCEPTION 'owner required' USING ERRCODE = '42501';
+  END IF;
+  SELECT l.id, l.contact_id, l.status INTO v_list FROM public.needs_lists l WHERE l.id = p_list_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'not_found';
+  END IF;
+  SELECT count(*)::integer INTO v_items FROM public.needs_items i WHERE i.list_id = p_list_id;
+  SELECT COALESCE(array_agg(DISTINCT d.document_id ORDER BY d.document_id), '{}') INTO v_documents
+    FROM public.needs_item_documents d JOIN public.needs_items i ON i.id = d.item_id
+   WHERE i.list_id = p_list_id;
+
+  DELETE FROM public.needs_lists l WHERE l.id = p_list_id;
+
+  INSERT INTO public.audit_logs (user_id, action, details)
+  VALUES (
+    auth.uid(),
+    'needs_list_deleted',
+    jsonb_build_object(
+      'list_id', p_list_id,
+      'contact_id', v_list.contact_id,
+      'status', v_list.status,
+      'item_count', v_items,
+      'document_count', cardinality(v_documents),
+      'source', 'owner'));
+  RETURN v_documents;
 END;
 $$;
 
@@ -1231,16 +1506,24 @@ TO service_role;
 
 -- Signed-in sessions; the policies decide who. A pick-list key and its system flag never
 -- change. Item documents are written only by the server; start links only read.
+-- Lists and items: the owner's builder creates and replaces a draft only through
+-- needs_owner_save_draft and deletes only through needs_owner_delete_list (both lock the
+-- list, so a save and a send run one after the other, and the delete is audited). Direct
+-- writes are what the screens need and no more: close, pause reminders, accept an answer.
+-- An answer is never the owner's to write.
 GRANT SELECT, INSERT, DELETE, UPDATE (label, colour, sort_order, is_active) ON public.request_categories, public.request_tags
 TO authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.needs_lists, public.needs_items, public.needs_templates TO authenticated;
+GRANT SELECT, UPDATE (status, closed_at, reminders_paused) ON public.needs_lists TO authenticated;
+GRANT SELECT, UPDATE (status) ON public.needs_items TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.needs_templates TO authenticated;
 GRANT SELECT, DELETE ON public.needs_item_documents TO authenticated;
 GRANT SELECT ON public.pending_signup_requests TO authenticated;
 
 -- Functions created in this file only. Trigger functions need no EXECUTE grant. The
--- owner's builder save (needs_owner_save_draft) is the one function a signed-in session
--- may call, and it refuses anyone but the owner first; every other function here is the
--- server's alone (the AI connector reaches the draft functions through the server).
+-- owner's builder save (needs_owner_save_draft) and delete (needs_owner_delete_list) are
+-- the functions a signed-in session may call, and each refuses anyone but the owner first;
+-- every other function here is the server's alone (the AI connector reaches the draft
+-- functions through the server).
 REVOKE ALL ON FUNCTION
   public._needs_bump_version_new(),
   public._needs_bump_version_old(),
@@ -1248,20 +1531,26 @@ REVOKE ALL ON FUNCTION
   public._needs_bump_version_self(),
   public.needs_lists_guard_status(),
   public.needs_items_guard_draft(),
+  public._needs_expire_start_links(),
+  public.needs_guard_document_delete(),
+  public._needs_recheck_document_item(),
   public.needs_list_progress(uuid[]),
   public.needs_replace_draft(uuid, text, jsonb, text, uuid, boolean),
   public.needs_owner_save_draft(uuid, uuid, integer, text, text, boolean, jsonb),
+  public.needs_owner_delete_list(uuid),
   public.needs_delete_draft(uuid, uuid, integer, uuid, inet, text),
   public.needs_send_list(uuid, integer),
-  public.needs_record_reminder(uuid),
-  public.needs_issue_start_link(uuid, text, text, timestamptz, uuid, boolean),
+  public.needs_claim_reminder(uuid, integer),
+  public.needs_release_reminder(uuid, integer),
+  public.needs_issue_start_link(uuid, uuid, text, text, timestamptz, uuid),
+  public.needs_supersede_start_links(uuid, uuid),
   public.needs_client_set_answer(uuid, uuid, text, bytea),
   public.needs_client_mark_todo(uuid, uuid, boolean),
   public.needs_client_link_document(uuid, uuid, uuid),
   public.needs_client_submit(uuid, uuid),
   public.needs_claim_upload_notice(uuid),
   public.needs_release_upload_notice(uuid, timestamptz),
-  public.start_link_access_revoked(uuid, text),
+  public.start_link_access_revoked(uuid, text, uuid),
   public.start_link_lookup(text),
   public.expire_start_link(uuid),
   public.claim_start_link(uuid, uuid),
@@ -1277,15 +1566,17 @@ GRANT EXECUTE ON FUNCTION
   public.needs_replace_draft(uuid, text, jsonb, text, uuid, boolean),
   public.needs_delete_draft(uuid, uuid, integer, uuid, inet, text),
   public.needs_send_list(uuid, integer),
-  public.needs_record_reminder(uuid),
-  public.needs_issue_start_link(uuid, text, text, timestamptz, uuid, boolean),
+  public.needs_claim_reminder(uuid, integer),
+  public.needs_release_reminder(uuid, integer),
+  public.needs_issue_start_link(uuid, uuid, text, text, timestamptz, uuid),
+  public.needs_supersede_start_links(uuid, uuid),
   public.needs_client_set_answer(uuid, uuid, text, bytea),
   public.needs_client_mark_todo(uuid, uuid, boolean),
   public.needs_client_link_document(uuid, uuid, uuid),
   public.needs_client_submit(uuid, uuid),
   public.needs_claim_upload_notice(uuid),
   public.needs_release_upload_notice(uuid, timestamptz),
-  public.start_link_access_revoked(uuid, text),
+  public.start_link_access_revoked(uuid, text, uuid),
   public.start_link_lookup(text),
   public.expire_start_link(uuid),
   public.claim_start_link(uuid, uuid),
@@ -1297,5 +1588,6 @@ GRANT EXECUTE ON FUNCTION
 TO service_role;
 
 GRANT EXECUTE ON FUNCTION
-  public.needs_owner_save_draft(uuid, uuid, integer, text, text, boolean, jsonb)
+  public.needs_owner_save_draft(uuid, uuid, integer, text, text, boolean, jsonb),
+  public.needs_owner_delete_list(uuid)
 TO authenticated;

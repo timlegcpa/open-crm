@@ -52,21 +52,29 @@ export function createNeedsSendStore(deps: {
       return (count ?? 0) > 0;
     },
 
-    async issueStartLink({ listId, email, tokenHash, expiresAt, actorId, supersede }) {
+    async issueStartLink({ listId, contactId, email, tokenHash, expiresAt, actorId }) {
       const { data, error } = await server.rpc('needs_issue_start_link', {
         p_list_id: listId,
+        p_contact_id: contactId,
         p_email: email,
         p_token_hash: tokenHash,
         p_expires_at: expiresAt.toISOString(),
         p_actor: actorId,
-        p_supersede: supersede,
       });
-      if (error) throw error;
-      return data as string;
+      if (error) {
+        if (error.message === 'contact_changed' || error.message === 'address_changed') return { refused: error.message };
+        throw error;
+      }
+      return { id: data as string };
     },
 
     async expireStartLink(linkId) {
       const { error } = await server.rpc('expire_start_link', { p_id: linkId });
+      if (error) throw error;
+    },
+
+    async supersedeStartLinks(listId, keepLinkId) {
+      const { error } = await server.rpc('needs_supersede_start_links', { p_list_id: listId, p_keep: keepLinkId });
       if (error) throw error;
     },
 
@@ -76,10 +84,15 @@ export function createNeedsSendStore(deps: {
       return data as SendOutcome;
     },
 
-    async recordReminder(listId) {
-      const { data, error } = await server.rpc('needs_record_reminder', { p_list_id: listId });
+    async claimReminder(listId, expectedCount) {
+      const { data, error } = await server.rpc('needs_claim_reminder', { p_list_id: listId, p_expected_count: expectedCount });
       if (error) throw error;
-      return data === true;
+      return data as 'claimed' | 'in_progress' | 'not_sent';
+    },
+
+    async releaseReminder(listId, claimedCount) {
+      const { error } = await server.rpc('needs_release_reminder', { p_list_id: listId, p_claimed_count: claimedCount });
+      if (error) throw error;
     },
 
     loadOrg: () => deps.org.load(),

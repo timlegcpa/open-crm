@@ -297,33 +297,59 @@ function QuestionField({
   labelId: string;
 }) {
   // A sensitive answer is never shown back (it is stored encrypted); its box starts empty.
-  const [text, setText] = useState(item.sensitive ? '' : item.answer_text ?? '');
-  const saved = useRef(item.sensitive ? '' : item.answer_text ?? '');
+  const initial = item.sensitive ? '' : item.answer_text ?? '';
+  const [text, setText] = useState(initial);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [state, setState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  // One save at a time per answer, so they land in the order typed: while one is out, only
+  // the newest value waits (older ones are skipped), and it goes when the first returns.
+  // "Saved" shows only once the newest value is the one stored.
+  const stored = useRef(initial); // the value the server last confirmed
+  const requested = useRef(initial); // the value last sent or queued
+  const inFlight = useRef(false);
+  const queued = useRef<string | null>(null);
+
+  const run = async (value: string): Promise<void> => {
+    inFlight.current = true;
+    setState('saving');
+    try {
+      await track(saveAnswer(item.id, value));
+      stored.current = value;
+    } catch (err) {
+      inFlight.current = false;
+      queued.current = null;
+      requested.current = stored.current; // so the next change or blur tries again
+      setState('error');
+      toast.error(getErrorMessage(err, 'Your answer did not save. Try again.'));
+      return;
+    }
+    inFlight.current = false;
+    const next = queued.current;
+    queued.current = null;
+    if (next !== null && next !== value) return run(next);
+    setState('saved');
+    if (item.sensitive) {
+      setText('');
+      stored.current = '';
+      requested.current = '';
+    }
+    void onSaved();
+  };
 
   const flush = (value: string) => {
     if (timer.current) clearTimeout(timer.current);
     timer.current = null;
-    if (!editable || value === saved.current) return;
+    if (!editable || value === requested.current) return;
     // A sensitive box never shows the stored answer, so a blank one (spaces included) means
     // "nothing typed yet", never "erase my answer": the server would clear it.
     if (item.sensitive && value.trim() === '') return;
-    setState('saving');
-    void track(saveAnswer(item.id, value))
-      .then(() => {
-        saved.current = value;
-        setState('saved');
-        if (item.sensitive) {
-          setText('');
-          saved.current = '';
-        }
-        return onSaved();
-      })
-      .catch((err) => {
-        setState('error');
-        toast.error(getErrorMessage(err, 'Your answer did not save. Try again.'));
-      });
+    requested.current = value;
+    if (inFlight.current) {
+      queued.current = value;
+      setState('saving');
+      return;
+    }
+    void run(value);
   };
 
   useEffect(() => () => {
@@ -430,7 +456,6 @@ function DocumentField({
 const FIELD_LABELS: Record<ConfirmField, string> = {
   first_name: 'First name',
   last_name: 'Last name',
-  email: 'Email',
   phone: 'Phone',
   business_name: 'Business name',
 };
@@ -462,6 +487,7 @@ function ConfirmDetails({ listId, editable, track }: { listId: string; editable:
       <h2 id="confirm-details-heading" className="text-[14px] font-semibold">
         Confirm your details
       </h2>
+      <p className="text-[13px] text-muted-foreground">To change your email address, get in touch with us.</p>
       {!form && <Skeleton className="h-20 w-full" />}
       {form && (
         <div className="grid gap-3 sm:grid-cols-2">
@@ -472,7 +498,7 @@ function ConfirmDetails({ listId, editable, track }: { listId: string; editable:
                 id={`confirm-${f}`}
                 value={form[f]}
                 disabled={!editable}
-                type={f === 'email' ? 'email' : f === 'phone' ? 'tel' : 'text'}
+                type={f === 'phone' ? 'tel' : 'text'}
                 onChange={(e) => setForm({ ...form, [f]: e.target.value })}
               />
             </div>

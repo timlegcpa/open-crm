@@ -16,6 +16,7 @@ const h = vi.hoisted(() => ({
   answer: (() => ({ data: [], error: null })) as (call: Recorded) => Result,
   invoked: [] as Array<{ name: string; body: unknown }>,
   rpcAnswer: null as Result | null,
+  rpcAnswers: {} as Record<string, Result>,
 }));
 
 vi.mock('@/lib/supabase', () => {
@@ -43,7 +44,7 @@ vi.mock('@/lib/supabase', () => {
     from: (table: string) => builder(table),
     rpc: async (name: string, args?: unknown) => {
       h.calls.push({ table: `rpc:${name}`, chain: [['args', [args]]] });
-      return h.rpcAnswer ?? { data: { folders_deleted: 1, documents_moved: 0 }, error: null };
+      return h.rpcAnswers[name] ?? h.rpcAnswer ?? { data: { folders_deleted: 1, documents_moved: 0 }, error: null };
     },
     auth: { getSession: async () => ({ data: { session: { user: { id: '00000000-0000-4000-8000-000000000001' } } } }) },
     get storage() {
@@ -85,34 +86,38 @@ beforeEach(() => {
   h.invoked = [];
   h.answer = () => ({ data: [], error: null });
   h.rpcAnswer = null;
+  h.rpcAnswers = {};
 });
 
 describe('deleting a request', () => {
-  it('deletes the list, then the linked document rows and the list folder, and never touches Storage', async () => {
+  it('deletes through the one audited call, then the linked document rows and the list folder, and never touches Storage', async () => {
+    h.rpcAnswers.needs_owner_delete_list = { data: ['doc-1', 'doc-2'], error: null };
     h.answer = (call) => {
-      if (call.table === 'needs_item_documents') return { data: [{ document_id: 'doc-1' }, { document_id: 'doc-1' }, { document_id: 'doc-2' }], error: null };
-      if (call.table === 'needs_lists') return { data: [{ id: LIST.id }], error: null };
       if (call.table === 'client_documents') return { data: [{ id: 'doc', contact_id: 'contact-1', original_filename: 'a.pdf' }], error: null };
       if (call.table === 'client_folders') return { data: [{ id: 'folder-1' }], error: null };
       return { data: null, error: null };
     };
     const result = await deleteRequest(LIST, { deleteFiles: true });
     expect(result).toEqual({ documentsDeleted: 2, cleanupOk: true });
-    expect(h.calls.filter((c) => c.table === 'client_documents')).toHaveLength(2); // one document linked twice counts once
+    const del = h.calls.find((c) => c.table === 'rpc:needs_owner_delete_list')!;
+    expect(del.chain[0][1][0]).toEqual({ p_list_id: LIST.id });
+    // Never a bare table delete of the list.
+    expect(h.calls.some((c) => c.table === 'needs_lists' || c.table === 'needs_items' || c.table === 'needs_item_documents')).toBe(false);
+    expect(h.calls.filter((c) => c.table === 'client_documents')).toHaveLength(2);
     const folder = h.calls.find((c) => c.table === 'client_folders')!;
     expect(has(folder, 'eq', 'name', 'Onboarding – 2026-06-19')).toBe(true);
     expect(has(folder, 'eq', 'held_by', 'client')).toBe(true);
     expect(h.calls.some((c) => c.table === 'rpc:admin_client_folder_remove')).toBe(true);
-    const audit = h.calls.find((c) => c.table === 'audit_logs' && (c.chain[0][1][0] as { action?: string }).action === 'needs_list_deleted')!;
-    expect(audit.chain[0][1][0]).toMatchObject({ action: 'needs_list_deleted', details: { list_id: LIST.id, documents_deleted: 2, cleanup_ok: true } });
+    const audit = h.calls.find((c) => c.table === 'audit_logs' && (c.chain[0][1][0] as { action?: string }).action === 'needs_list_files_deleted')!;
+    expect(audit.chain[0][1][0]).toMatchObject({ action: 'needs_list_files_deleted', details: { list_id: LIST.id, documents_deleted: 2, cleanup_ok: true } });
     expect(h.storageTouched).toBe(0);
   });
 
   it('keeps the files when asked, and says when nothing was deleted', async () => {
-    h.answer = (call) => (call.table === 'needs_lists' ? { data: [{ id: LIST.id }], error: null } : { data: [], error: null });
+    h.rpcAnswers.needs_owner_delete_list = { data: ['doc-1'], error: null };
     await deleteRequest(LIST, { deleteFiles: false });
-    expect(h.calls.some((c) => c.table === 'client_documents' || c.table === 'client_folders')).toBe(false);
-    h.answer = () => ({ data: [], error: null });
+    expect(h.calls.some((c) => c.table === 'client_documents' || c.table === 'client_folders' || c.table === 'audit_logs')).toBe(false);
+    h.rpcAnswers.needs_owner_delete_list = { data: null, error: { message: 'not_found' } };
     await expect(deleteRequest(LIST, { deleteFiles: true })).rejects.toThrow(/not deleted/);
     expect(h.storageTouched).toBe(0);
   });

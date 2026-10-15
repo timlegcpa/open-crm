@@ -8,18 +8,25 @@
 //   1. The list is a draft with at least one item, and its contact has an address.
 //   2. Where the email points: the portal when the contact has an active portal account,
 //      else a start link (a one-time token, 14 days) that creates the sign-in first. The
-//      first send never supersedes an earlier link: a send that lost the publish race
-//      would otherwise kill the winner's.
+//      link is issued only for the contact and address read in step 1, re-checked under
+//      the list's lock (a reassigned list or a corrected address gets none). The first
+//      send never supersedes an earlier link: a send that lost the publish race would
+//      otherwise kill the winner's.
 //   3. Publish, only at the content version read in step 1 (needs_send_list, a
-//      compare-and-swap): an edit landing in between publishes nothing.
+//      compare-and-swap): an edit landing in between publishes nothing, and a change of
+//      contact moves the version too.
 //   4. The email. Its failure does not undo the send (the client sees the request in the
 //      portal, and Remind retries); the answer says whether it went: email_sent true,
 //      false, or null when the provider's answer was lost.
 //
 // Reminding: the list is sent and has open items. A manual reminder ignores the pause and
-// the cap (those are the schedule's). A contact still without an active account gets a
-// fresh start link, and the list's older links stop working, so only one is live. The
-// count advances when the email went (or may have: a lost answer), never on a refusal.
+// the cap (those are the schedule's). One reminder at a time per list: the count is
+// claimed first, from the count read (needs_claim_reminder), so of two at once the second
+// is refused before it mints or sends anything; the claimed number keys the email. A
+// contact still without an active account gets a fresh start link, and only once that
+// email was accepted do the list's older links stop working (needs_supersede_start_links:
+// never the link just sent, never a newer one). A failed email gives the count back and
+// expires its link.
 
 import { createHandler, HttpError, type Principal } from '../_shared/handler.ts';
 import type { AuthOutcome, OwnerPrincipal } from '../_shared/auth.ts';
@@ -72,14 +79,29 @@ export interface NeedsSendStore {
   /** needs_list_progress for one list. */
   progress(listId: string): Promise<ListProgress>;
   hasActivePortalAccount(contactId: string): Promise<boolean>;
-  /** needs_issue_start_link: the new link's id. */
-  issueStartLink(input: { listId: string; email: string; tokenHash: string; expiresAt: Date; actorId: string | null; supersede: boolean }): Promise<string>;
-  /** expire_start_link, for a link minted for a send that then published nothing. */
+  /**
+   * needs_issue_start_link, for the contact and address the caller read: the new link's
+   * id, or why none was issued (the list now belongs to another contact, or the address
+   * is no longer the contact's).
+   */
+  issueStartLink(input: {
+    listId: string;
+    contactId: string;
+    email: string;
+    tokenHash: string;
+    expiresAt: Date;
+    actorId: string | null;
+  }): Promise<{ id: string } | { refused: 'contact_changed' | 'address_changed' }>;
+  /** expire_start_link, for a link minted for a message that then never went. */
   expireStartLink(linkId: string): Promise<void>;
+  /** needs_supersede_start_links: the list's other pending links stop working. */
+  supersedeStartLinks(listId: string, keepLinkId: string): Promise<void>;
   /** needs_send_list. */
   sendList(listId: string, expectedVersion: number): Promise<SendOutcome>;
-  /** needs_record_reminder: false when the list stopped being sent meanwhile. */
-  recordReminder(listId: string): Promise<boolean>;
+  /** needs_claim_reminder, from the count the caller read. */
+  claimReminder(listId: string, expectedCount: number): Promise<'claimed' | 'in_progress' | 'not_sent'>;
+  /** needs_release_reminder: a reminder whose email failed gives its count back. */
+  releaseReminder(listId: string, claimedCount: number): Promise<void>;
   loadOrg(): Promise<OrgIdentity>;
   sendEmail(message: { to: string; subject: string; content: EmailContent; fromName: string; idempotencyKey: string }): Promise<SendResult>;
   newToken?: () => string;
@@ -103,38 +125,50 @@ function refuse(status: number, error: string, code: string): never {
   throw new HttpError(status, error, code);
 }
 
-/** Where the email points: the portal, or a fresh start link. */
+/** Where the email points: the portal, or a fresh start link; null when the list or address moved. */
 async function destination(
   store: NeedsSendStore,
   siteUrl: string,
   list: NeedsListRow,
   email: string,
   actorId: string | null,
-  supersede: boolean,
-): Promise<{ url: string; startLinkId: string | null }> {
+): Promise<{ url: string; startLinkId: string | null } | null> {
   if (await store.hasActivePortalAccount(list.contact_id)) {
     return { url: portalRequestUrl(siteUrl, list.id), startLinkId: null };
   }
   const token = (store.newToken ?? randomTokenBase64Url)();
   const now = (store.now ?? (() => new Date()))();
-  const startLinkId = await store.issueStartLink({
+  const issued = await store.issueStartLink({
     listId: list.id,
+    contactId: list.contact_id,
     email,
     tokenHash: await sha256Hex(token),
     expiresAt: startLinkExpiry(now),
     actorId,
-    supersede,
   });
-  return { url: startLinkUrl(siteUrl, token), startLinkId };
+  if ('refused' in issued) return null;
+  return { url: startLinkUrl(siteUrl, token), startLinkId: issued.id };
+}
+
+/** Expire a link whose message never went; logged, never thrown. */
+async function expireQuietly(store: NeedsSendStore, linkId: string | null, log: Logger): Promise<void> {
+  if (!linkId) return;
+  try {
+    await store.expireStartLink(linkId);
+  } catch (err) {
+    log.error('could not expire an unsent start link', err);
+  }
 }
 
 const emailStatus = (r: SendResult): boolean | null => (r.status === 'sent' ? true : r.status === 'failed' ? false : null);
 
 export type RemindResult =
-  | { status: 'reminded'; email: 'sent' | 'unknown'; remaining: number; counted: boolean; startLink: boolean }
+  | { status: 'reminded'; email: 'sent' | 'unknown'; remaining: number; startLink: boolean }
   | { status: 'nothing_open' }
   | { status: 'not_sent' }
   | { status: 'no_email' }
+  | { status: 'in_progress' }
+  | { status: 'changed' }
   | { status: 'email_failed' };
 
 /**
@@ -157,20 +191,54 @@ export async function remindList(
   const email = contact?.email?.trim().toLowerCase() ?? '';
   if (!email || !isValidEmail(email)) return { status: 'no_email' };
 
-  const { url, startLinkId } = await destination(store, siteUrl, list, email, actorId, true);
-  const org = await store.loadOrg();
-  const { subject, content } = requestReminderEmail({
-    org, clientName: clientFirstName(contact), title: list.title, remaining, url, startLink: startLinkId !== null,
-  });
-  const result = await store.sendEmail({
-    to: email, subject, content, fromName: org.senderName, idempotencyKey: `needs-remind:${list.id}:${list.reminder_count}`,
-  });
+  // Claim this reminder's number before minting or sending anything.
+  const number = list.reminder_count;
+  const claim = await store.claimReminder(list.id, number);
+  if (claim !== 'claimed') return { status: claim };
+
+  const giveBack = async () => {
+    try {
+      await store.releaseReminder(list.id, number);
+    } catch (err) {
+      log.error('could not give a reminder count back', err);
+    }
+  };
+  let startLinkId: string | null = null;
+  let result: SendResult;
+  try {
+    const target = await destination(store, siteUrl, list, email, actorId);
+    if (!target) {
+      await giveBack();
+      return { status: 'changed' };
+    }
+    startLinkId = target.startLinkId;
+    const org = await store.loadOrg();
+    const { subject, content } = requestReminderEmail({
+      org, clientName: clientFirstName(contact), title: list.title, remaining, url: target.url, startLink: startLinkId !== null,
+    });
+    result = await store.sendEmail({
+      to: email, subject, content, fromName: org.senderName, idempotencyKey: `needs-remind:${list.id}:${number}`,
+    });
+  } catch (err) {
+    await expireQuietly(store, startLinkId, log);
+    await giveBack();
+    throw err;
+  }
   if (result.status === 'failed') {
     log.warn('reminder not sent', { reason: result.reason });
+    await expireQuietly(store, startLinkId, log);
+    await giveBack();
     return { status: 'email_failed' };
   }
-  const counted = await store.recordReminder(list.id);
-  return { status: 'reminded', email: result.status, remaining, counted, startLink: startLinkId !== null };
+  // The new link went out (or may have): the older ones stop working now, never before.
+  if (startLinkId) {
+    try {
+      await store.supersedeStartLinks(list.id, startLinkId);
+    } catch (err) {
+      log.error('could not retire the older start links', err);
+    }
+  }
+  return { status: 'reminded', email: result.status, remaining, startLink: startLinkId !== null };
 }
 
 export function createSendNeedsListHandler(deps: SendNeedsDeps): (req: Request) => Promise<Response> {
@@ -200,10 +268,12 @@ export function createSendNeedsListHandler(deps: SendNeedsDeps): (req: Request) 
         if (result.status === 'not_sent') refuse(409, 'Only a sent request can be reminded.', 'not_sent');
         if (result.status === 'nothing_open') refuse(409, 'Every item is already answered.', 'nothing_open');
         if (result.status === 'no_email') refuse(400, 'This contact has no email address.', 'no_email');
+        if (result.status === 'in_progress') refuse(409, 'A reminder for this request is already being sent.', 'reminder_in_progress');
+        if (result.status === 'changed') refuse(409, 'The contact changed while reminding. Refresh, then try again.', 'changed');
         if (result.status === 'email_failed') refuse(502, 'The reminder could not be sent. Try again.', 'email_failed');
         await writeAudit(deps, log, {
           actorId, action: 'needs_list_reminded', ip, userAgent,
-          details: { list_id: list.id, contact_id: list.contact_id, remaining: result.remaining, start_link: result.startLink, email_status: result.email, counted: result.counted },
+          details: { list_id: list.id, contact_id: list.contact_id, remaining: result.remaining, start_link: result.startLink, email_status: result.email },
         });
         return json(200, { status: 'reminded', email_sent: result.email === 'sent' ? true : null, remaining: result.remaining });
       }
@@ -215,17 +285,13 @@ export function createSendNeedsListHandler(deps: SendNeedsDeps): (req: Request) 
       const email = contact?.email?.trim().toLowerCase() ?? '';
       if (!email || !isValidEmail(email)) refuse(400, 'This contact has no email address.', 'no_email');
 
-      const { url, startLinkId } = await destination(deps, siteUrl, list, email, actorId, false);
+      const target = await destination(deps, siteUrl, list, email, actorId);
+      if (!target) refuse(409, 'The request changed while sending. Review it, then send again.', 'changed');
+      const { url, startLinkId } = target;
       const outcome = await deps.sendList(list.id, list.content_version);
       if (outcome !== 'sent') {
         // Nothing was published by this call, so its link is never emailed: retire it.
-        if (startLinkId) {
-          try {
-            await deps.expireStartLink(startLinkId);
-          } catch (err) {
-            log.error('could not expire an unsent start link', err);
-          }
-        }
+        await expireQuietly(deps, startLinkId, log);
         if (outcome === 'already_sent') refuse(409, 'This request was already sent.', 'already_sent');
         if (outcome === 'changed') refuse(409, 'The request changed while sending. Review it, then send again.', 'changed');
         if (outcome === 'gone') refuse(404, 'This request no longer exists.', 'not_found');

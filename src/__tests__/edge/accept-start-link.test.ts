@@ -7,7 +7,7 @@
 import type { PGlite } from '@electric-sql/pglite';
 import { randomUUID } from 'node:crypto';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { createDb, seedContact, seedCore } from '../db/harness';
+import { createDb, seedContact, seedCore, seedPortalAccount } from '../db/harness';
 import {
   createAcceptStartLinkHandler,
   type AcceptStartLinkDeps,
@@ -155,8 +155,8 @@ beforeEach(async () => {
   await db.query(`DELETE FROM public.pending_signup_requests WHERE token_hash = $1`, [await sha256Hex(TOKEN)]);
   contactId = await seedContact(db, { first_name: 'Grace', email: EMAIL });
   listId = await one(`INSERT INTO public.needs_lists (contact_id, title, status, sent_at) VALUES ($1, 'Docs', 'sent', now()) RETURNING id AS r`, [contactId]);
-  linkId = await one(`SELECT public.needs_issue_start_link($1, $2, $3, now() + interval '14 days', NULL, false) AS r`,
-    [listId, EMAIL, await sha256Hex(TOKEN)]);
+  linkId = await one(`SELECT public.needs_issue_start_link($1, $2, $3, $4, now() + interval '14 days', NULL) AS r`,
+    [listId, contactId, EMAIL, await sha256Hex(TOKEN)]);
 });
 
 describeEdgeContract({
@@ -204,6 +204,63 @@ describe('accept-start-link', () => {
     expect(await accept(deps(auth))).toMatchObject({ status: 410, body: { code: 'link_expired' } });
     expect((await linkStatus()).status).toBe('expired');
     expect(auth.calls).toEqual([]);
+  });
+
+  // Each case re-opens the link the trigger expired, to show the lookup refuses it anyway.
+  const reopen = () => q(`UPDATE public.pending_signup_requests SET status = 'pending' WHERE id = $1`, [linkId]);
+
+  it('a link whose request was closed no longer works', async () => {
+    const auth = fakeAuth();
+    await q(`UPDATE public.needs_lists SET status = 'closed' WHERE id = $1`, [listId]);
+    expect((await linkStatus()).status).toBe('expired'); // the close expired it
+    await reopen();
+    expect(await accept(deps(auth))).toMatchObject({ status: 410, body: { code: 'link_expired' } });
+    expect(auth.calls).toEqual([]);
+  });
+
+  it('a link to an address the contact no longer has no longer works', async () => {
+    const auth = fakeAuth();
+    await db.query(`UPDATE public.contacts SET email = $2 WHERE id = $1`, [contactId, `moved-${n}@example.com`]);
+    expect((await linkStatus()).status).toBe('expired'); // the address change expired it
+    await db.query(`DELETE FROM public.contact_emails WHERE contact_id = $1 AND email = $2`, [contactId, EMAIL]);
+    await reopen();
+    expect(await accept(deps(auth))).toMatchObject({ status: 410, body: { code: 'link_expired' } });
+    expect(auth.calls).toEqual([]);
+  });
+
+  it('a link for a deleted request no longer works', async () => {
+    const auth = fakeAuth();
+    await db.query(`DELETE FROM public.needs_lists WHERE id = $1`, [listId]);
+    const row = (await q<{ status: string; needs_list_id: string | null }>(
+      `SELECT status, needs_list_id FROM public.pending_signup_requests WHERE id = $1`, [linkId]))[0];
+    expect(row).toEqual({ status: 'expired', needs_list_id: null });
+    await q(`UPDATE public.pending_signup_requests SET status = 'pending' WHERE id = $1`, [linkId]);
+    expect(await accept(deps(auth))).toMatchObject({ status: 410, body: { code: 'link_expired' } });
+    expect(auth.calls).toEqual([]);
+  });
+
+  it('a contact that already signs in gets no second login from an old link', async () => {
+    const auth = fakeAuth();
+    await seedPortalAccount(db, contactId, { email: `other-${n}@example.com` });
+    expect(await accept(deps(auth))).toMatchObject({ status: 410, body: { code: 'link_expired' } });
+    expect(auth.calls).toEqual([]);
+    expect(await accounts()).toHaveLength(1);
+  });
+
+  it('a request closed after the checks still wins: the link refuses and the user is rolled back', async () => {
+    const auth = fakeAuth();
+    const d = deps(auth);
+    const create = d.createBannedUser;
+    d.createBannedUser = async (input) => {
+      const made = await create(input);
+      // The interleaving: the owner closes the request between the lookup and the link.
+      await db.query(`UPDATE public.needs_lists SET status = 'closed' WHERE id = $1`, [listId]);
+      await q(`UPDATE public.pending_signup_requests SET status = 'pending' WHERE id = $1`, [linkId]);
+      return made;
+    };
+    expect(await accept(d)).toMatchObject({ status: 409, body: { code: 'portal_account_unavailable' } });
+    expect(auth.calls).toEqual(['create', 'link', 'ban', 'delete']);
+    expect(await accounts()).toEqual([]);
   });
 
   it('a revoke that lands after the checks still wins: the link refuses and the user is rolled back', async () => {

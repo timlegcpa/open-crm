@@ -5,7 +5,10 @@
 // database function scoped to the caller's own contact, so an id from another contact, a
 // draft, a closed or submitted list, or an accepted item all read as "not here" and
 // change nothing:
-//   save_contact   confirm or correct the contact's own details, when the request asks
+//   save_contact   confirm or correct the contact's own details (names and phone, never
+//                  an email address: any account on the contact, a spouse's included,
+//                  could otherwise redirect where the contact signs in and is written to),
+//                  when the request asks
 //   save_answer    a question's answer; a sensitive one is encrypted here first
 //                  (PII_ENCRYPTION_KEY) and stored only as ciphertext, and without the
 //                  key the save is refused rather than stored in the clear
@@ -39,20 +42,20 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** The longest answer a question takes, in characters (the column's own limit). */
 export const ANSWER_MAX = 5000;
 
-/** The contact fields a request may ask the client to confirm, and their longest values. */
+/**
+ * The contact fields a request may ask the client to confirm, and their longest values.
+ * No email address: changing one is the owner's (see the header).
+ */
 export const CONTACT_FIELDS = {
   first_name: 200,
   last_name: 200,
-  email: 254,
   phone: 40,
   business_name: 200,
   spouse_first_name: 200,
   spouse_last_name: 200,
-  spouse_email: 254,
 } as const;
 export type ContactField = keyof typeof CONTACT_FIELDS;
 const NEVER_BLANK: readonly ContactField[] = ['first_name', 'last_name'];
-const EMAILS: readonly ContactField[] = ['email', 'spouse_email'];
 
 export interface ClientItemRow {
   id: string;
@@ -87,7 +90,7 @@ export interface NeedsSaveDeps {
   loadItem(contactId: string, itemId: string): Promise<ClientItemRow | null>;
   /** The list, only when it is a non-draft list of this contact. */
   loadList(contactId: string, listId: string): Promise<ClientListRow | null>;
-  /** A service update of the contact's own row (its email mirrors to contact_emails). */
+  /** A service update of the contact's own row (names and phone only). */
   updateContact(contactId: string, fields: Partial<Record<ContactField, string | null>>): Promise<void>;
   /** needs_client_set_answer: the item's new status, or null when the guard matched nothing. */
   setAnswer(contactId: string, itemId: string, text: string | null, ciphertextHex: string | null): Promise<string | null>;
@@ -133,16 +136,8 @@ export function contactUpdate(raw: unknown): Partial<Record<ContactField, string
       out[field] = null;
       continue;
     }
-    if (EMAILS.includes(field)) {
-      const email = text.toLowerCase();
-      if (!isValidEmail(email)) refuse(400, 'Enter a valid email address.', 'invalid_email');
-      out[field] = email;
-      continue;
-    }
     out[field] = text;
   }
-  // The primary address is how this client signs in and hears from the owner: never cleared here.
-  if (out.email === null) refuse(400, 'Your email address cannot be blank.', 'blank_email');
   if (Object.keys(out).length === 0) refuse(400, 'Nothing to save.', 'nothing_to_save');
   return out;
 }

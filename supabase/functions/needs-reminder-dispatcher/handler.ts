@@ -84,7 +84,7 @@ export function createDispatcherHandler(deps: DispatcherDeps): (req: Request) =>
     logSink: deps.logSink,
     async handle({ json, log }) {
       const settings = normalizeReminderSettings(await deps.loadSettings());
-      const empty = { sent: 0, due: 0, failures: 0, skipped_zero_remaining: 0, not_counted: 0 };
+      const empty = { sent: 0, due: 0, failures: 0, skipped_zero_remaining: 0, skipped_in_progress: 0 };
       if (!settings.enabled) return json(200, { ...empty, enabled: false });
       if (!deps.siteUrl) {
         log.error('SITE_URL is not set; reminders need it for their links');
@@ -100,10 +100,10 @@ export function createDispatcherHandler(deps: DispatcherDeps): (req: Request) =>
         if (!active.has(row.contact_id)) continue;
         try {
           const result = await remindList(deps.store, deps.siteUrl, row, null, log);
-          if (result.status === 'reminded') {
-            out.sent++;
-            if (!result.counted) out.not_counted++;
-          } else if (result.status === 'nothing_open') out.skipped_zero_remaining++;
+          if (result.status === 'reminded') out.sent++;
+          else if (result.status === 'nothing_open') out.skipped_zero_remaining++;
+          // Another reminder (a person's Remind) got there first: this list is not due now.
+          else if (result.status === 'in_progress') out.skipped_in_progress++;
           else if (result.status !== 'not_sent') out.failures++;
         } catch (err) {
           out.failures++;

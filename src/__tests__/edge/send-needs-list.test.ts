@@ -65,9 +65,18 @@ function pgliteStore(sent: Sent[], status: () => SendResult = () => ({ status: '
     async hasActivePortalAccount(contactId) {
       return (await q(`SELECT 1 FROM public.client_portal_accounts WHERE contact_id = $1 AND status = 'active' AND user_id IS NOT NULL`, [contactId])).length > 0;
     },
-    async issueStartLink({ listId, email, tokenHash, expiresAt, actorId, supersede }) {
-      return (await q<{ id: string }>(`SELECT public.needs_issue_start_link($1, $2, $3, $4, $5, $6) AS id`,
-        [listId, email, tokenHash, expiresAt.toISOString(), actorId, supersede]))[0].id;
+    async issueStartLink({ listId, contactId, email, tokenHash, expiresAt, actorId }) {
+      try {
+        return (await q<{ id: string }>(`SELECT public.needs_issue_start_link($1, $2, $3, $4, $5, $6) AS id`,
+          [listId, contactId, email, tokenHash, expiresAt.toISOString(), actorId]))[0];
+      } catch (err) {
+        const message = (err as Error).message;
+        if (message === 'contact_changed' || message === 'address_changed') return { refused: message };
+        throw err;
+      }
+    },
+    async supersedeStartLinks(id, keep) {
+      await q(`SELECT public.needs_supersede_start_links($1, $2)`, [id, keep]);
     },
     async expireStartLink(id) {
       await q(`SELECT public.expire_start_link($1)`, [id]);
@@ -75,8 +84,11 @@ function pgliteStore(sent: Sent[], status: () => SendResult = () => ({ status: '
     async sendList(id, v) {
       return (await q<{ r: never }>(`SELECT public.needs_send_list($1, $2) AS r`, [id, v]))[0].r;
     },
-    async recordReminder(id) {
-      return (await q<{ r: boolean }>(`SELECT public.needs_record_reminder($1) AS r`, [id]))[0].r;
+    async claimReminder(id, n) {
+      return (await q<{ r: never }>(`SELECT public.needs_claim_reminder($1, $2) AS r`, [id, n]))[0].r;
+    },
+    async releaseReminder(id, n) {
+      await q(`SELECT public.needs_release_reminder($1, $2)`, [id, n]);
     },
     loadOrg: async () => ORG,
     async sendEmail({ to, subject, content, idempotencyKey }) {
@@ -204,6 +216,59 @@ describe('send-needs-list: send', () => {
     expect((await links(id)).map((r) => r.status)).toEqual(['expired']);
   });
 
+  it('a list reassigned after it was read gets no link for the old contact, and nothing is sent', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(noAccount);
+    const other = await seedContact(db, { first_name: 'Hedy', email: `hedy-${n}@example.com` });
+    const d = deps(sent);
+    const load = d.loadList;
+    d.loadList = async (listId) => {
+      const row = await load(listId);
+      // The interleaving: the draft moves to another contact between the read and the link.
+      await q(`UPDATE public.needs_lists SET contact_id = $2 WHERE id = $1`, [listId, other]);
+      return row;
+    };
+    const res = await call(d, { list_id: id });
+    expect([res.status, (await res.json()).code]).toEqual([409, 'changed']);
+    expect(await links(id)).toEqual([]);
+    expect((await listRow(id)).status).toBe('draft');
+    expect(sent).toEqual([]);
+  });
+
+  it('a list reassigned after its link was issued publishes nothing, and the link is retired', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(noAccount);
+    const other = await seedContact(db, { first_name: 'Hedy', email: `hedy-${n}@example.com` });
+    const d = deps(sent);
+    const issue = d.issueStartLink;
+    d.issueStartLink = async (input) => {
+      const out = await issue(input);
+      await q(`UPDATE public.needs_lists SET contact_id = $2 WHERE id = $1`, [input.listId, other]);
+      return out;
+    };
+    const res = await call(d, { list_id: id });
+    expect([res.status, (await res.json()).code]).toEqual([409, 'changed']);
+    expect((await links(id)).map((r) => r.status)).toEqual(['expired']);
+    expect((await listRow(id)).status).toBe('draft');
+    expect(sent).toEqual([]);
+  });
+
+  it('an address corrected after it was read gets no link', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(noAccount);
+    const d = deps(sent);
+    const load = d.loadContact;
+    d.loadContact = async (contactId) => {
+      const row = await load(contactId);
+      await q(`UPDATE public.contacts SET email = $2 WHERE id = $1`, [contactId, `grace-new-${n}@example.com`]);
+      return row;
+    };
+    const res = await call(d, { list_id: id });
+    expect([res.status, (await res.json()).code]).toEqual([409, 'changed']);
+    expect(await links(id)).toEqual([]);
+    expect(sent).toEqual([]);
+  });
+
   it('refuses a list already sent, an empty draft, a contact without an address, a missing list', async () => {
     const id = await draft(withAccount);
     await call(deps([]), { list_id: id });
@@ -275,19 +340,78 @@ describe('send-needs-list: remind', () => {
     expect((await listRow(id)).reminder_count).toBe(0);
   });
 
-  it('refuses a draft and a list with nothing open', async () => {
-    const id = await draft(withAccount);
-    const r1 = await call(deps([]), { list_id: id, remind: true });
-    expect([r1.status, (await r1.json()).code]).toEqual([409, 'not_sent']);
-    await call(deps([]), { list_id: id });
-    await q(`UPDATE public.needs_items SET status = 'fulfilled' WHERE list_id = $1`, [id]);
-    const [doc] = await q<{ id: string }>(
-      `INSERT INTO public.client_documents (contact_id, filename, original_filename, storage_path, file_size, mime_type)
-       VALUES ($1, 'a.pdf', 'a.pdf', 'p', 1, 'application/pdf') RETURNING id`, [withAccount]);
-    await q(`INSERT INTO public.needs_item_documents (item_id, document_id)
-             SELECT id, $2 FROM public.needs_items WHERE list_id = $1 AND kind = 'document'`, [id, doc.id]);
-    const r2 = await call(deps([]), { list_id: id, remind: true });
-    expect([r2.status, (await r2.json()).code]).toEqual([409, 'nothing_open']);
+  it('a failed reminder leaves the client\u2019s link working and retires the one it never sent', async () => {
+    const id = await draft(noAccount);
+    let token = 0;
+    const d = deps([]);
+    d.newToken = () => `${String(++token)}`.padStart(43, 'F');
+    await call(d, { list_id: id });
+    const failing = deps([], {}, () => ({ status: 'failed', channel: 'resend', reason: 'rejected', httpStatus: 422 }));
+    failing.newToken = () => `${String(++token)}`.padStart(43, 'F');
+    const res = await call(failing, { list_id: id, remind: true });
+    expect(res.status).toBe(502);
+    expect((await links(id)).map((r) => r.status)).toEqual(['pending', 'expired']);
+    expect((await listRow(id)).reminder_count).toBe(0);
+  });
+
+  it('two reminders at once (both read the same count): one goes, the other is refused before it mints or sends', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(noAccount);
+    let token = 0;
+    const mint = () => `${String(++token)}`.padStart(43, 'T');
+    const first = deps(sent);
+    first.newToken = mint;
+    await call(first, { list_id: id });
+    let second: Response | null = null;
+    const claim = first.claimReminder;
+    first.claimReminder = async (listId, count) => {
+      // The interleaving: another Remind, which read the same count, gets its claim in first.
+      if (!second) {
+        const other = deps(sent);
+        other.newToken = mint;
+        second = await call(other, { list_id: id, remind: true });
+      }
+      return claim(listId, count);
+    };
+    const res = await call(first, { list_id: id, remind: true });
+    expect([res.status, (await res.json()).code]).toEqual([409, 'reminder_in_progress']);
+    expect(second!.status).toBe(200);
+    const reminders = sent.filter((m) => m.subject.startsWith('Reminder'));
+    expect(reminders).toHaveLength(1);
+    expect(reminders[0].idempotencyKey).toBe(`needs-remind:${id}:0`);
+    // The send's link, then the winner's: only the one in the reminder still works.
+    expect((await links(id)).map((r) => r.status)).toEqual(['superseded', 'pending']);
+    expect(reminders[0].text).toContain(`/start#token=${'2'.padStart(43, 'T')}`);
+    expect((await listRow(id)).reminder_count).toBe(1);
+  });
+
+  it('a reminder finishing after a later one never kills the later email\u2019s link', async () => {
+    const sent: Sent[] = [];
+    const id = await draft(noAccount);
+    let token = 0;
+    const mint = () => `${String(++token)}`.padStart(43, 'L');
+    const first = deps(sent);
+    first.newToken = mint;
+    await call(first, { list_id: id });
+    let second: Response | null = null;
+    const send = first.sendEmail;
+    first.sendEmail = async (message) => {
+      // The interleaving: a second Remind starts and finishes while this one's email is out.
+      if (message.idempotencyKey.startsWith('needs-remind:') && !second) {
+        const other = deps(sent);
+        other.newToken = mint;
+        second = await call(other, { list_id: id, remind: true });
+      }
+      return send(message);
+    };
+    expect((await call(first, { list_id: id, remind: true })).status).toBe(200);
+    expect(second!.status).toBe(200);
+    const reminders = sent.filter((m) => m.subject.startsWith('Reminder'));
+    expect(reminders.map((m) => m.idempotencyKey)).toEqual([`needs-remind:${id}:1`, `needs-remind:${id}:0`]);
+    // send, first reminder, second reminder: the newest email's link is the live one.
+    expect((await links(id)).map((r) => r.status)).toEqual(['superseded', 'superseded', 'pending']);
+    expect(reminders[0].text).toContain(`/start#token=${'3'.padStart(43, 'L')}`);
+    expect((await listRow(id)).reminder_count).toBe(2);
   });
 
   it('a contact still without an account gets a fresh link, and the older one stops working', async () => {

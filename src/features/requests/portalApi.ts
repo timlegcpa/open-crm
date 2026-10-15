@@ -43,7 +43,8 @@ export const markItem = (itemId: string, done: boolean) => save({ action: 'mark_
 export const linkDocument = (itemId: string, documentId: string) => save({ action: 'link_document', item_id: itemId, document_id: documentId });
 export const submitRequest = (listId: string) => save({ action: 'submit', list_id: listId });
 
-export const CONFIRM_FIELDS = ['first_name', 'last_name', 'email', 'phone', 'business_name'] as const;
+/** The details a request may ask the client to confirm. Never an email address (needs-save refuses one). */
+export const CONFIRM_FIELDS = ['first_name', 'last_name', 'phone', 'business_name'] as const;
 export type ConfirmField = (typeof CONFIRM_FIELDS)[number];
 export const saveContactDetails = (listId: string, fields: Partial<Record<ConfirmField, string>>) =>
   save({ action: 'save_contact', list_id: listId, fields });
