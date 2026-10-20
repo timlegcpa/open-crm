@@ -70,6 +70,8 @@ export interface DispatcherDeps {
   sentLists(): Promise<DispatchListRow[]>;
   /** Of these contacts, the ones with an active portal account. */
   activeContacts(contactIds: string[]): Promise<Set<string>>;
+  /** Of these contacts, the archived ones. A scheduled reminder never mails them. */
+  archivedContacts(contactIds: string[]): Promise<Set<string>>;
   store: NeedsSendStore;
   now?: () => Date;
   logSink?: LogSink;
@@ -94,10 +96,12 @@ export function createDispatcherHandler(deps: DispatcherDeps): (req: Request) =>
       const due = (await deps.sentLists()).filter((row) => isReminderDue(row, settings, now));
       if (due.length === 0) return json(200, { ...empty, enabled: true });
 
-      const active = await deps.activeContacts([...new Set(due.map((r) => r.contact_id))]);
+      const ids = [...new Set(due.map((r) => r.contact_id))];
+      const active = await deps.activeContacts(ids);
+      const archived = await deps.archivedContacts(ids);
       const out = { ...empty, due: due.length };
       for (const row of due) {
-        if (!active.has(row.contact_id)) continue;
+        if (!active.has(row.contact_id) || archived.has(row.contact_id)) continue;
         try {
           const result = await remindList(deps.store, deps.siteUrl, row, null, log);
           if (result.status === 'reminded') out.sent++;

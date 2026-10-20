@@ -26,7 +26,8 @@ notes and history stay. Archive from a list row, a board card or its bar, the bu
 record's menu; the Archived button lists everyone archived, searchable, with Restore. Archiving
 leaves the stage alone, so Restore brings a contact back at the stage they left, and a contact
 the e-signature flow created to sign stays exactly that. The database records when, and a
-group email already queued skips a contact archived since. Archiving does not revoke portal
+group email already queued skips a contact archived since. Scheduled request reminders skip an
+archived contact; a request you send or remind by hand still goes. Archiving does not revoke portal
 access: turn that off separately in the record's portal access panel.
 
 **The record.** Overview holds the contact's details and a Billing card with the services

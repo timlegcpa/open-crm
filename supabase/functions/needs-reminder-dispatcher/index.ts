@@ -56,6 +56,20 @@ Deno.serve(
       return out;
     },
 
+    async archivedContacts(contactIds) {
+      const out = new Set<string>();
+      for (let i = 0; i < contactIds.length; i += ID_CHUNK) {
+        const { data, error } = await server
+          .from('contacts')
+          .select('id')
+          .in('id', contactIds.slice(i, i + ID_CHUNK))
+          .not('archived_at', 'is', null);
+        if (error) throw error;
+        for (const row of (data as { id: string }[] | null) ?? []) out.add(row.id);
+      }
+      return out;
+    },
+
     store: createNeedsSendStore({ server, org, outbound }),
   }),
 );

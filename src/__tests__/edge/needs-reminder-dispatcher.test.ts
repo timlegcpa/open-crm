@@ -77,6 +77,11 @@ function deps(sent: string[], over: Partial<DispatcherDeps> = {}, status: () => 
         `SELECT DISTINCT contact_id FROM public.client_portal_accounts WHERE contact_id = ANY($1::uuid[]) AND status = 'active' AND user_id IS NOT NULL`, [ids]);
       return new Set(rows.map((r) => r.contact_id));
     },
+    async archivedContacts(ids) {
+      const rows = await q<{ id: string }>(
+        `SELECT id FROM public.contacts WHERE id = ANY($1::uuid[]) AND archived_at IS NOT NULL`, [ids]);
+      return new Set(rows.map((r) => r.id));
+    },
     store: store(sent, status),
     logSink: () => {},
     ...over,
@@ -150,6 +155,23 @@ describe('needs-reminder-dispatcher', () => {
     expect((await q<{ n: number }>(`SELECT reminder_count AS n FROM public.needs_lists WHERE id = $1`, [due]))[0].n).toBe(1);
     // The next run waits for the interval again.
     expect((await run(deps(sent))).body.sent).toBe(0);
+  });
+
+  it('never reminds an archived contact, and does again once restored', async () => {
+    await setSettings({ enabled: true, interval_days: 7, max_reminders: 3 });
+    const id = await sentList(active, { daysAgo: 8 });
+    await q(`UPDATE public.contacts SET archived_at = now() WHERE id = $1`, [active]);
+    try {
+      const sent: string[] = [];
+      expect((await run(deps(sent))).body.sent).toBe(0);
+      expect(sent).toEqual([]);
+      expect((await q<{ n: number }>(`SELECT reminder_count AS n FROM public.needs_lists WHERE id = $1`, [id]))[0].n).toBe(0);
+    } finally {
+      await q(`UPDATE public.contacts SET archived_at = NULL WHERE id = $1`, [active]);
+    }
+    const sent: string[] = [];
+    expect((await run(deps(sent))).body.sent).toBe(1);
+    expect(sent).toEqual(['ada@example.com']);
   });
 
   it('counts a failed email as a failure and does not advance the count', async () => {
