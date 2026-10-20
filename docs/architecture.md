@@ -139,6 +139,7 @@ test harness:
 | `0010_email` | Group email campaigns, recipients, suppressions and unsubscribe tokens. |
 | `0011_control_center` | The lead-intake key and deliveries, and the public logo bucket. |
 | `0012_portal` | The server side of invitations, sign-in records, and the View as client credential lock. |
+| `0013_crm` | Client tiers and reversible archiving (stamped by the database), and the group email claim that skips archived contacts. |
 | `0014_requests` | Requests that close themselves once nothing is left to do, the once-a-day upload notice, and the guarded write a client's contact confirmation goes through. |
 | `0015_mcp` | The AI connector's pipeline, work board and request follow-up tools, and a consent version, bound to each approval, that makes older connector approvals re-consent. |
 | `0016_small` | Deactivating a portal account expires the contact's pending start links in the same transaction. |
