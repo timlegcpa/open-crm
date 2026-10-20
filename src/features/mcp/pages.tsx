@@ -24,14 +24,23 @@ import { isEdgeError } from '@/lib/edge';
 import { getErrorMessage } from '@/lib/errors';
 import { connectorUrl, decideRequest, listGrants, mcpKeys, readRequest, revokeGrant, type Grant } from './api';
 
-/** What a connected assistant can and cannot do, as the consent screen states it. */
-const CAN = [
+/**
+ * What a connected assistant can and cannot do, as the consent screen states it. Every
+ * power a tool grants is named here: a new kind of tool means a new line, and a bump of
+ * CONSENT_VERSION in 0015_mcp.sql so connections approved on the old wording must be
+ * approved again.
+ */
+export const CAN = [
   'Search and read contacts, their businesses, quotes and recent notes',
   'Add contacts and businesses, and update names and phone numbers',
+  'Move a contact to another pipeline stage',
   'Log call notes',
   'Record proposed quotes, and delete a proposed quote you confirm',
+  'Read, add, edit, move and note cards on your work board',
+  'Draft requests, and send, remind, accept the answers on or close a request you confirm',
+  'See every open request, and pause or resume its reminders',
 ];
-const CANNOT = ['Accept a quote', 'Change the address of a contact with a portal account', 'Delete a contact or a note'];
+export const CANNOT = ['Accept a quote', 'Change the address of a contact with a portal account', 'Delete a contact or a note'];
 
 function Centered({ children }: { children: ReactNode }) {
   return <main className="flex min-h-svh items-center justify-center p-4">{children}</main>;

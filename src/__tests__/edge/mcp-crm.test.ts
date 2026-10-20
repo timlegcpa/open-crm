@@ -270,6 +270,15 @@ describe('authentication', () => {
     expect((await post(initialize, { Authorization: `Bearer ${other}` })).status).toBe(401);
   });
 
+  it('a grant approved on an older consent screen is a 401 that sends the assistant to re-authorize', async () => {
+    const old = 'mcpat_' + 'v'.repeat(43);
+    const id = await seedGrant(old);
+    await db.query(`UPDATE public.mcp_oauth_grants SET consent_version = public.mcp_consent_version() - 1 WHERE id = $1`, [id]);
+    const res = await post(initialize, { Authorization: `Bearer ${old}` });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('WWW-Authenticate')).toBe(`Bearer resource_metadata="${protectedResourceMetadataUrl(SUPABASE_URL)}"`);
+  });
+
   it('refuses to serve when SITE_URL is unset', async () => {
     expect((await post(initialize, BEARER, createMcpCrmHandler(liveDeps({ siteUrl: null })))).status).toBe(500);
   });
@@ -1142,12 +1151,15 @@ describe('the board tools', () => {
     ]);
   });
 
-  it('refuses a stale move with the card\u2019s current lane, and an archived card, moving nothing', async () => {
+  it('refuses a stale move with the card\u2019s current lane, and an archived card, changing nothing', async () => {
     const id = (await toolJson('create_work_item', { title: 'Call back', stage: 'waiting' })).json().created.id as string;
     const stale = await tool('move_work_item', { work_item_id: id, to_stage: 'done', expected_stage: 'todo', reason: 'Done' });
     expect(stale).toEqual({ isError: true, text: expect.stringContaining('now in Waiting (waiting), not To do (todo)') });
     await db.query(`UPDATE public.work_items SET archived_at = now() WHERE id = $1`, [id]);
     expect((await tool('move_work_item', { work_item_id: id, to_stage: 'done', expected_stage: 'waiting', reason: 'Done' })).text).toMatch(/archived/);
+    expect(await tool('update_work_item', { work_item_id: id, title: 'Renamed' })).toEqual({ isError: true, text: expect.stringMatching(/^That card is archived.*Nothing was edited/) });
+    expect(await tool('add_work_item_note', { work_item_id: id, note: 'n' })).toEqual({ isError: true, text: expect.stringMatching(/^That card is archived.*Nothing was noted/) });
+    expect((await db.query(`SELECT title FROM public.work_items WHERE id = $1`, [id])).rows).toEqual([{ title: 'Call back' }]);
     expect((await db.query(`SELECT stage FROM public.work_items WHERE id = $1`, [id])).rows).toEqual([{ stage: 'waiting' }]);
   });
 

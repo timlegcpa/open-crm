@@ -318,7 +318,7 @@ describe('the tool handlers refuse bad input before any database call', () => {
 
   it('update_work_item writes only what is present: an explicit null clears, an absent key is left', async () => {
     const c = ctx();
-    c.rpc.mockResolvedValueOnce({ data: { id: ID }, error: null });
+    c.rpc.mockResolvedValueOnce({ data: { outcome: 'updated', card: { id: ID } }, error: null });
     await callTool('update_work_item', { work_item_id: ID, contact_id: null, due_date: null, priority: 'low' }, c);
     expect(c.rpc).toHaveBeenCalledWith('mcp_update_work_item', expect.objectContaining({
       p_id: ID, p_patch: { contact_id: null, due_date: null, priority: 'low' },

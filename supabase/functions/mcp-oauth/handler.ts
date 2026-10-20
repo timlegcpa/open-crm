@@ -97,8 +97,8 @@ const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 const NO_EXTRA: ReadonlySet<string> = new Set();
 
 /**
- * An allowlisted https callback with no query, or plain-http loopback. No fragment, no
- * credentials. `extra` is the adopter's own list (parseExtraRedirectUris). The fragment and
+ * An allowlisted https callback, or plain-http loopback; for either, no query, no fragment
+ * and no credentials. `extra` is the adopter's own list (parseExtraRedirectUris). The fragment and
  * query are judged on the raw string, not on the parsed URL: a bare trailing '#' or '?'
  * parses to an empty hash or search and would slip past a truthiness check.
  */
@@ -110,10 +110,11 @@ export function validRedirectUri(raw: unknown, extra: ReadonlySet<string> = NO_E
   } catch {
     return false;
   }
-  if (raw.includes('#') || u.username || u.password) return false;
+  // Every scheme, loopback included: a callback carries no query and no fragment.
+  if (raw.includes('#') || raw.includes('?') || u.username || u.password) return false;
   if (u.protocol === 'https:') {
     const target = `${u.origin}${u.pathname}`;
-    return !raw.includes('?') && (ALLOWED_REDIRECT_URIS.has(target) || extra.has(target));
+    return ALLOWED_REDIRECT_URIS.has(target) || extra.has(target);
   }
   return u.protocol === 'http:' && LOOPBACK_HOSTS.has(u.hostname);
 }
@@ -378,10 +379,11 @@ export function createMcpOauthEndpoints(deps: McpOauthDeps) {
       const uris = Array.isArray(b.redirect_uris) ? b.redirect_uris : [];
       if (uris.length < 1 || uris.length > 5 || !uris.every((u) => validRedirectUri(u, extra))) {
         // Names the exact callback a new assistant would need allowlisted. JSON.stringify
-        // escapes control characters, so a caller's value cannot forge a log line.
-        const name = typeof b.client_name === 'string' ? b.client_name.slice(0, 60) : null;
+        // escapes control characters, so a caller's value cannot forge a log line. The
+        // client name is not logged: it is free text the caller chose, and could carry a
+        // code or a credential.
         log.warn(
-          `register refused redirect_uris=${JSON.stringify(rejectedCallbacks(b.redirect_uris, extra))} client_name=${JSON.stringify(name)}`,
+          `register refused redirect_uris=${JSON.stringify(rejectedCallbacks(b.redirect_uris, extra))}`,
           { count: Array.isArray(b.redirect_uris) ? b.redirect_uris.length : 0 },
         );
         return oauthError(400, 'invalid_redirect_uri', 'redirect_uris must be 1 to 5 recognized callback addresses');

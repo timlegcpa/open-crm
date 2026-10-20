@@ -36,6 +36,7 @@ export const allowlist: DomainAllowlist = {
     'mcp_claim_reminder(uuid,uuid)',
     'mcp_release_reminder(uuid,timestamp with time zone,timestamp with time zone)',
     // 0015_mcp: the pipeline, the work board and the request follow-up.
+    'mcp_consent_version()',
     'mcp_set_contact_status(uuid,text,text,uuid,text,text)',
     'mcp_list_board(text,uuid,integer,uuid,text,text)',
     'mcp_work_item_contact_ok(uuid,text)',

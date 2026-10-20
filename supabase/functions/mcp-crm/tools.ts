@@ -17,7 +17,8 @@
 //     An archived contact is not searched, moved, or given new board work.
 //
 // The board tools work the owner's work board (0008): a move needs a reason and the lane
-// the caller read, an archived card is not moved, and a note is append-only. Board history
+// the caller read, an archived card is not moved, edited or noted, and a note is
+// append-only. Board history
 // is owner-only, so nothing here reaches a client.
 //
 // The request tools work on drafts and never publish one themselves:
@@ -633,6 +634,9 @@ const STALE_TOKEN =
   'That review_token does not match the request as it stands now (its content, its answers or its recipient changed, or the token belongs to another request). Nothing was done. Read it again with list_requests, read it back to your user, and confirm again.';
 const INACTIVE_KEY = 'An item names a category or tag that is not in use any more. List the tools again for the current ones.';
 const NO_CARD = 'No card with that id. Read the board again with list_board.';
+/** An archived card is off the board: nothing here changes it. */
+const ARCHIVED_CARD = (what: 'edited' | 'moved' | 'noted') =>
+  `That card is archived, so it is not on the board. Nothing was ${what}. The owner restores it from Archived on the board first.`;
 const INACTIVE_TYPE = 'That kind of work is not in use any more. List the tools again for the current ones.';
 
 /** The roster's sections, in order: what needs the owner first. */
@@ -1727,8 +1731,17 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
       if (sentinel(error, 'mcp_update_work_item: inactive_type')) return toolError(INACTIVE_TYPE);
       throw error;
     }
-    if (!data) return toolError(NO_CARD);
-    return toolText({ updated: data });
+    const result = data as { outcome?: string; card?: unknown } | null;
+    switch (result?.outcome) {
+      case 'updated':
+        return toolText({ updated: result.card });
+      case 'not_found':
+        return toolError(NO_CARD);
+      case 'not_on_board':
+        return toolError(ARCHIVED_CARD('edited'));
+      default:
+        throw new Error(`mcp_update_work_item returned an unknown outcome: ${String(result?.outcome)}`);
+    }
   }
 
   if (name === 'move_work_item') {
@@ -1757,7 +1770,7 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
       case 'not_found':
         return toolError(NO_CARD);
       case 'not_on_board':
-        return toolError('That card is archived, so it is not on the board. Nothing was moved. The owner restores it from Archived on the board first.');
+        return toolError(ARCHIVED_CARD('moved'));
       case 'stale':
         return toolError(
           `The card is now in ${lane(result.current_stage)}, not ${lane(args.expected_stage)}, so nothing was moved. Read it again with list_board and confirm the move against its current lane.`,
@@ -1773,8 +1786,16 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
     if ('error' in note) return toolError(note.error);
     const { data, error } = await rpc('mcp_add_work_item_note', { p_id: args.work_item_id, p_note: note.note });
     if (error) throw error;
-    if (data !== true) return toolError(NO_CARD);
-    return toolText({ logged: { work_item_id: args.work_item_id } });
+    switch ((data as { outcome?: string } | null)?.outcome) {
+      case 'noted':
+        return toolText({ logged: { work_item_id: args.work_item_id } });
+      case 'not_found':
+        return toolError(NO_CARD);
+      case 'not_on_board':
+        return toolError(ARCHIVED_CARD('noted'));
+      default:
+        throw new Error(`mcp_add_work_item_note returned an unknown outcome: ${String((data as { outcome?: string } | null)?.outcome)}`);
+    }
   }
 
   return toolError(`Unknown tool: ${name}`);

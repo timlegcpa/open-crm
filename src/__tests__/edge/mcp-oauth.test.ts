@@ -142,7 +142,7 @@ describeEdgeContract({
 describe('validRedirectUri', () => {
   it('accepts each allowlisted callback exactly, and loopback over http', () => {
     for (const uri of ALLOWED_REDIRECT_URIS) expect(validRedirectUri(uri)).toBe(true);
-    for (const uri of ['http://localhost:3334/callback', 'http://127.0.0.1/cb', 'http://[::1]:9000/cb?x=1']) {
+    for (const uri of ['http://localhost:3334/callback', 'http://127.0.0.1/cb', 'http://[::1]:9000/cb']) {
       expect([uri, validRedirectUri(uri)]).toEqual([uri, true]);
     }
   });
@@ -153,6 +153,9 @@ describe('validRedirectUri', () => {
     ['a fragment', `${REDIRECT}#x`],
     ['a bare trailing fragment mark', `${REDIRECT}#`],
     ['a bare trailing query mark', `${REDIRECT}?`],
+    ['a query on a loopback callback', 'http://[::1]:9000/cb?x=1'],
+    ['a bare trailing query mark on a loopback callback', 'http://localhost:9000/cb?'],
+    ['a bare trailing fragment mark on a loopback callback', 'http://127.0.0.1:9000/cb#'],
     ['credentials in the URL', 'https://user:pw@claude.ai/api/mcp/auth_callback'],
     ['a look-alike host', 'https://claude.ai.attacker.example/api/mcp/auth_callback'],
     ['plain http to a public host', 'http://claude.ai/api/mcp/auth_callback'],
@@ -384,20 +387,20 @@ describe('/register with an extra callback, and the refusal log', () => {
     expect((await handler(new Request(`${FN}/authorize?${q}`))).status).toBe(400);
   });
 
-  it('logs the refused callbacks by scheme, host and path, never a query, credentials or the whole name', async () => {
+  it('logs the refused callbacks by scheme, host and path, never a query, credentials or the client name', async () => {
     const lines: string[] = [];
     const h = createMcpOauthHandler(liveDeps({ logSink: (_level, line) => lines.push(line) }));
     const res = await h(new Request(`${FN}/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ redirect_uris: [REDIRECT, 'https://user:pw@new.example.com/agents/cb?code=abc123#frag'], client_name: 'New assistant\n' + 'x'.repeat(100) }),
+      body: JSON.stringify({ redirect_uris: [REDIRECT, 'https://user:pw@new.example.com/agents/cb?code=abc123#frag'], client_name: 'Named ?code=leak9#x' }),
     }));
     expect(res.status).toBe(400);
     const line = lines.find((l) => l.includes('register refused'));
     expect(line).toBeDefined();
     expect(line).toContain('https://new.example.com/agents/cb');
     expect(line).toContain('count=2');
-    for (const leak of ['user:pw', 'code=abc123', 'frag', 'x'.repeat(61), 'claude.ai']) expect([leak, line!.includes(leak)]).toEqual([leak, false]);
+    for (const leak of ['user:pw', 'code=abc123', 'frag', 'Named', 'leak9', 'client_name', 'claude.ai']) expect([leak, line!.includes(leak)]).toEqual([leak, false]);
   });
 });
 

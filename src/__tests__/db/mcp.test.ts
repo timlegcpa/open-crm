@@ -182,6 +182,7 @@ const SERVER_FUNCTIONS = [
   'mcp_oauth_authenticate(text)',
   'mcp_oauth_cleanup()',
   'mcp_tool_vocabulary()',
+  'mcp_consent_version()',
   'mcp_search_contacts(text,text,integer,uuid,text,text)',
   'mcp_get_contact(uuid,uuid,text,text)',
   'mcp_create_contact(jsonb,uuid,text,text)',
@@ -1754,7 +1755,7 @@ describe('the board functions', () => {
     expect(out.n).toBe(0);
   });
 
-  it('edits only the keys present: null clears the contact and the date, an absent key is kept; NULL for a missing card', async () => {
+  it('edits only the keys present: null clears the contact and the date, an absent key is kept; not_found for a missing card', async () => {
     const out = await asServerTx(async (tx) => {
       const id = await card(tx, { contact_id: contactA, due_date: '2027-01-01', priority: 'urgent' });
       const edited = await call<Record<string, unknown>>(tx, 'mcp_update_work_item', { p_id: id, p_patch: { contact_id: null, due_date: null, title: ' Renamed ' }, ...audit });
@@ -1763,8 +1764,8 @@ describe('the board functions', () => {
       const toArchived = await attempt(tx, () => call(tx, 'mcp_update_work_item', { p_id: id, p_patch: { contact_id: contactB }, ...audit }));
       return { edited, missing, toArchived, rows: (await auditRows(tx, 'mcp_update_work_item')).map((r) => r.details) };
     });
-    expect(out.edited).toMatchObject({ title: 'Renamed', contact_id: null, due_date: null, priority: 'urgent', stage: 'todo' });
-    expect(out.missing).toBeNull();
+    expect(out.edited).toMatchObject({ outcome: 'updated', card: { title: 'Renamed', contact_id: null, due_date: null, priority: 'urgent', stage: 'todo' } });
+    expect(out.missing).toEqual({ outcome: 'not_found' });
     expect(out.toArchived).toMatch(/contact_archived/);
     expect(out.rows).toEqual([{ source: 'mcp', work_item_id: expect.any(String), fields: ['contact_id', 'due_date', 'title'] }]);
   });
@@ -1807,7 +1808,7 @@ describe('the board functions', () => {
     expect(out.ev).toBe(0);
   });
 
-  it('notes a card without moving it; false for a missing card; a blank note is refused', async () => {
+  it('notes a card without moving it; not_found for a missing card; a blank note is refused', async () => {
     const out = await asServerTx(async (tx) => {
       const id = await card(tx);
       const note = (cardId: string, text: string) => call(tx, 'mcp_add_work_item_note', { p_id: cardId, p_note: text, ...audit });
@@ -1819,8 +1820,8 @@ describe('the board functions', () => {
         rows: (await auditRows(tx, 'mcp_add_work_item_note')).map((r) => r.details),
       };
     });
-    expect(out.ok).toBe(true);
-    expect(out.missing).toBe(false);
+    expect(out.ok).toEqual({ outcome: 'noted' });
+    expect(out.missing).toEqual({ outcome: 'not_found' });
     expect(out.blank).toMatch(/note_required/);
     expect(out.ev).toEqual([{ event_type: 'note_added', from_value: null, to_value: null, actor_user_id: OWNER_ID, detail: { note: 'Left a message', source: 'mcp' } }]);
     expect(out.rows).toEqual([{ source: 'mcp', work_item_id: expect.any(String) }]);
@@ -1877,6 +1878,27 @@ describe('the request follow-up functions', () => {
     expect(out.other).toEqual({ applied: false, reason: 'not_found' });
     expect(out.statuses.map((r) => r.status).sort()).toEqual(['draft', 'sent']);
     expect(out.audit).toEqual(['draft', 'already_closed']);
+  });
+
+  it('reports the status as stored after the items move: a trigger that closes a fully accepted request is reported as closed', async () => {
+    const out = await asServerTx(async (tx) => {
+      // Stands in for the requests domain's trigger (0014): once no item is left to accept
+      // or answer, the request closes itself.
+      await asSetup(tx, `
+        CREATE FUNCTION public.mut_close_when_accepted() RETURNS trigger LANGUAGE plpgsql SET search_path = '' AS $f$
+        BEGIN
+          UPDATE public.needs_lists l SET status = 'closed', closed_at = now()
+           WHERE l.id IN (SELECT DISTINCT n.list_id FROM new_items n) AND l.status IN ('sent', 'submitted')
+             AND NOT EXISTS (SELECT 1 FROM public.needs_items i WHERE i.list_id = l.id AND i.kind <> 'info' AND i.status <> 'reviewed');
+          RETURN NULL;
+        END $f$`);
+      await asSetup(tx, `CREATE TRIGGER mut_close_when_accepted AFTER UPDATE ON public.needs_items
+          REFERENCING NEW TABLE AS new_items FOR EACH STATEMENT EXECUTE FUNCTION public.mut_close_when_accepted();`);
+      const id = await request(tx, 'submitted', [{ status: 'fulfilled' }, { status: 'reviewed' }]);
+      return { result: await accept(tx, id), stored: (await tx.query(`SELECT status FROM public.needs_lists WHERE id = $1`, [id])).rows[0] };
+    });
+    expect(out.stored).toEqual({ status: 'closed' });
+    expect(out.result).toEqual({ accepted: 1, still_open: 0, list_status: 'closed' });
   });
 
   it('accepts only the answered items, counts what is still open (not the read-only ones), and leaves the request open', async () => {
@@ -1973,5 +1995,77 @@ describe('the request follow-up functions', () => {
     for (const err of [out.close, out.accept, out.pause]) expect(err).toBe('mcp_request_audit: failed');
     expect(out.list).toEqual({ status: 'sent', reminders_paused: false });
     expect(out.items).toEqual([{ status: 'fulfilled' }]);
+  });
+});
+
+describe('archived cards are off the board for every board write', () => {
+  it('an archived card is neither edited nor noted: not_on_board, nothing written, the refusal audited', async () => {
+    const out = await asServerTx(async (tx) => {
+      const [{ id }] = await asSetup(tx, `INSERT INTO public.work_items (title, archived_at) VALUES ('Old', now()) RETURNING id`);
+      const edit = await call(tx, 'mcp_update_work_item', { p_id: id, p_patch: { title: 'New' }, ...audit });
+      const note = await call(tx, 'mcp_add_work_item_note', { p_id: id, p_note: 'x', ...audit });
+      return {
+        edit, note,
+        row: (await tx.query(`SELECT title FROM public.work_items WHERE id = $1`, [id])).rows[0],
+        events: (await tx.query<{ n: number }>(`SELECT count(*)::int AS n FROM public.work_item_events WHERE work_item_id = $1`, [id])).rows[0].n,
+        rows: [...await auditRows(tx, 'mcp_update_work_item'), ...await auditRows(tx, 'mcp_add_work_item_note')].map((r) => r.details.outcome),
+      };
+    });
+    expect(out.edit).toEqual({ outcome: 'not_on_board' });
+    expect(out.note).toEqual({ outcome: 'not_on_board' });
+    expect(out.row).toEqual({ title: 'Old' });
+    expect(out.events).toBe(0);
+    expect(out.rows).toEqual(['not_on_board', 'not_on_board']);
+  });
+});
+
+describe('the consent version', () => {
+  const rotate = (tx: Tx, old: string, next: string) =>
+    call<{ status: string }>(tx, 'mcp_oauth_rotate_refresh', {
+      p_old_hash: old, p_client_id: CLIENT_ID, p_access_hash: `a-${next}`, p_access_expires: later(600_000), p_refresh_hash: next,
+      p_refresh_idle_expires: later(7 * 86_400_000), p_ip: null, p_user_agent: null,
+    });
+
+  it('a new grant carries the current version; one approved on older wording authenticates, refreshes and lists as nothing', async () => {
+    const out = await asServerTx(async (tx) => {
+      const current = await call<number>(tx, 'mcp_consent_version');
+      const fresh = await seedGrant(tx, { access: 'new-access', refresh: 'new-refresh' });
+      const old = await seedGrant(tx, { access: 'old-access', refresh: 'old-refresh' });
+      await asSetup(tx, `UPDATE public.mcp_oauth_grants SET consent_version = consent_version - 1 WHERE id = $1`, [old]);
+      const versions = (await tx.query<{ id: string; v: number }>(`SELECT id, consent_version AS v FROM public.mcp_oauth_grants`)).rows;
+      const result = {
+        current,
+        freshVersion: versions.find((r) => r.id === fresh)!.v,
+        freshAuth: await call(tx, 'mcp_oauth_authenticate', { p_access_hash: 'new-access' }),
+        oldAuth: await call(tx, 'mcp_oauth_authenticate', { p_access_hash: 'old-access' }),
+        oldRefresh: await rotate(tx, 'old-refresh', 'old-next'),
+        freshRefresh: await rotate(tx, 'new-refresh', 'new-next'),
+      };
+      await become(tx, asOwner);
+      const listed = await call<Array<{ id: string }>>(tx, 'mcp_list_grants');
+      return { ...result, listed: listed.map((g) => g.id), fresh, old };
+    });
+    expect(out.current).toBe(2);
+    expect(out.freshVersion).toBe(out.current);
+    expect(out.freshAuth).toMatchObject({ grant_id: out.fresh });
+    expect(out.oldAuth).toBeNull();
+    expect(out.oldRefresh).toEqual({ status: 'invalid' });
+    expect(out.freshRefresh).toMatchObject({ status: 'ok' });
+    expect(out.listed).toContain(out.fresh);
+    expect(out.listed).not.toContain(out.old);
+  });
+
+  it('a grant that existed before this migration is version 1, so its approver must consent again', async () => {
+    const { rows } = await db.query<{ d: string }>(
+      `SELECT pg_get_expr(d.adbin, d.adrelid) AS d FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+        WHERE d.adrelid = 'public.mcp_oauth_grants'::regclass AND a.attname = 'consent_version'`);
+    // The column was added with DEFAULT 1 (filling the rows already there), then the default
+    // moved to the current version; the source says so in that order.
+    expect(rows[0].d).toBe('mcp_consent_version()');
+    const sql = (await import('node:fs')).readFileSync('supabase/migrations/0015_mcp.sql', 'utf8');
+    const add = sql.indexOf('ADD COLUMN consent_version integer NOT NULL DEFAULT 1;');
+    const move = sql.indexOf('ALTER COLUMN consent_version SET DEFAULT public.mcp_consent_version();');
+    expect(add).toBeGreaterThan(0);
+    expect(move).toBeGreaterThan(add);
   });
 });

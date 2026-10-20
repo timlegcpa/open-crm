@@ -4,9 +4,11 @@
 -- created from a phone call with no address, a stage and a lead source on creation, and a
 -- stage move), the work board of 0008 (list, create, edit, move and note a card), and the
 -- request follow-up (close a request, accept its answers, pause or resume its reminders,
--- and one roster of every open request). Three 0007 functions are replaced in place, with
--- their signatures and privileges unchanged: mcp_tool_vocabulary, mcp_search_contacts and
--- mcp_create_contact.
+-- and one roster of every open request), and the consent version that makes a connection
+-- approved before these powers existed be approved again. Six 0007 functions are replaced
+-- in place, with their signatures and privileges unchanged: mcp_tool_vocabulary,
+-- mcp_search_contacts, mcp_create_contact, mcp_oauth_authenticate, mcp_oauth_rotate_refresh
+-- and mcp_list_grants. One column is added to a 0007 table: mcp_oauth_grants.consent_version.
 --
 -- Written to run once on top of 0001 to 0014: CREATE OR REPLACE for the replaced
 -- functions, CREATE for the new ones. 0001 to 0012 may already be applied on a project, so
@@ -54,6 +56,9 @@
 --     job-runner, or a schedule the adopter sets up outside the migrations.
 --
 -- No table is created here. What this file decides, and why:
+--   * A connection carries the consent version it was approved under (see the consent
+--     section): new powers are never handed to a connection the owner approved without
+--     them.
 --   * The 0007 shape for every function: SECURITY INVOKER, executable by service_role
 --     alone (the mcp-crm bearer check is the authentication boundary), returning jsonb or
 --     a scalar, and writing its audit row INSIDE the act's transaction, so an audit
@@ -103,6 +108,149 @@
 --   * The roster reads every open request (draft, sent, submitted) by whose move it is:
 --     waiting on the owner (submitted, or sent with an answer to accept), waiting on the
 --     client (sent, nothing to accept), and drafts. No answer and no token leaves here.
+
+-- ---------------------------------------------------------------------------
+-- Consent version: a connection approved on older wording must be approved again
+-- ---------------------------------------------------------------------------
+
+-- The consent screen lists every power the connector's tools grant (src/features/mcp/
+-- pages.tsx, CAN). This file adds powers the owner was never asked about (stage moves,
+-- board writes, closing and accepting requests), and a grant lives up to 30 days, so a
+-- connection approved before it would pick the new tools up silently. Each grant records
+-- the consent version it was approved under (the column default, so the grant writer
+-- needs no change), and authentication, refresh and the owner's list honour only the
+-- current one. An older connection gets the ordinary answers (401 on a call, invalid_grant
+-- on a refresh), which send the assistant back through the consent screen.
+--
+-- To change what a connection may do: add the line to CAN, bump the number returned
+-- here, and ship both together.
+CREATE FUNCTION public.mcp_consent_version()
+RETURNS integer
+LANGUAGE sql
+IMMUTABLE
+SET search_path = ''
+AS $$ SELECT 2 $$;
+
+-- Grants that exist now were approved on the older wording: version 1. New ones take the
+-- current version.
+ALTER TABLE public.mcp_oauth_grants ADD COLUMN consent_version integer NOT NULL DEFAULT 1;
+ALTER TABLE public.mcp_oauth_grants ALTER COLUMN consent_version SET DEFAULT public.mcp_consent_version();
+
+-- 0007's authentication, with the consent version.
+CREATE OR REPLACE FUNCTION public.mcp_oauth_authenticate(p_access_hash text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v record;
+BEGIN
+  SELECT g.id, g.approved_by, g.last_used_at INTO v
+    FROM public.mcp_oauth_tokens t
+    JOIN public.mcp_oauth_grants g ON g.id = t.grant_id
+   WHERE t.token_hash = p_access_hash
+     AND t.kind = 'access'
+     AND t.expires_at > now()
+     AND g.revoked_at IS NULL
+     AND g.absolute_expires_at > now()
+     AND g.consent_version = public.mcp_consent_version()
+     AND g.approved_by = (SELECT o.owner_user_id FROM public.org_profile o)
+     AND NOT EXISTS (SELECT 1 FROM public.mfa_recovery_lockouts l WHERE l.user_id = g.approved_by AND g.approved_at < l.revoked_before);
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+  IF v.last_used_at IS NULL OR v.last_used_at < now() - interval '5 minutes' THEN
+    UPDATE public.mcp_oauth_grants SET last_used_at = now() WHERE id = v.id;
+  END IF;
+  RETURN jsonb_build_object('grant_id', v.id, 'actor', v.approved_by);
+END;
+$$;
+
+-- 0007's refresh rotation, with the consent version: an older grant is invalid, never
+-- rotated. Replay is still judged first.
+CREATE OR REPLACE FUNCTION public.mcp_oauth_rotate_refresh(
+  p_old_hash text, p_client_id text, p_access_hash text, p_access_expires timestamptz, p_refresh_hash text,
+  p_refresh_idle_expires timestamptz, p_ip text, p_user_agent text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_tok record;
+  v_grant record;
+BEGIN
+  SELECT t.id, t.grant_id, t.expires_at, t.rotated_at INTO v_tok
+    FROM public.mcp_oauth_tokens t
+   WHERE t.token_hash = p_old_hash AND t.kind = 'refresh'
+     FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'invalid');
+  END IF;
+
+  SELECT g.id, g.client_id, g.scope, g.approved_by, g.approved_at, g.revoked_at, g.absolute_expires_at, g.consent_version INTO v_grant
+    FROM public.mcp_oauth_grants g
+   WHERE g.id = v_tok.grant_id
+     FOR UPDATE;
+
+  IF v_tok.rotated_at IS NOT NULL THEN
+    UPDATE public.mcp_oauth_grants SET revoked_at = now() WHERE id = v_grant.id AND revoked_at IS NULL;
+    PERFORM public.mcp_audit_row(
+      v_grant.approved_by, 'mcp_oauth_replay_revoked',
+      jsonb_build_object('source', 'mcp_oauth', 'grant_id', v_grant.id), p_ip, p_user_agent);
+    RETURN jsonb_build_object('status', 'replayed');
+  END IF;
+  IF v_tok.expires_at <= now() THEN
+    RETURN jsonb_build_object('status', 'invalid');
+  END IF;
+
+  IF (p_client_id IS NOT NULL AND v_grant.client_id IS DISTINCT FROM p_client_id)
+     OR v_grant.revoked_at IS NOT NULL OR v_grant.absolute_expires_at <= now()
+     OR v_grant.consent_version IS DISTINCT FROM public.mcp_consent_version()
+     OR v_grant.approved_by IS DISTINCT FROM (SELECT o.owner_user_id FROM public.org_profile o)
+     OR EXISTS (SELECT 1 FROM public.mfa_recovery_lockouts l
+                 WHERE l.user_id = v_grant.approved_by AND v_grant.approved_at < l.revoked_before) THEN
+    RETURN jsonb_build_object('status', 'invalid');
+  END IF;
+
+  UPDATE public.mcp_oauth_tokens SET rotated_at = now() WHERE id = v_tok.id;
+
+  INSERT INTO public.mcp_oauth_tokens (grant_id, token_hash, kind, expires_at)
+  VALUES (v_grant.id, p_access_hash, 'access', p_access_expires),
+         (v_grant.id, p_refresh_hash, 'refresh', least(p_refresh_idle_expires, v_grant.absolute_expires_at));
+  UPDATE public.mcp_oauth_grants SET last_used_at = now() WHERE id = v_grant.id;
+
+  PERFORM public.mcp_audit_row(
+    v_grant.approved_by, 'mcp_oauth_refreshed',
+    jsonb_build_object('source', 'mcp_oauth', 'grant_id', v_grant.id), p_ip, p_user_agent);
+
+  RETURN jsonb_build_object('status', 'ok', 'scope', v_grant.scope);
+END;
+$$;
+
+-- 0007's list of live connections for Settings, with the consent version: a connection
+-- that no longer works is not shown as connected.
+CREATE OR REPLACE FUNCTION public.mcp_list_grants()
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF NOT public.is_owner() THEN
+    RAISE EXCEPTION 'mcp_list_grants: owner only' USING ERRCODE = '42501';
+  END IF;
+  RETURN COALESCE((
+    SELECT jsonb_agg(jsonb_build_object(
+             'id', g.id, 'client_name', g.client_name, 'created_at', g.created_at,
+             'last_used_at', g.last_used_at, 'expires_at', g.absolute_expires_at)
+           ORDER BY g.created_at DESC, g.id DESC)
+    FROM public.mcp_oauth_grants g
+    WHERE g.revoked_at IS NULL AND g.absolute_expires_at > now()
+      AND g.consent_version = public.mcp_consent_version()
+      AND NOT EXISTS (SELECT 1 FROM public.mfa_recovery_lockouts l WHERE l.user_id = g.approved_by AND g.approved_at < l.revoked_before)), '[]'::jsonb);
+END;
+$$;
 
 -- ---------------------------------------------------------------------------
 -- The vocabulary tools/list offers
@@ -442,16 +590,30 @@ $$;
 
 -- A card's face: title, contact, type, priority and due date. A key is applied only when
 -- PRESENT, so an explicit null clears the contact or the due date and an absent key leaves
--- it. The stage is not here: a move needs a reason (mcp_move_work_item). NULL when there
--- is no such card.
+-- it. The stage is not here: a move needs a reason (mcp_move_work_item). An archived card
+-- is off the board and is not edited from here. Outcomes:
+--   not_found     no such card (nothing read, nothing audited)
+--   not_on_board  the card is archived
+--   updated       with the card as it now stands
 CREATE FUNCTION public.mcp_update_work_item(p_id uuid, p_patch jsonb, p_actor uuid, p_ip text, p_user_agent text)
 RETURNS jsonb
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
+  v_archived timestamptz;
   v_row record;
 BEGIN
+  -- Locked, so the card cannot be archived between this check and the write.
+  SELECT w.archived_at INTO v_archived FROM public.work_items w WHERE w.id = p_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('outcome', 'not_found');
+  END IF;
+  IF v_archived IS NOT NULL THEN
+    PERFORM public.mcp_audit_row(p_actor, 'mcp_update_work_item',
+      jsonb_build_object('work_item_id', p_id, 'outcome', 'not_on_board'), p_ip, p_user_agent);
+    RETURN jsonb_build_object('outcome', 'not_on_board');
+  END IF;
   IF p_patch ? 'contact_id' AND p_patch ->> 'contact_id' IS NOT NULL THEN
     PERFORM public.mcp_work_item_contact_ok((p_patch ->> 'contact_id')::uuid, 'mcp_update_work_item');
   END IF;
@@ -466,19 +628,15 @@ BEGIN
     work_item_type = CASE WHEN p_patch ? 'work_item_type' THEN p_patch ->> 'work_item_type' ELSE work_item_type END,
     priority       = CASE WHEN p_patch ? 'priority' THEN p_patch ->> 'priority' ELSE priority END,
     due_date       = CASE WHEN p_patch ? 'due_date' THEN (p_patch ->> 'due_date')::date ELSE due_date END
-  WHERE id = p_id
-  RETURNING id, title, contact_id, work_item_type, stage, priority, due_date, archived_at INTO v_row;
-
-  IF NOT FOUND THEN
-    RETURN NULL;
-  END IF;
+  WHERE id = p_id AND archived_at IS NULL
+  RETURNING id, title, contact_id, work_item_type, stage, priority, due_date INTO v_row;
 
   PERFORM public.mcp_audit_row(p_actor, 'mcp_update_work_item',
     jsonb_build_object('work_item_id', p_id,
       'fields', (SELECT COALESCE(jsonb_agg(k ORDER BY k), '[]'::jsonb) FROM jsonb_object_keys(p_patch) AS k)),
     p_ip, p_user_agent);
 
-  RETURN to_jsonb(v_row);
+  RETURN jsonb_build_object('outcome', 'updated', 'card', to_jsonb(v_row));
 END;
 $$;
 
@@ -543,20 +701,30 @@ END;
 $$;
 
 -- add_work_item_note's twin for the server: a note on a card's history without a move.
--- History is owner-only, so a note never reaches a client. false when there is no card.
+-- History is owner-only, so a note never reaches a client. An archived card is off the
+-- board and takes no note from here. Outcomes: not_found (nothing audited), not_on_board,
+-- noted.
 CREATE FUNCTION public.mcp_add_work_item_note(p_id uuid, p_note text, p_actor uuid, p_ip text, p_user_agent text)
-RETURNS boolean
+RETURNS jsonb
 LANGUAGE plpgsql
 SET search_path = ''
 AS $$
 DECLARE
   v_note text := btrim(p_note);
+  v_archived timestamptz;
 BEGIN
   IF v_note IS NULL OR v_note = '' THEN
     RAISE EXCEPTION 'mcp_add_work_item_note: note_required';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM public.work_items w WHERE w.id = p_id) THEN
-    RETURN false;
+  -- A share lock, so the card cannot be archived between this check and the note.
+  SELECT w.archived_at INTO v_archived FROM public.work_items w WHERE w.id = p_id FOR SHARE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('outcome', 'not_found');
+  END IF;
+  IF v_archived IS NOT NULL THEN
+    PERFORM public.mcp_audit_row(p_actor, 'mcp_add_work_item_note',
+      jsonb_build_object('work_item_id', p_id, 'outcome', 'not_on_board'), p_ip, p_user_agent);
+    RETURN jsonb_build_object('outcome', 'not_on_board');
   END IF;
 
   INSERT INTO public.work_item_events (work_item_id, event_type, from_value, to_value, actor_user_id, detail)
@@ -564,7 +732,7 @@ BEGIN
 
   PERFORM public.mcp_audit_row(p_actor, 'mcp_add_work_item_note',
     jsonb_build_object('work_item_id', p_id), p_ip, p_user_agent);
-  RETURN true;
+  RETURN jsonb_build_object('outcome', 'noted');
 END;
 $$;
 
@@ -613,8 +781,10 @@ $$;
 -- Accept every answered item of a request, bound to the contact named, under a lock on
 -- the list: one UPDATE, so an item is either accepted here or left answered for the next
 -- accept. Only 'fulfilled' moves; an unanswered item never does. still_open counts the
--- items still waiting on the client (an info item asks nothing and is not counted). NULL
--- when there is no such request for that contact.
+-- items still waiting on the client (an info item asks nothing and is not counted).
+-- list_status is read AFTER the items move: a trigger on needs_items may close the request
+-- once every item is accepted, and the tool must report what is stored, not what was
+-- read before. NULL when there is no such request for that contact.
 CREATE FUNCTION public.mcp_accept_request(p_list_id uuid, p_contact_id uuid, p_actor uuid, p_ip text, p_user_agent text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -640,6 +810,8 @@ BEGIN
   SELECT count(*)::integer INTO v_open
     FROM public.needs_items i
    WHERE i.list_id = p_list_id AND i.status = 'pending' AND i.kind <> 'info';
+
+  SELECT l.status INTO v_status FROM public.needs_lists l WHERE l.id = p_list_id;
 
   PERFORM public.mcp_request_audit(p_actor, 'mcp_accept_request',
     jsonb_build_object('contact_id', p_contact_id, 'list_id', p_list_id, 'accepted', v_accepted),
@@ -743,10 +915,12 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- Function privileges: the functions this file creates, never a sweep. The three it
--- replaces keep the privileges 0007 gave them (CREATE OR REPLACE does not change them).
+-- replaces (and the three OAuth functions above) keep the privileges 0007 gave them
+-- (CREATE OR REPLACE does not change them).
 -- ---------------------------------------------------------------------------
 
 REVOKE ALL ON FUNCTION
+  public.mcp_consent_version(),
   public.mcp_set_contact_status(uuid, text, text, uuid, text, text),
   public.mcp_list_board(text, uuid, integer, uuid, text, text),
   public.mcp_work_item_contact_ok(uuid, text),
@@ -760,7 +934,10 @@ REVOKE ALL ON FUNCTION
   public.mcp_list_open_requests(integer, uuid, text, text)
 FROM PUBLIC, anon, authenticated, service_role;
 
+-- The consent version is read by the column default, which runs in the grant writer's
+-- transaction (the server's), and by the three functions above.
 GRANT EXECUTE ON FUNCTION
+  public.mcp_consent_version(),
   public.mcp_set_contact_status(uuid, text, text, uuid, text, text),
   public.mcp_list_board(text, uuid, integer, uuid, text, text),
   public.mcp_work_item_contact_ok(uuid, text),
