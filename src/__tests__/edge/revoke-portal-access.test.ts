@@ -36,12 +36,6 @@ function deps(over: Partial<RevokeDeps> = {}) {
       if (error) throw error;
       return (data as string | null) ?? null;
     },
-    async expireStartLinks(id) {
-      await db.transaction(async (tx) => {
-        await tx.exec('SET LOCAL ROLE service_role');
-        await tx.query(`UPDATE public.pending_signup_requests SET status = 'expired' WHERE contact_id = $1 AND status = 'pending'`, [id]);
-      });
-    },
     async banUser(id) {
       banned.push(id);
     },
@@ -102,40 +96,55 @@ describe('revoke-portal-access', () => {
     expect(retry.banned).toEqual([userId]);
   });
 
-  it("expires the contact's pending start links before the ban, and they were refused already", async () => {
-    const [{ id: listId }] = await rows<{ id: string }>(
-      `INSERT INTO public.needs_lists (contact_id, title, status, sent_at) VALUES ($1, 'Docs', 'sent', now()) RETURNING id`, [contactId]);
-    const [{ id: linkId }] = await rows<{ id: string }>(
-      `INSERT INTO public.pending_signup_requests (email, contact_id, needs_list_id, token_hash, expires_at)
-       VALUES ($1, $2, $3, $4, now() + interval '14 days') RETURNING id`,
-      [`ada-${n}@example.com`, contactId, listId, n.toString(16).padStart(64, '0')]);
-    const order: string[] = [];
-    const base = deps();
-    const { d } = deps({
-      async expireStartLinks(id) {
-        await base.d.expireStartLinks(id);
-        // Pushed after the write lands: a ban that did not wait for it comes first.
-        order.push('expire');
-      },
-      async banUser() {
-        order.push('ban');
-        const [{ status }] = await rows<{ status: string }>(`SELECT status FROM public.pending_signup_requests WHERE id = $1`, [linkId]);
-        expect(status).toBe('expired');
-      },
-    });
-    expect((await revoke(d, accountId)).status).toBe(200);
-    expect(order).toEqual(['expire', 'ban']);
-    const [{ revoked }] = await rows<{ revoked: boolean }>(
-      `SELECT public.start_link_access_revoked($1, $2, $3) AS revoked`, [contactId, `ada-${n}@example.com`, listId]);
-    expect(revoked).toBe(true);
-  });
+  describe('pending start links', () => {
+    let email: string;
+    let listId: string;
+    let linkId: string;
 
-  it('a failed expiry is logged and the sign-in is still banned', async () => {
-    const logs: string[] = [];
-    const { d, banned } = deps({ expireStartLinks: async () => { throw new Error('links down'); }, logSink: (_level, line) => logs.push(line) });
-    expect((await revoke(d, accountId)).status).toBe(200);
-    expect(banned).toEqual([userId]);
-    expect(logs).toContainEqual(expect.stringMatching(/start link expiry failed after deactivating: links down$/));
+    beforeEach(async () => {
+      email = `ada-${n}@example.com`;
+      [{ id: listId }] = await rows<{ id: string }>(
+        `INSERT INTO public.needs_lists (contact_id, title, status, sent_at) VALUES ($1, 'Docs', 'sent', now()) RETURNING id`, [contactId]);
+      [{ id: linkId }] = await rows<{ id: string }>(
+        `INSERT INTO public.pending_signup_requests (email, contact_id, needs_list_id, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4, now() + interval '14 days') RETURNING id`,
+        [email, contactId, listId, n.toString(16).padStart(64, '0')]);
+    });
+
+    const linkStatus = async () =>
+      (await rows<{ status: string }>(`SELECT status FROM public.pending_signup_requests WHERE id = $1`, [linkId]))[0].status;
+
+    it('are expired with the revoke, even where the redemption check alone would let one through', async () => {
+      // The revoked account moves to another address; the link's address now belongs to a
+      // second account that is active with no sign-in (what a failed redemption retry
+      // leaves). No clause of start_link_access_revoked refuses that link, so only the
+      // expiry inside the deactivate stops it.
+      await db.query(`UPDATE public.client_portal_accounts SET invited_email = $1 WHERE id = $2`, [`bo-${n}@example.com`, accountId]);
+      await db.query(
+        `INSERT INTO public.client_portal_accounts (contact_id, user_id, status, invited_email, role) VALUES ($1, NULL, 'active', $2, 'secondary')`,
+        [contactId, email]);
+
+      expect((await revoke(deps().d, accountId)).status).toBe(200);
+      expect(await linkStatus()).toBe('expired');
+      const [{ revoked }] = await rows<{ revoked: boolean }>(
+        `SELECT public.start_link_access_revoked($1, $2, $3) AS revoked`, [contactId, email, listId]);
+      expect(revoked).toBe(false);
+
+      const claim = randomUUID();
+      const redeemer = randomUUID();
+      await db.query(`INSERT INTO auth.users (id, email) VALUES ($1, $2)`, [redeemer, `redeemer-${n}@example.com`]);
+      const [{ claimed }] = await rows<{ claimed: boolean }>(`SELECT public.claim_start_link($1, $2) AS claimed`, [linkId, claim]);
+      const [{ linked }] = await rows<{ linked: string | null }>(`SELECT public.link_start_link($1, $2, $3) AS linked`, [linkId, redeemer, claim]);
+      expect(claimed).toBe(false);
+      expect(linked).toBeNull();
+    });
+
+    it('stay pending when the deactivate is refused', async () => {
+      expect((await revoke(deps().d, randomUUID())).status).toBe(404);
+      const failing = deps({ deactivate: async () => { throw new Error('db down'); } });
+      expect((await revoke(failing.d, accountId)).status).toBe(500);
+      expect(await linkStatus()).toBe('pending');
+    });
   });
 
   it('a missing account is 404', async () => {

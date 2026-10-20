@@ -75,9 +75,11 @@ export function createDeleteContactHandler(deps: DeleteContactDeps): (req: Reque
         // the contact's pending start links BEFORE the claim lifts: until then the claim
         // refuses any account write, and afterwards a redemption finds its link expired.
         // Only once something was destroyed, so a refusal before that changes nothing.
-        // Logged, not fatal: the release must still run, and the redemption check
-        // (start_link_access_revoked) refuses these links on its own; this makes them read
-        // as expired. Every revoke path does the same (revoke-portal-access too).
+        // Logged, not fatal: the release must still run, and after it the redemption check
+        // (start_link_access_revoked) refuses every link of the contact on its own, because
+        // the release deactivates each account it left without a sign-in, so any account
+        // still active holds one. This makes the links read as expired. revoke-portal-access
+        // has no such cover, so it expires them inside its own transaction (0016).
         if (destroyed.length > 0) {
           try {
             await deps.expireStartLinks(id);

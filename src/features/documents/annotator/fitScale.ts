@@ -32,3 +32,49 @@ export function computeFitScale(
     ),
   );
 }
+
+export interface PageSize {
+  widthPt: number;
+  heightPt: number;
+}
+
+/**
+ * Height of the scroll body's content at a scale: py-4 above and below the stack, and each
+ * page (drawn at Math.floor of its scaled height, as AnnotatorPage does) followed by its mb-4.
+ */
+export function stackHeight(pages: readonly PageSize[], scale: number): number {
+  return pages.reduce((sum, p) => sum + Math.floor(p.heightPt * scale) + PAGE_GAP, PAGE_GAP * 2);
+}
+
+/**
+ * The fit scale for the whole document, decided from the pane's width INCLUDING any vertical
+ * scrollbar (`outerWidth`), so the scrollbar appearing or going never changes the answer.
+ * Deciding from the width left beside the scrollbar fed back: with several width-bound pages,
+ * the stack overflowed, the scrollbar took its width, the pages shrank until the stack fit,
+ * the scrollbar went, and the pages grew again, forever. Here: when the stack at the full
+ * width would overflow, the pages are sized for the width beside a scrollbar, and stay that
+ * size even if the smaller stack then fits.
+ */
+export function computeDocumentFitScale(
+  outerWidth: number,
+  containerHeight: number,
+  pages: readonly PageSize[],
+  scrollbarWidth: number,
+): number {
+  const sizes = pages.length > 0 ? pages : [{ widthPt: 612, heightPt: 792 }];
+  const maxW = Math.max(...sizes.map((p) => p.widthPt));
+  const maxH = Math.max(...sizes.map((p) => p.heightPt));
+  const full = computeFitScale(outerWidth, containerHeight, maxW, maxH);
+  if (outerWidth <= 0 || containerHeight <= 0 || stackHeight(sizes, full) <= containerHeight) return full;
+  return computeFitScale(outerWidth - scrollbarWidth, containerHeight, maxW, maxH);
+}
+
+/** The width a classic vertical scrollbar takes here (0 where scrollbars overlay content). */
+export function measureScrollbarWidth(doc: Document): number {
+  const probe = doc.createElement('div');
+  probe.style.cssText = 'position:absolute;top:-9999px;width:100px;height:100px;overflow:scroll;visibility:hidden';
+  doc.body.appendChild(probe);
+  const width = probe.offsetWidth - probe.clientWidth;
+  probe.remove();
+  return width;
+}

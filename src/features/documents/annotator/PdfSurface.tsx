@@ -12,7 +12,7 @@ import AnnotatorPage from './AnnotatorPage';
 import { useAnnotatorDoc } from './useAnnotatorDoc';
 import { useAnnotations } from './useAnnotations';
 import type { AnnotatorDoc } from './types';
-import { PAGE_GAP, computeFitScale } from './fitScale';
+import { PAGE_GAP, computeDocumentFitScale, measureScrollbarWidth } from './fitScale';
 
 const EMPTY_ANNOTATIONS: DocumentAnnotation[] = [];
 
@@ -90,8 +90,11 @@ export default function PdfSurface({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  // The pane's width INCLUDING any vertical scrollbar (offsetWidth; the pane has no border),
+  // so the fit never changes when the scrollbar comes or goes (see computeDocumentFitScale).
   const [containerWidth, setContainerWidth] = useState(0);
   const [containerHeight, setContainerHeight] = useState(0);
+  const [scrollbarWidth, setScrollbarWidth] = useState(0);
 
   // Selection is per-document: documentAnnotations.remove() deletes by primary
   // key with no document scoping, so a selection carried across a switch would
@@ -122,9 +125,12 @@ export default function PdfSurface({
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+    const probed = measureScrollbarWidth(el.ownerDocument);
     const update = () => {
-      setContainerWidth(el.clientWidth);
+      setContainerWidth(el.offsetWidth);
       setContainerHeight(el.clientHeight);
+      // Only ever grows, so it settles: the probe, or a wider scrollbar seen on the pane.
+      setScrollbarWidth((prev) => Math.max(prev, probed, el.offsetWidth - el.clientWidth));
     };
     update();
     const observer = new ResizeObserver(update);
@@ -132,9 +138,7 @@ export default function PdfSurface({
     return () => observer.disconnect();
   }, []);
 
-  const maxPageWidthPt = pageMetas.length > 0 ? Math.max(...pageMetas.map((m) => m.widthPt)) : 612;
-  const maxPageHeightPt = pageMetas.length > 0 ? Math.max(...pageMetas.map((m) => m.heightPt)) : 792;
-  const fitScale = computeFitScale(containerWidth, containerHeight, maxPageWidthPt, maxPageHeightPt);
+  const fitScale = computeDocumentFitScale(containerWidth, containerHeight, pageMetas, scrollbarWidth);
   const cssScale = fitScale * zoomFactor;
 
   // ── Page counter from scroll position ──

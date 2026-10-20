@@ -363,6 +363,30 @@ describe('delete-contact: pending start links', () => {
     expect(revoked).toBe(true);
   });
 
+  it('a failed expiry leaves no redeemable link, even beside an active account with no sign-in', async () => {
+    // The shape that let a link through on revoke-portal-access: the link's address belongs
+    // to an account that is active with no sign-in (a failed redemption retry). Here the
+    // release itself closes it: an account that was active without a sign-in comes back
+    // deactivated, and any account still active holds a sign-in.
+    await db.exec(`
+      UPDATE public.client_portal_accounts SET invited_email = 'a2@example.test' WHERE user_id = '${USER_A}';
+      INSERT INTO public.client_portal_accounts (contact_id, user_id, status, invited_email, role)
+        VALUES ('${CONTACT}', NULL, 'active', 'a@example.test', 'secondary');
+    `);
+    const d = failSecondDelete({ expireStartLinks: async () => { throw new Error('links down'); } });
+    expect((await call(d, request({ contact_id: CONTACT }))).status).toBe(500);
+    expect(await linkStatus()).toBe('pending');
+    const [{ revoked }] = await rows<{ revoked: boolean }>(
+      `SELECT public.start_link_access_revoked($1, 'a@example.test', $2) AS revoked`, [CONTACT, listId]);
+    expect(revoked).toBe(true);
+    const claim = '20000000-0000-4000-8000-000000000001';
+    await db.exec(`INSERT INTO auth.users (id, email) VALUES ('20000000-0000-4000-8000-00000000000c', 'c@example.test')`);
+    await rows(`SELECT public.claim_start_link($1, $2)`, [linkId, claim]);
+    const [{ linked }] = await rows<{ linked: string | null }>(
+      `SELECT public.link_start_link($1, '20000000-0000-4000-8000-00000000000c', $2) AS linked`, [linkId, claim]);
+    expect(linked).toBeNull();
+  });
+
   it('a completed delete leaves no link pointing at the contact', async () => {
     expect((await call(deps(), request({ contact_id: CONTACT }))).status).toBe(200);
     const [{ contact_id }] = await rows<{ contact_id: string | null }>(
