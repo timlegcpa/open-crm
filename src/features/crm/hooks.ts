@@ -123,6 +123,7 @@ export function useSetArchived() {
       } else if (archived) {
         const saved = ids.filter((id) => !result.failedIds.includes(id));
         toast.success(name ? `${name} archived. The record is kept.` : `${result.updated} contacts archived. Their records are kept.`, {
+          description: 'Archiving does not revoke portal access; turn that off on the record.',
           action: { label: 'Undo', onClick: () => void run(saved, false, name) },
         });
       } else {

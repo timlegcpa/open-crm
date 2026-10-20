@@ -1,6 +1,6 @@
-import { useEffect } from 'react';
+import { useEffect, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider, useMutation } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 
@@ -19,10 +19,12 @@ vi.mock('@/features/registry', async (importOriginal) => ({ ...(await importOrig
 
 import type { Contact } from '@/api/contacts';
 import { fake } from '@/__tests__/fakeSupabase';
+import { BillingTab } from '../components/BillingTab';
 import { OverviewTab } from '../components/OverviewTab';
 import { RecordRightBar } from '../components/RecordRightBar';
 import { contactFieldMutationKey } from '../hooks';
 import { quoteOpMutationKey } from '../lib/quotes';
+import { useQuoteEditing } from '../useQuoteEditing';
 
 const ADA = '10000000-0000-4000-8000-00000000000a';
 
@@ -183,5 +185,50 @@ describe('the record right bar', () => {
     quote.unmount();
     renderWith(<RecordRightBar contact={CONTACT} />, contactFieldMutationKey(ADA));
     await waitFor(async () => expect((await screen.findByTestId('quote-editor')).dataset.disabled).toBe('true'));
+  });
+});
+
+describe('the Billing tab and a field save', () => {
+  const QUOTE = {
+    id: '20000000-0000-4000-8000-000000000001',
+    contact_id: ADA,
+    organization_id: null,
+    service_type: 'retainer',
+    state: 'accepted',
+    cadence: 'monthly',
+    amount: '500.00',
+  };
+  const CLIENT = { ...CONTACT, status: 'client', contact_services: [QUOTE] } as unknown as Contact;
+
+  beforeEach(() => {
+    fake.state.tables.contacts = [{ ...CLIENT }];
+    fake.state.tables.contact_services = [{ ...QUOTE }];
+  });
+
+  // A quote save re-derives the status from the one it read: it must not start while the
+  // owner's own status change (from the right bar, say) is saving.
+  it('holds its quotes while a field save for this contact is in flight', async () => {
+    renderWith(<BillingTab contactId={ADA} />, contactFieldMutationKey(ADA));
+    await waitFor(() => expect(screen.getByRole('button', { name: /price:/ })).toBeDisabled());
+  });
+
+  it('leaves its quotes open when nothing is saving', async () => {
+    renderWith(<BillingTab contactId={ADA} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /price:/ })).toBeEnabled());
+  });
+
+  it('refuses a quote write that starts while a field save is in flight', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>
+        <PendingSave mutationKey={contactFieldMutationKey(ADA)} />
+        {children}
+      </QueryClientProvider>
+    );
+    const { result } = renderHook(() => useQuoteEditing({ id: ADA }), { wrapper });
+    await waitFor(() => expect(result.current.busy).toBe(true));
+    expect(await result.current.patchQuote({ id: QUOTE.id }, { amount: 900 })).toBe(false);
+    expect(fake.calls('contact_services', 'update')).toHaveLength(0);
+    expect(fake.calls('contacts', 'update')).toHaveLength(0);
   });
 });

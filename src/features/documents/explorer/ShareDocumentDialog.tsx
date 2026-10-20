@@ -34,7 +34,8 @@ export interface ShareTarget {
  * The candidate list is exactly this contact's linked people (contact relationships),
  * because a free contact search here would make a mis-click a disclosure. **The link is
  * only the candidate list: it grants nothing on its own.** This dialog is what grants
- * access, one document at a time.
+ * access, one document at a time. An archived linked person is never offered; one this
+ * document is already shared with stays listed, so opening the dialog changes nothing.
  *
  * The recipient's access is READ-ONLY (the UPDATE and DELETE policies do not match a
  * shared row), and the copy says so because "shared" otherwise reads as "can change it".
@@ -54,11 +55,12 @@ export default function ShareDocumentDialog({
   }, [target]);
 
   const contactId = target?.contactId ?? '';
-  const { data: links = [], isPending: linksPending } = useQuery({
+  const { data: household = [], isPending: linksPending } = useQuery({
     queryKey: queryKeys.contactRelationships.forContact(contactId),
     queryFn: () => listHousehold(contactId),
     enabled: !!contactId,
   });
+  const links = household.filter((l) => !l.otherArchived || l.otherId === target?.sharedWithContactId);
 
   // The share must always resolve to a CURRENTLY linked person or to nobody.
   // `selected` is seeded from the row, so a document shared with someone who was

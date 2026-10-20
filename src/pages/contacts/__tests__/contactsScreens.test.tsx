@@ -211,6 +211,24 @@ describe('contacts index', () => {
     expect(within(screen.getByRole('region', { name: 'Not ranked' })).getByRole('button', { name: 'Open Sample, Bo' })).toBeInTheDocument();
   });
 
+  // Below lg the Tiers tab hides the index, yet the search and the board filter still narrow
+  // the tier rows: the controls that clear them must not be hidden with it.
+  it('on a narrow Tiers tab the search and the filter clear sit atop the rows, never in the hidden index', async () => {
+    renderAt('/contacts?tab=tiers&view=unpriced');
+    await screen.findByRole('region', { name: 'Not ranked' });
+    const hidden = (el: HTMLElement) => el.closest('[class~="max-lg:hidden"]') !== null;
+    expect(hidden(screen.getByLabelText('Search contacts'))).toBe(false);
+    expect(hidden(screen.getByRole('button', { name: 'Clear list filter' }))).toBe(false);
+  });
+
+  it('on a wide Tiers tab the search stays atop the index', async () => {
+    setWide(true);
+    renderAt('/contacts?tab=tiers');
+    await screen.findByRole('region', { name: 'Not ranked' });
+    expect(screen.getAllByLabelText('Search contacts')).toHaveLength(1);
+    expect(within(screen.getByLabelText('Search contacts').closest('[class~="lg:w-[300px]"]') as HTMLElement).getByRole('checkbox', { name: 'Select Sample, Bo' })).toBeInTheDocument();
+  });
+
   it('archived contacts are off every list, and the Archived dialog restores them with the status untouched', async () => {
     fake.state.tables.contacts[2].archived_at = '2026-03-05T10:00:00Z';
     renderAt('/contacts?tab=all');
@@ -236,6 +254,7 @@ describe('contacts index', () => {
     expect(Object.keys(write.payload as object)).toEqual(['archived_at']);
     expect(write.filters[0].value).toEqual([ADA]);
     expect(await screen.findByText('Ada Example archived. The record is kept.')).toBeInTheDocument();
+    expect(screen.getByText('Archiving does not revoke portal access; turn that off on the record.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Undo' })).toBeInTheDocument();
   });
 

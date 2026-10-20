@@ -158,6 +158,16 @@ export function joinQuotes(contacts: readonly MarketingContactRow[], quotes: rea
   return contacts.filter((c) => !isArchived(c)).map((c) => ({ ...c, contact_services: byContact.get(c.id) ?? [] }));
 }
 
+/**
+ * The open upsells the figures count: an archived contact's are dropped, as joinQuotes drops
+ * the contact and its quotes (the shared rollup would count an upsell whose contact it cannot
+ * find).
+ */
+export function dropArchivedUpsells(contacts: readonly MarketingContactRow[], upsells: readonly OpenUpsell[]): OpenUpsell[] {
+  const archived = new Set(contacts.filter(isArchived).map((c) => c.id));
+  return upsells.filter((u) => !archived.has(u.contact_id));
+}
+
 // ── Goal writes ─────────────────────────────────────────────────────────────
 
 /**

@@ -259,6 +259,26 @@ export function ContactsList() {
   // The tier rows read the board filter and the search, like the index beside them.
   const tierMatches = useCallback((c: Contact) => (!viewIds || viewIds.has(c.id)) && matches(c), [viewIds, matches]);
 
+  // The search and the board filter live atop the index. On a narrow Tiers tab the index is
+  // hidden, yet both still narrow the tier rows, so there they move atop the rows instead.
+  const filtersOnTiers = pane === 'tiers' && !recordOpen && !wide;
+  const filterBar = (
+    <div className="flex flex-col gap-2 border-b border-border p-3">
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+        <Input aria-label="Search contacts" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search" className="h-8 pl-8 text-[13px]" />
+      </div>
+      {view && (
+        <div className="flex items-center gap-1 text-[12px] text-muted-foreground">
+          Filtered by the board
+          <ClickRegion onClick={() => setView(null)} aria-label="Clear list filter" className="inline-flex rounded-sm p-0.5 hover:bg-muted">
+            <X className="h-3 w-3" aria-hidden="true" />
+          </ClickRegion>
+        </div>
+      )}
+    </div>
+  );
+
   const headerActions = (
     <>
       {figures.length > 0 && (
@@ -353,20 +373,7 @@ export function ContactsList() {
       </Tabs>
       <div className="flex h-full min-h-0 flex-1">
         <div className={cn('relative flex min-h-0 shrink-0 flex-col border-r border-border', 'w-full lg:w-[300px]', paneFirst && 'max-lg:hidden')}>
-          <div className="flex flex-col gap-2 border-b border-border p-3">
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
-              <Input aria-label="Search contacts" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search" className="h-8 pl-8 text-[13px]" />
-            </div>
-            {view && (
-              <div className="flex items-center gap-1 text-[12px] text-muted-foreground">
-                Filtered by the board
-                <ClickRegion onClick={() => setView(null)} aria-label="Clear list filter" className="inline-flex rounded-sm p-0.5 hover:bg-muted">
-                  <X className="h-3 w-3" aria-hidden="true" />
-                </ClickRegion>
-              </div>
-            )}
-          </div>
+          {!filtersOnTiers && filterBar}
           <ScrollArea className="min-h-0 flex-1" fitWidth>
             <div className={cn('pb-3', selecting && 'pb-36')}>{indexBody}</div>
           </ScrollArea>
@@ -413,12 +420,17 @@ export function ContactsList() {
             contacts.isPending ? (
               <p className="p-5 text-[13px] text-muted-foreground">Loading contacts...</p>
             ) : (
-              <TierBoard
-                contacts={all}
-                matches={tierMatches}
-                onSaveTier={saveTier}
-                onOpen={(contactId) => navigate(`${links.contact(contactId)}${indexSearch}`)}
-              />
+              <div className="flex h-full min-h-0 flex-col">
+                {filtersOnTiers && filterBar}
+                <div className="min-h-0 flex-1">
+                  <TierBoard
+                    contacts={all}
+                    matches={tierMatches}
+                    onSaveTier={saveTier}
+                    onOpen={(contactId) => navigate(`${links.contact(contactId)}${indexSearch}`)}
+                  />
+                </div>
+              </div>
             )
           ) : !wide ? null : showTable ? (
             <CrmTable
