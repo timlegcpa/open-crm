@@ -57,6 +57,7 @@ BEGIN
   PERFORM 1 FROM public.pending_signup_requests r
    WHERE r.status = 'pending'
      AND r.contact_id = (SELECT a.contact_id FROM public.client_portal_accounts a WHERE a.id = p_account_id)
+   ORDER BY r.id
      FOR UPDATE;
   SELECT * INTO v_account FROM public.client_portal_accounts a WHERE a.id = p_account_id FOR UPDATE;
   IF NOT FOUND THEN
