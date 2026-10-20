@@ -14,7 +14,7 @@
 //                  key the save is refused rather than stored in the clear
 //   mark_item      tick or untick a to-do
 //   link_document  attach a file the client just uploaded to a document item; the owner
-//                  hears about uploads at most once per list per 30 minutes, with no names
+//                  hears about uploads at most once per list per 24 hours, with no names
 //   submit         hand the list back, only when every required item is answered; the
 //                  owner and the client each get one email, and a second submit none
 //
@@ -158,10 +158,14 @@ export function createNeedsSaveHandler(deps: NeedsSaveDeps): (req: Request) => P
         url: ownerDocumentsUrl(deps.siteUrl, contactId),
       });
       const result = await deps.sendEmail({ to, subject, content, fromName: org.senderName, idempotencyKey: `needs-upload:${listId}:${stamp}` });
+      // Unknown (no answer from the provider) may well have been delivered, so it keeps the
+      // claim: giving it back would let the next upload email the owner again within the day.
       sent = result.status !== 'failed';
       if (!sent) log.warn('upload notice not sent');
     } finally {
-      // A notice that did not go gives its claim back, so the next upload tries again.
+      // A notice the provider refused, or that never reached the send, gives its claim back,
+      // so the next upload tries again instead of the notice going quiet for a day. Only this
+      // claim's own stamp is cleared, never a newer one.
       if (!sent) {
         try {
           await deps.releaseUploadNotice(listId, stamp);

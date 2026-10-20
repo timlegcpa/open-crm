@@ -149,7 +149,7 @@ export function requestSubmittedClientEmail(input: {
 }
 
 /**
- * An upload to a request, to the owner, at most once per list per 30 minutes. No file
+ * An upload to a request, to the owner, at most once per list per 24 hours. No file
  * names: the client typed them.
  */
 export function requestUploadOwnerEmail(input: {

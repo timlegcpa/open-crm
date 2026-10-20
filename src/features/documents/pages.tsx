@@ -17,16 +17,21 @@ import { documentKeys, getDocument, listDocumentsForContact } from './api';
 const AdminDocumentsExplorer = lazy(() => import('./explorer/AdminDocumentsExplorer'));
 const DocumentWorkstation = lazy(() => import('./workstation/DocumentWorkstation'));
 const PortalDocuments = lazy(() => import('./portal/PortalDocuments'));
+// The picked contact's requests, above their folders on the full page only (the contact
+// record has its own Requests tab).
+const ContactRequestsStrip = lazy(() =>
+  import('@/features/requests/components/ContactRequestsStrip').then((m) => ({ default: m.ContactRequestsStrip })),
+);
 
 const Loading = () => <Skeleton className="m-4 h-40" />;
 
-/** /documents: every contact's files. `?contact=<id>` opens on one contact. */
+/** /documents: every contact's files, each picked contact's requests above them. `?contact=<id>` opens on one contact. */
 export function DocumentsPage() {
   const [params] = useSearchParams();
   const contact = params.get('contact') ?? undefined;
   return (
     <Suspense fallback={<Loading />}>
-      <AdminDocumentsExplorer variant="flush" initialClientId={isUuid(contact) ? contact : undefined} />
+      <AdminDocumentsExplorer variant="flush" initialClientId={isUuid(contact) ? contact : undefined} contactPanel={ContactRequestsStrip} />
     </Suspense>
   );
 }

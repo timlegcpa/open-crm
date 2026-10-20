@@ -16,7 +16,7 @@ Supabase. One owner runs it; clients get a secure portal.
 - **Secure messages**: secure messages between the owner and each client: a client's message is
   end-to-end encrypted in their browser to the owner's key, and the owner's replies are stored as
   plain text (not end-to-end encrypted). Messages are deleted 7 days after they are read.
-- **Requests**: send a client a list of documents and questions, with reminders.
+- **Requests**: send a client a list of documents and questions, with reminders; a request closes itself once every answer is accepted.
 - **E-signature**: place fields, send, sign, and verify an executed PDF against tampering.
 - **Work board**: a Kanban board of work items with configurable stages.
 - **Group email**: email a chosen group of contacts, with an unsubscribe link in every message.

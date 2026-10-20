@@ -23,4 +23,5 @@ export * from './owner.ts';
 export * from './paging.ts';
 export * from './portal-account.ts';
 export * from './rate-limit.ts';
+export * from './request-roster.ts';
 export * from './secrets.ts';

@@ -12,3 +12,17 @@ export const requestKeys = {
   mine: (contactId: string) => ['requests', 'mine', contactId] as const,
   myRequest: (id: string) => ['requests', 'mine', 'detail', id] as const,
 };
+
+/**
+ * How the owner's request lists stay current: a client answering in the portal writes
+ * nothing that reaches the owner's cache, so a visible list reads again every 30 seconds,
+ * pauses in a hidden tab, and catches up at once when the owner comes back to it (the app's
+ * default is never to refetch on focus). For reads only: never on a screen that edits, where
+ * a refetch could replace what is being typed.
+ */
+export const LIST_REFRESH = {
+  refetchInterval: 30_000,
+  refetchIntervalInBackground: false,
+  refetchOnWindowFocus: 'always',
+  refetchOnMount: 'always',
+} as const;

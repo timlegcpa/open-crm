@@ -31,19 +31,13 @@ import {
   LIST_STATUS_LABELS,
   listProgress,
   type ItemStatus,
-  type ListStatus,
   type RequestItem,
   type RequestList,
   type RequestWithItems,
 } from '../lib/requests';
 import { KIND_ICONS } from './RequestPreview';
+import { LIST_TONES } from './RequestRow';
 
-export const LIST_TONES: Record<ListStatus, ToneBadgeVariant> = {
-  draft: 'default',
-  sent: 'attention',
-  submitted: 'review',
-  closed: 'neutral',
-};
 const ITEM_TONES: Record<ItemStatus, ToneBadgeVariant> = { pending: 'default', fulfilled: 'warning', reviewed: 'success' };
 
 /** A sent, submitted or closed request, for the owner: every item, its answer, and what to do next. */
@@ -129,7 +123,9 @@ export function RequestDetail({ request }: { request: RequestWithItems }) {
 
       <Panel title={`Items (${request.items.length})`} bodyClassName="divide-y divide-border">
         {request.items.map((item) => (
-          <ItemRow key={item.id} item={item} listOpen={open} onChanged={refresh} />
+          // Keyed on the stored answer too: when the client changes a sensitive answer, the
+          // old one, if revealed, is put away rather than shown as the current one.
+          <ItemRow key={`${item.id}:${item.secret_answer_key ?? 'none'}`} item={item} listOpen={open} onChanged={refresh} />
         ))}
       </Panel>
     </div>

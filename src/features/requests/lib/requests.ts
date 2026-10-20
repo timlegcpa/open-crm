@@ -1,6 +1,6 @@
 /**
  * Requests, the pure parts: the shapes, the one fulfilment rule as the browser applies
- * it, how a list's progress and sections are derived, the folder a list's uploads go
+ * it, how a list's progress is derived and grouped, the folder a list's uploads go
  * into, and the reminder settings. No supabase-js here, so every screen and test can use
  * it, and the portal never loads the owner's code through it.
  *
@@ -68,6 +68,8 @@ export interface RequestItem {
   sensitive: boolean;
   /** Whether an encrypted answer is stored. The ciphertext itself is never read by a screen. */
   has_secret_answer: boolean;
+  /** Tells one stored encrypted answer from the next (rows.ts); null when none is stored. */
+  secret_answer_key?: string | null;
   category: string;
   tag: string;
   documents: LinkedDocument[];
@@ -166,19 +168,17 @@ export function canAccept(item: RequestItem): boolean {
   return isActionable(item) && item.status === 'fulfilled' && isItemFulfilled(item);
 }
 
-/** The owner's requests page, in the order it shows them: what needs the owner first. */
-export const SECTION_ORDER: readonly ListStatus[] = ['submitted', 'sent', 'draft', 'closed'];
-
-export function requestSections<T extends Pick<RequestList, 'status' | 'created_at' | 'id'>>(
-  lists: readonly T[],
-): Array<{ status: ListStatus; lists: T[] }> {
-  return SECTION_ORDER.map((status) => ({
-    status,
-    lists: lists
-      .filter((l) => l.status === status)
-      .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : a.id < b.id ? -1 : 1)),
-  })).filter((s) => s.lists.length > 0);
-}
+/**
+ * The owner's request lists are grouped by whose move it is (Waiting on you, Waiting on
+ * client, Drafts, Archived). The grouping is shared with the edge functions, so it lives in
+ * supabase/functions/_shared/request-roster.ts and is re-exported here.
+ */
+export {
+  ARCHIVED_SECTION,
+  answersToAccept,
+  requestRosterSections,
+  type RosterSection,
+} from '../../../../supabase/functions/_shared/request-roster';
 
 /** The lists a client still has to work on (the portal home card). */
 export function openRequestLists<T extends Pick<RequestList, 'status'>>(lists: readonly T[]): T[] {

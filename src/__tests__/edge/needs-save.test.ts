@@ -243,6 +243,15 @@ describe('needs-save: uploads', () => {
     expect(sent).toHaveLength(2);
   });
 
+  it('a notice whose delivery is unknown keeps its claim, so the next upload sends nothing', async () => {
+    const sent: Sent[] = [];
+    const d = deps(sent, {}, () => ({ status: 'unknown', channel: 'resend' }));
+    await save(d, { action: 'link_document', item_id: docItem, document_id: await upload() });
+    await save(d, { action: 'link_document', item_id: docItem, document_id: await upload() });
+    expect(sent).toHaveLength(1);
+    expect(await one(`SELECT upload_notified_at IS NOT NULL AS r FROM public.needs_lists WHERE id = $1`, [listId])).toBe(true);
+  });
+
   it('refuses another contact’s file, an owner-held file, and a non-document item', async () => {
     const theirs = await upload(other);
     expect(await result(await save(deps([]), { action: 'link_document', item_id: docItem, document_id: theirs }))).toEqual([409, 'locked']);

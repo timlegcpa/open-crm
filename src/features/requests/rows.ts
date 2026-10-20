@@ -4,8 +4,9 @@ import type { RequestItem, RequestWithItems } from './lib/requests';
 /**
  * A request row with its items, as PostgREST returns them, mapped to the screens' shape.
  * Shared by the owner's api.ts and the portal's portalApi.ts (no supabase-js here).
- * A sensitive answer's ciphertext is read only to know whether one is stored; the bytes
- * are dropped here and never reach a screen.
+ * A sensitive answer's ciphertext is read only to know whether one is stored, and to tell
+ * one stored answer from the next (a short hash, so a revealed answer is put away when the
+ * client changes it); the bytes are dropped here and never reach a screen.
  */
 export const LIST_COLUMNS =
   'id, contact_id, title, status, intro_message, include_contact_confirm, reminders_paused, reminder_count, ' +
@@ -55,11 +56,22 @@ const listSchema = z.object({
 
 export type RawList = z.input<typeof listSchema>;
 
+/** A short tag of the stored ciphertext: it changes when the answer does and reveals nothing of it. */
+function secretAnswerKey(raw: unknown): string | null {
+  if (raw === null || raw === undefined || raw === '' || raw === '\\x') return null;
+  const text = typeof raw === 'string' ? raw : JSON.stringify(raw);
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  return `${text.length}.${(hash >>> 0).toString(36)}`;
+}
+
 function toItem(raw: z.infer<typeof itemSchema>): RequestItem {
   const { answer_ciphertext, needs_item_documents, ...rest } = raw;
+  const secretKey = secretAnswerKey(answer_ciphertext);
   return {
     ...rest,
-    has_secret_answer: answer_ciphertext !== null && answer_ciphertext !== undefined && answer_ciphertext !== '' && answer_ciphertext !== '\\x',
+    has_secret_answer: secretKey !== null,
+    secret_answer_key: secretKey,
     documents: (needs_item_documents ?? [])
       .map((d) => ({
         id: d.id,

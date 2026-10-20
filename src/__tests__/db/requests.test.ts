@@ -1,9 +1,11 @@
 // @vitest-environment node
-// 0005_requests: who may read and write requests, their items, answers, item documents,
+// 0005_requests and 0014_requests: who may read and write requests, their items, answers, item documents,
 // the request pick-lists, templates and start links, and what the server functions refuse,
 // by real policy evaluation in PGlite. Every fixture is fictional.
 import type { PGlite } from '@electric-sql/pglite';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
   as,
@@ -626,15 +628,19 @@ describe('a client writes through the server functions, guarded', () => {
     }
   });
 
-  it('the upload notice is claimed once per 30 minutes and released only by its claimer', async () => {
+  it('the upload notice is claimed once per 24 hours and released only by its claimer', async () => {
     await session(db, asServer, async (tx) => {
-      const stamp = await one<string | null>(tx, `SELECT public.needs_claim_upload_notice($1) AS r`, [sentA]);
+      const claim = () => one<string | null>(tx, `SELECT public.needs_claim_upload_notice($1) AS r`, [sentA]);
+      const stamp = await claim();
       expect(stamp).not.toBeNull();
-      expect(await one(tx, `SELECT public.needs_claim_upload_notice($1) AS r`, [sentA])).toBeNull();
+      expect(await claim()).toBeNull();
       expect(await one(tx, `SELECT public.needs_release_upload_notice($1, now() - interval '1 hour') AS r`, [sentA])).toBe(false);
       expect(await one(tx, `SELECT public.needs_release_upload_notice($1, $2) AS r`, [sentA, stamp])).toBe(true);
-      await tx.query(`UPDATE public.needs_lists SET upload_notified_at = now() - interval '31 minutes' WHERE id = $1`, [sentA]);
-      expect(await one(tx, `SELECT public.needs_claim_upload_notice($1) AS r`, [sentA])).not.toBeNull();
+      // A client uploading in bursts through the day: still the one claim (0014).
+      await tx.query(`UPDATE public.needs_lists SET upload_notified_at = now() - interval '23 hours' WHERE id = $1`, [sentA]);
+      expect(await claim()).toBeNull();
+      await tx.query(`UPDATE public.needs_lists SET upload_notified_at = now() - interval '25 hours' WHERE id = $1`, [sentA]);
+      expect(await claim()).not.toBeNull();
     });
   });
 });
@@ -1152,5 +1158,150 @@ describe('function privileges', () => {
       await expectDenied(as(db, who, `SELECT * FROM public.start_link_lookup($1)`, [HASH('b')]));
       await expectDenied(as(db, who, `SELECT * FROM public.needs_list_progress(ARRAY[$1]::uuid[])`, [sentA]));
     }
+  });
+});
+
+describe('a request closes itself once nothing is left to do (0014)', () => {
+  const one = async <T>(tx: Tx, sql: string, params: unknown[]) => (await tx.query<{ r: T }>(sql, params)).rows[0].r;
+  type Seed = { kind: string; status: string; required?: boolean };
+  /** A list of contact A at `status`, with `items`, written as the database superuser inside the session. */
+  async function seedList(tx: Tx, status: 'sent' | 'submitted', items: Seed[]): Promise<{ listId: string; ids: string[] }> {
+    await becomeSuperuser(tx);
+    const listId = await one<string>(tx,
+      `INSERT INTO public.needs_lists (contact_id, title, status, sent_at, submitted_at)
+       VALUES ($1, 'Closing', $2::text, now(), CASE WHEN $2::text = 'submitted' THEN now() END) RETURNING id AS r`, [contactA, status]);
+    const ids: string[] = [];
+    for (const [i, it] of items.entries()) {
+      ids.push(await one<string>(tx,
+        `INSERT INTO public.needs_items (list_id, kind, label, status, required, sort_order)
+         VALUES ($1, $2, 'x', $3, $4, $5) RETURNING id AS r`, [listId, it.kind, it.status, it.required ?? it.kind !== 'info', i]));
+    }
+    return { listId, ids };
+  }
+  const listRow = async (tx: Tx, id: string) =>
+    (await tx.query<{ status: string; closed: boolean }>(
+      `SELECT status, closed_at IS NOT NULL AS closed FROM public.needs_lists WHERE id = $1`, [id])).rows[0];
+  const accept = (tx: Tx, ids: string[]) =>
+    tx.query(`UPDATE public.needs_items SET status = 'reviewed' WHERE id = ANY($1::uuid[]) AND status = 'fulfilled'`, [ids]);
+
+  it('the owner accepting the last answer closes the list', async () => {
+    await session(db, owner, async (tx) => {
+      const { listId, ids } = await seedList(tx, 'sent', [
+        { kind: 'question', status: 'fulfilled' }, { kind: 'todo', status: 'reviewed' }, { kind: 'info', status: 'pending' },
+      ]);
+      await become(tx, owner);
+      await accept(tx, [ids[0]]);
+      expect(await listRow(tx, listId)).toEqual({ status: 'closed', closed: true });
+    });
+  });
+
+  it('accept all closes the list in the one statement', async () => {
+    await session(db, owner, async (tx) => {
+      const { listId, ids } = await seedList(tx, 'submitted', [
+        { kind: 'question', status: 'fulfilled' }, { kind: 'document', status: 'fulfilled' }, { kind: 'todo', status: 'fulfilled' },
+      ]);
+      await become(tx, owner);
+      await accept(tx, ids);
+      expect(await listRow(tx, listId)).toEqual({ status: 'closed', closed: true });
+    });
+  });
+
+  it('stays open while an answer waits to be accepted, and locks the list as it checks', async () => {
+    // Committed first: a row this transaction wrote already carries its id, so the lock
+    // check needs a list written before it. Removed again below.
+    const listId = await list(contactA, 'submitted', 'Lock check');
+    const first = await item(listId, 'question', { status: 'fulfilled' });
+    await item(listId, 'todo', { status: 'fulfilled' });
+    try {
+      await session(db, owner, async (tx) => {
+        expect(await lockedByMe(tx, 'needs_lists', listId)).toBe(false);
+        await accept(tx, [first]);
+        // The lock is what lets two accepts at once read each other's (0014's header).
+        expect(await lockedByMe(tx, 'needs_lists', listId)).toBe(true);
+        expect(await listRow(tx, listId)).toEqual({ status: 'submitted', closed: false });
+      });
+    } finally {
+      await db.query(`DELETE FROM public.needs_lists WHERE id = $1`, [listId]);
+    }
+  });
+
+  it('a sent list waits for every item; once submitted, only for the required ones', async () => {
+    for (const [status, expected] of [['sent', 'sent'], ['submitted', 'closed']] as const) {
+      await session(db, owner, async (tx) => {
+        const { listId, ids } = await seedList(tx, status, [
+          { kind: 'question', status: 'fulfilled' }, { kind: 'document', status: 'pending', required: false },
+        ]);
+        await become(tx, owner);
+        await accept(tx, [ids[0]]);
+        expect((await listRow(tx, listId)).status, status).toBe(expected);
+      });
+    }
+  });
+
+  it('a submit after every required answer was accepted closes the list, and submit still reports submitted', async () => {
+    await session(db, asServer, async (tx) => {
+      const { listId } = await seedList(tx, 'sent', [
+        { kind: 'todo', status: 'reviewed' }, { kind: 'question', status: 'pending', required: false },
+      ]);
+      await become(tx, asServer);
+      expect(await one(tx, `SELECT public.needs_client_submit($1, $2) AS r`, [contactA, listId])).toBe('submitted');
+      expect(await listRow(tx, listId)).toEqual({ status: 'closed', closed: true });
+    });
+  });
+
+  it('a list with nothing to answer never closes on its own', async () => {
+    await session(db, asServer, async (tx) => {
+      const { listId } = await seedList(tx, 'sent', [{ kind: 'info', status: 'pending' }]);
+      await become(tx, asServer);
+      await tx.query(`UPDATE public.needs_lists SET status = 'submitted', submitted_at = now() WHERE id = $1`, [listId]);
+      expect((await listRow(tx, listId)).status).toBe('submitted');
+    });
+  });
+
+  it('an answer arriving is never a reason to close, and a closed list stays closed', async () => {
+    await session(db, asServer, async (tx) => {
+      const { listId, ids } = await seedList(tx, 'sent', [{ kind: 'todo', status: 'pending' }]);
+      await become(tx, asServer);
+      await tx.query(`UPDATE public.needs_items SET status = 'fulfilled' WHERE id = $1`, [ids[0]]);
+      expect(await listRow(tx, listId)).toEqual({ status: 'sent', closed: false });
+      await tx.query(`UPDATE public.needs_lists SET status = 'closed', closed_at = now() WHERE id = $1`, [listId]);
+      await tx.query(`UPDATE public.needs_items SET status = 'reviewed' WHERE id = $1`, [ids[0]]);
+      await tx.query(`UPDATE public.needs_items SET status = 'fulfilled' WHERE id = $1`, [ids[0]]);
+      expect((await listRow(tx, listId)).status).toBe('closed');
+    });
+  });
+
+  it('closing on its own expires the list start links, as a close by hand does', async () => {
+    await session(db, owner, async (tx) => {
+      const { listId, ids } = await seedList(tx, 'sent', [{ kind: 'todo', status: 'fulfilled' }]);
+      await tx.query(
+        `INSERT INTO public.pending_signup_requests (email, contact_id, needs_list_id, token_hash, expires_at)
+         VALUES ('ada@example.com', $1, $2, $3, now() + interval '14 days')`, [contactA, listId, HASH('c')]);
+      await become(tx, owner);
+      await accept(tx, ids);
+      await becomeSuperuser(tx);
+      expect(await one(tx, `SELECT status AS r FROM public.pending_signup_requests WHERE needs_list_id = $1`, [listId])).toBe('expired');
+    });
+  });
+
+  it('the migration closes the lists that were already finished, and only those', async () => {
+    const sql = readFileSync(path.resolve(__dirname, '..', '..', '..', 'supabase', 'migrations', '0014_requests.sql'), 'utf8');
+    const backfill = sql.split('-- 3. Close the lists that were already finished')[1];
+    expect(backfill).toMatch(/UPDATE public\.needs_lists/);
+    await session(db, asServer, async (tx) => {
+      const done = (await seedList(tx, 'sent', [{ kind: 'todo', status: 'reviewed' }, { kind: 'info', status: 'pending' }])).listId;
+      const doneSubmitted = (await seedList(tx, 'submitted', [
+        { kind: 'todo', status: 'reviewed' }, { kind: 'question', status: 'pending', required: false },
+      ])).listId;
+      const waiting = (await seedList(tx, 'submitted', [{ kind: 'todo', status: 'fulfilled' }])).listId;
+      const owed = (await seedList(tx, 'sent', [{ kind: 'todo', status: 'reviewed' }, { kind: 'todo', status: 'pending', required: false }])).listId;
+      const empty = (await seedList(tx, 'sent', [{ kind: 'info', status: 'pending' }])).listId;
+      await tx.exec(backfill);
+      expect(await listRow(tx, done)).toEqual({ status: 'closed', closed: true });
+      expect((await listRow(tx, doneSubmitted)).status).toBe('closed');
+      for (const id of [waiting, owed, empty]) expect((await listRow(tx, id)).status, id).not.toBe('closed');
+      expect((await listRow(tx, sentA)).status).toBe('sent');
+      expect((await listRow(tx, draftA)).status).toBe('draft');
+    });
   });
 });

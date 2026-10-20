@@ -1,39 +1,39 @@
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useState } from 'react';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Inbox, Plus } from 'lucide-react';
-import { EmptyState, PAGE, PageHeader, Panel } from '@/components/layout/page';
+import { EmptyState, PAGE, PageHeader } from '@/components/layout/page';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ToneBadge } from '@/components/ui/tone-badge';
-import { ContactPicker } from '@/components/contacts/ContactPicker';
 import { contactDisplayName, getContact, isUuid, listContacts } from '@/api/contacts';
 import { queryKeys } from '@/api/queryKeys';
 import type { ContactTabProps } from '@/features/types';
 import { links } from '@/features/links';
 import { getErrorMessage } from '@/lib/errors';
-import { formatDate } from '@/lib/format';
 import { getRequest, listRequests } from './api';
-import { requestKeys } from './keys';
-import { LIST_STATUS_LABELS, listProgress, requestSections, type RequestWithItems } from './lib/requests';
+import { LIST_REFRESH, requestKeys } from './keys';
 import { RequestBuilder } from './components/RequestBuilder';
-import { DeleteRequestButton, LIST_TONES, RequestDetail } from './components/RequestDetail';
+import { DeleteRequestButton, RequestDetail } from './components/RequestDetail';
+import { NewRequestDialog } from './components/NewRequestDialog';
+import { RequestRoster } from './components/RequestRoster';
 
-/** The owner's requests: what was handed back first, then what is waiting, drafts, and closed. */
+/** The owner's requests, every contact's, grouped by whose move it is. */
 export function RequestsPage() {
-  const navigate = useNavigate();
-  const requests = useQuery({ queryKey: requestKeys.lists(), queryFn: () => listRequests() });
+  const [newOpen, setNewOpen] = useState(false);
+  const requests = useQuery({ queryKey: requestKeys.lists(), queryFn: () => listRequests(), ...LIST_REFRESH });
   const contacts = useQuery({ queryKey: queryKeys.contacts.list(), queryFn: listContacts });
   const names = new Map((contacts.data ?? []).map((c) => [c.id, contactDisplayName(c)]));
-  const sections = requestSections(requests.data ?? []);
   const waiting = (requests.data ?? []).filter((r) => r.status === 'sent').length;
+  const newButton = (
+    <Button size="sm" onClick={() => setNewOpen(true)}>
+      <Plus aria-hidden /> New request
+    </Button>
+  );
 
   return (
     <>
-      <PageHeader
-        title="Requests"
-        subtitle={requests.data ? `${waiting} waiting on clients` : undefined}
-        actions={<NewRequestPicker onPick={(id) => navigate(links.newRequest(id))} />}
-      />
+      <PageHeader title="Requests" subtitle={requests.data ? `${waiting} waiting on clients` : undefined} actions={newButton} />
       <div className={`${PAGE} flex flex-col gap-4`}>
         {requests.isPending && <Skeleton className="h-24 w-full" />}
         {requests.error && (
@@ -46,48 +46,13 @@ export function RequestsPage() {
             icon={<Inbox />}
             title="No requests yet"
             description="Ask a client for documents, answers or tasks, and follow what comes back."
+            action={newButton}
           />
         )}
-        {sections.map((section) => (
-          <Panel key={section.status} title={`${LIST_STATUS_LABELS[section.status]} (${section.lists.length})`} bodyClassName="divide-y divide-border">
-            {section.lists.map((r) => (
-              <RequestRow key={r.id} request={r} contactName={names.get(r.contact_id) ?? null} />
-            ))}
-          </Panel>
-        ))}
+        {requests.data && <RequestRoster requests={requests.data} contactName={(id) => names.get(id) ?? null} />}
       </div>
+      <NewRequestDialog open={newOpen} onOpenChange={setNewOpen} />
     </>
-  );
-}
-
-function NewRequestPicker({ onPick }: { onPick: (contactId: string) => void }) {
-  return (
-    <ContactPicker grouped onSelect={(c) => onPick(c.id)}>
-      <Button size="sm" aria-label="New request: choose a contact">
-        <Plus aria-hidden /> New request
-      </Button>
-    </ContactPicker>
-  );
-}
-
-/** One request in a list: its title, who it is for, its status and progress. */
-export function RequestRow({ request, contactName }: { request: RequestWithItems; contactName: string | null }) {
-  const progress = listProgress(request.items);
-  const when = request.sent_at ? `Sent ${formatDate(request.sent_at)}` : `Created ${formatDate(request.created_at)}`;
-  return (
-    <Link to={links.request(request.id)} className="flex flex-col gap-1 px-4 py-2.5 hover:bg-accent/50 sm:flex-row sm:items-center sm:gap-3">
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-[14px] font-medium">{request.title}</p>
-        <p className="truncate text-[12px] text-muted-foreground">{[contactName, when].filter(Boolean).join(' · ')}</p>
-      </div>
-      <div className="flex shrink-0 flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
-        {request.status !== 'draft' && <span className="tabular-nums">{`${progress.fulfilled} of ${progress.actionable} answered`}</span>}
-        {progress.awaitingAccept > 0 && (request.status === 'sent' || request.status === 'submitted') && (
-          <ToneBadge variant="warning">{`${progress.awaitingAccept} to accept`}</ToneBadge>
-        )}
-        <ToneBadge variant={LIST_TONES[request.status]}>{LIST_STATUS_LABELS[request.status]}</ToneBadge>
-      </div>
-    </Link>
   );
 }
 
@@ -102,7 +67,7 @@ function useContactName(contactId: string | null) {
 
 /** /requests/new?contact=<id>: the builder, for one contact. */
 export function NewRequestPage() {
-  const navigate = useNavigate();
+  const [pickOpen, setPickOpen] = useState(false);
   const [params] = useSearchParams();
   const raw = params.get('contact') ?? undefined;
   const contactId = isUuid(raw) ? raw : null;
@@ -116,13 +81,18 @@ export function NewRequestPage() {
           <EmptyState
             icon={<Inbox />}
             title="Choose who the request is for"
-            action={<NewRequestPicker onPick={(id) => navigate(links.newRequest(id), { replace: true })} />}
+            action={
+              <Button size="sm" onClick={() => setPickOpen(true)}>
+                Choose a contact
+              </Button>
+            }
           />
         )}
         {contactId && contact.isPending && <Skeleton className="h-40 w-full" />}
         {contactId && contact.isSuccess && !contact.data && <p className="text-[13px] text-muted-foreground">This contact no longer exists.</p>}
         {contactId && contact.data && <RequestBuilder contactId={contactId} contactName={name ?? 'this contact'} />}
       </div>
+      <NewRequestDialog open={pickOpen} onOpenChange={setPickOpen} />
     </>
   );
 }
@@ -135,6 +105,11 @@ export function RequestPage() {
     queryKey: requestKeys.detail(requestId ?? ''),
     queryFn: () => getRequest(requestId!),
     enabled: requestId !== null,
+    // A sent request follows the client's answers; a draft is in the builder, where a
+    // refetch would replace what is being typed.
+    ...LIST_REFRESH,
+    refetchInterval: (q) => (q.state.data && q.state.data.status !== 'draft' ? LIST_REFRESH.refetchInterval : false),
+    refetchOnWindowFocus: (q) => (q.state.data && q.state.data.status !== 'draft' ? 'always' : false),
   });
   const { name } = useContactName(request.data?.contact_id ?? null);
   const data = request.data;
@@ -190,8 +165,7 @@ export function RequestPage() {
 
 /** A contact's Requests tab. */
 export function RequestsTab({ contactId }: ContactTabProps) {
-  const requests = useQuery({ queryKey: requestKeys.forContact(contactId), queryFn: () => listRequests(contactId) });
-  const sections = requestSections(requests.data ?? []);
+  const requests = useQuery({ queryKey: requestKeys.forContact(contactId), queryFn: () => listRequests(contactId), ...LIST_REFRESH });
   return (
     <div className="flex flex-col gap-4">
       <div className="flex justify-end">
@@ -208,13 +182,7 @@ export function RequestsTab({ contactId }: ContactTabProps) {
         </p>
       )}
       {requests.data?.length === 0 && <EmptyState icon={<Inbox />} title="No requests for this contact" description="Ask for documents, answers or tasks." />}
-      {sections.map((section) => (
-        <Panel key={section.status} title={`${LIST_STATUS_LABELS[section.status]} (${section.lists.length})`} bodyClassName="divide-y divide-border">
-          {section.lists.map((r) => (
-            <RequestRow key={r.id} request={r} contactName={null} />
-          ))}
-        </Panel>
-      ))}
+      {requests.data && <RequestRoster requests={requests.data} />}
     </div>
   );
 }
