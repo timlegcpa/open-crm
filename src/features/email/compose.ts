@@ -1,4 +1,4 @@
-import type { ContactListRow } from '@/api/contacts';
+import { isArchived, type ContactListRow } from '@/api/contacts';
 import { isEmailableStatus } from '@/lib/contactStatus';
 import { isEdgeError } from '@/lib/edgeCore';
 
@@ -18,8 +18,8 @@ export interface Skipped {
 }
 
 /**
- * A PREVIEW of the server's decision, from the same facts: the status may be emailed and
- * contacts.email (which the database keeps equal to the default primary address) is set.
+ * A PREVIEW of the server's decision, from the same facts: the contact is not archived, the
+ * status may be emailed and contacts.email (which the database keeps equal to the default primary address) is set.
  * The server re-resolves every recipient from the ids and applies suppression itself; the
  * browser never supplies an address to send to.
  */
@@ -30,7 +30,8 @@ export function splitRecipients(
   const eligible: ContactListRow[] = [];
   const skipped: Skipped[] = [];
   for (const c of contacts) {
-    if (!isEmailableStatus(c.status)) skipped.push({ contact: c, why: `${statusLabel(c.status)} is never emailed` });
+    if (isArchived(c)) skipped.push({ contact: c, why: 'Archived' });
+    else if (!isEmailableStatus(c.status)) skipped.push({ contact: c, why: `${statusLabel(c.status)} is never emailed` });
     else if (!c.email?.trim()) skipped.push({ contact: c, why: 'No email address' });
     else eligible.push(c);
   }

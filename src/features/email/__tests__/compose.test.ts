@@ -30,6 +30,15 @@ describe('splitRecipients', () => {
   });
 });
 
+describe('splitRecipients and the archive', () => {
+  it('skips an archived contact as "Archived", whatever its status and address', () => {
+    const archived = { ...row(id(5), 'client', 'grace@example.com'), archived_at: '2026-03-05T10:00:00Z' };
+    const { eligible, skipped } = splitRecipients([row(id(1), 'client', 'ada@example.com'), archived], (key) => key);
+    expect(eligible.map((c) => c.id)).toEqual([id(1)]);
+    expect(skipped).toEqual([{ contact: archived, why: 'Archived' }]);
+  });
+});
+
 describe('idsFromQuery', () => {
   it('reads valid ids once each and drops the rest', () => {
     expect(idsFromQuery(`${id(1)},junk,${id(1)}, ${id(2)}`, isUuid)).toEqual([id(1), id(2)]);

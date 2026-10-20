@@ -290,16 +290,16 @@ describe('contact relationships', () => {
     expect(fake.calls('contact_relationships', 'delete')[0].filters).toEqual([{ type: 'eq', column: 'id', value: 'r1' }]);
   });
 
-  it('lists links in both directions with the other contact named', async () => {
-    fake.state.tables.contacts = [contactRow(A, 'Ada'), contactRow(B, 'Bo', 'Example'), contactRow(C, 'Cy')];
+  it('lists links in both directions with the other contact named, and says which is archived', async () => {
+    fake.state.tables.contacts = [contactRow(A, 'Ada'), contactRow(B, 'Bo', 'Example'), contactRow(C, 'Cy', '', { archived_at: '2026-03-05T10:00:00Z' })];
     fake.state.tables.contact_relationships = [
       { id: 'r1', contact_id: A, related_contact_id: B, relationship: 'spouse', created_at: '2026-01-01' },
       { id: 'r2', contact_id: C, related_contact_id: A, relationship: 'dependent', created_at: '2026-01-02' },
       { id: 'r3', contact_id: B, related_contact_id: C, relationship: 'other', created_at: '2026-01-03' },
     ];
     expect(await listHousehold(A)).toEqual([
-      { id: 'r1', relationship: 'spouse', direction: 'outgoing', otherId: B, otherName: 'Bo Example' },
-      { id: 'r2', relationship: 'dependent', direction: 'incoming', otherId: C, otherName: 'Cy' },
+      { id: 'r1', relationship: 'spouse', direction: 'outgoing', otherId: B, otherName: 'Bo Example', otherArchived: false },
+      { id: 'r2', relationship: 'dependent', direction: 'incoming', otherId: C, otherName: 'Cy', otherArchived: true },
     ]);
   });
 

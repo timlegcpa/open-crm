@@ -15,6 +15,12 @@ export interface ContactListRow {
   business_name: string | null;
   status: string;
   source: string;
+  /**
+   * When the contact was archived (taken off every working list, record kept), else null.
+   * A second axis beside the status, which archiving leaves alone: see isArchived. Every
+   * list read selects it; optional so a row built by hand (a fixture) may leave it out.
+   */
+  archived_at?: string | null;
 }
 
 /**
@@ -52,7 +58,18 @@ export interface Contact extends ContactListRow {
   mailing_state: string | null;
   mailing_zip: string | null;
   client_since: string | null;
+  /** The owner's hand-set client ranking (src/features/crm/lib/tiers.ts); null = not ranked. */
+  tier: string | null;
   contact_services: ContactService[];
+}
+
+/**
+ * Whether a contact is archived: off the index, the pipeline board, the table, the tiers,
+ * every contact picker and group email, while its record stays whole and reachable. Every
+ * working list filters with this one predicate, never its own reading of the column.
+ */
+export function isArchived(c: { archived_at?: string | null }): boolean {
+  return c.archived_at != null;
 }
 
 /** The name to show for a contact: the person, else the business. */
@@ -70,7 +87,7 @@ export const CONTACT_SERVICE_COLUMNS =
 const CONTACT_COLUMNS =
   'id, created_at, updated_at, submitted_at, first_name, last_name, full_name, email, phone, business_name, ' +
   'spouse_first_name, spouse_last_name, spouse_name, spouse_email, spouse_phone, mailing_street, mailing_city, ' +
-  `mailing_state, mailing_zip, status, source, client_since, contact_services(${CONTACT_SERVICE_COLUMNS})`;
+  `mailing_state, mailing_zip, status, source, client_since, tier, archived_at, contact_services(${CONTACT_SERVICE_COLUMNS})`;
 
 // Same pattern as supabase/functions/_shared/http.ts, so an id the browser accepts is
 // never refused by an edge function. src/__tests__/edge/uuidParity.test.ts pins it.
@@ -167,6 +184,8 @@ export const CONTACT_PATCH_COLUMNS = [
   'source',
   'status',
   'client_since',
+  'tier',
+  'archived_at',
 ] as const;
 
 export type ContactPatchColumn = (typeof CONTACT_PATCH_COLUMNS)[number];
@@ -218,20 +237,18 @@ export interface BulkStatusResult {
 }
 
 /**
- * Sets the status of many contacts. Every selected row is written, whatever the cache
- * says its status is, and only the ids the server returns count as updated: a row that
- * is gone or out of reach comes back as failed. A row already at the target gets no new
- * history entry (the database records history only on a change). client_since is the
- * database's to stamp (see statusChangePatch).
+ * One write to many contacts. Every selected row is written, whatever the cache says, and
+ * only the ids the server returns count as updated: a row that is gone or out of reach
+ * comes back as failed, so the caller keeps it selected for a retry.
  */
-export async function bulkUpdateStatus(ids: readonly string[], status: string): Promise<BulkStatusResult> {
+async function bulkUpdate(ids: readonly string[], values: ContactPatch, failure: string): Promise<BulkStatusResult> {
   const written = new Set<string>();
   let error: string | null = null;
   for (let i = 0; i < ids.length; i += BULK_CHUNK) {
     const chunk = ids.slice(i, i + BULK_CHUNK);
-    const result = await getSupabase().from('contacts').update({ status }).in('id', chunk).select('id');
+    const result = await getSupabase().from('contacts').update(values).in('id', chunk).select('id');
     if (result.error) {
-      error = getErrorMessage(result.error, 'The status change failed.');
+      error = getErrorMessage(result.error, failure);
       break;
     }
     for (const row of (result.data ?? []) as Array<{ id: string }>) written.add(row.id);
@@ -239,6 +256,24 @@ export async function bulkUpdateStatus(ids: readonly string[], status: string): 
   const failedIds = ids.filter((id) => !written.has(id));
   if (!error && failedIds.length > 0) error = 'Some contacts were not changed. They may have been deleted.';
   return { requested: ids.length, updated: ids.length - failedIds.length, failedIds, error };
+}
+
+/**
+ * Sets the status of many contacts. A row already at the target gets no new history entry
+ * (the database records history only on a change). client_since is the database's to
+ * stamp (see statusChangePatch).
+ */
+export function bulkUpdateStatus(ids: readonly string[], status: string): Promise<BulkStatusResult> {
+  return bulkUpdate(ids, { status }, 'The status change failed.');
+}
+
+/**
+ * Archives (or restores) many contacts. The status is not touched, so a restored contact is
+ * back at the stage it left. The database stamps the archive time itself; the value sent
+ * only says "archived".
+ */
+export function bulkSetArchived(ids: readonly string[], archived: boolean): Promise<BulkStatusResult> {
+  return bulkUpdate(ids, { archived_at: archived ? new Date().toISOString() : null }, archived ? 'The archive failed.' : 'The restore failed.');
 }
 
 const DELETE_IN_PROGRESS_MESSAGE = 'This contact is already being deleted. Try again in a moment.';

@@ -119,7 +119,7 @@ afterEach(() => setWide(false));
 
 describe('contacts index', () => {
   it('puts every contact under its status section, titled from the table, clients as "Last, First"', async () => {
-    renderAt('/contacts');
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
     expect(screen.getByRole('region', { name: 'New' })).toHaveTextContent('Ada Example');
     expect(screen.getByRole('region', { name: 'Hot' })).toHaveTextContent('Cy Test');
@@ -128,13 +128,13 @@ describe('contacts index', () => {
 
   it('shows a renamed status label straight from the table', async () => {
     fake.state.tables.contact_statuses[0].label = 'Fresh enquiry';
-    renderAt('/contacts');
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
     expect(screen.getByRole('region', { name: 'Fresh enquiry' })).toHaveTextContent('Ada Example');
   });
 
   it('searches name, email, business, phone digits and the spouse', async () => {
-    renderAt('/contacts');
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
     const search = screen.getByLabelText('Search contacts');
     fireEvent.change(search, { target: { value: 'bo@example' } });
@@ -149,29 +149,129 @@ describe('contacts index', () => {
     expect(screen.getByText('No contacts match.')).toBeInTheDocument();
   });
 
-  it('switches between All, Clients and Leads, remembers the choice, and clears the selection', async () => {
+  it('opens on Clients: every client, one-time clients included, in ONE A-Z list', async () => {
+    fake.state.tables.contacts.push(
+      contact('10000000-0000-4000-8000-00000000000d', 'Di', 'Able', { status: 'one_time' }),
+      contact('10000000-0000-4000-8000-00000000000e', 'Ed', 'Zed', { status: 'client' }),
+    );
     renderAt('/contacts');
+    await screen.findByText('Sample, Bo');
+    expect(screen.getByRole('tab', { name: 'Clients' })).toHaveAttribute('aria-selected', 'true');
+    expect(indexNames()).toEqual(['Able, Di', 'Sample, Bo', 'Zed, Ed']);
+    expect(screen.getByRole('region', { name: 'Clients' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'One-time client' })).toBeNull();
+    // A search reaches everyone, and the clients stay one list.
+    fireEvent.change(screen.getByLabelText('Search contacts'), { target: { value: 'e' } });
+    expect(screen.getByRole('region', { name: 'Clients' })).toHaveTextContent('Able, Di');
+    expect(screen.queryByRole('region', { name: 'One-time client' })).toBeNull();
+    expect(indexNames()).toContain('Ada Example');
+  });
+
+  it('tabs switch the list, are links, are remembered, and clear the selection', async () => {
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
     expect(screen.getByRole('region', { name: 'Selected contacts' })).toHaveTextContent('1 selected');
-    fireEvent.click(screen.getByRole('radio', { name: 'Clients' }));
-    expect(indexNames()).toEqual(['Sample, Bo']);
-    expect(screen.queryByRole('region', { name: 'Selected contacts' })).toBeNull();
-    expect(localStorage.getItem('open-crm:contacts:list')).toBe('"clients"');
-    fireEvent.click(screen.getByRole('radio', { name: 'Leads' }));
+    fireEvent.mouseDown(screen.getByRole('tab', { name: 'Pipeline' }));
+    await waitFor(() => expect(window.location.search).toBe('?tab=pipeline'));
     expect(indexNames()).toEqual(['Ada Example', 'Cy Test']);
+    expect(screen.queryByRole('region', { name: 'Selected contacts' })).toBeNull();
+    expect(localStorage.getItem('open-crm:contacts:tab')).toBe('"pipeline"');
   });
 
-  it('ignores stored preferences of the wrong shape', async () => {
-    localStorage.setItem('open-crm:contacts:list', 'null');
+  it('a bare /contacts opens the remembered tab, and a stored value of the wrong shape falls back to Clients', async () => {
+    localStorage.setItem('open-crm:contacts:tab', '"pipeline"');
+    const first = renderAt('/contacts');
+    await screen.findByText('Ada Example');
+    expect(screen.getByRole('tab', { name: 'Pipeline' })).toHaveAttribute('aria-selected', 'true');
+    first.unmount();
+    localStorage.setItem('open-crm:contacts:tab', 'null');
     localStorage.setItem('open-crm:contacts:collapsed', '3');
     renderAt('/contacts');
+    await screen.findByText('Sample, Bo');
+    expect(screen.getByRole('tab', { name: 'Clients' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('Tiers ranks active clients only, in their tier rows, and holds that during a search', async () => {
+    fake.state.tables.contacts.push(
+      contact('10000000-0000-4000-8000-00000000000d', 'Di', 'Able', { status: 'one_time', tier: 'S' }),
+      contact('10000000-0000-4000-8000-00000000000e', 'Ed', 'Zed', { status: 'client', tier: 'S' }),
+    );
+    renderAt('/contacts?tab=tiers');
+    const s = await screen.findByRole('region', { name: 'S tier' });
+    expect(within(s).getByRole('button', { name: 'Open Zed, Ed' })).toBeInTheDocument();
+    // A one-time client keeps a stored tier but is not ranked here.
+    expect(within(s).queryByRole('button', { name: /Able, Di/ })).toBeNull();
+    expect(within(screen.getByRole('region', { name: 'Not ranked' })).getByRole('button', { name: 'Open Sample, Bo' })).toBeInTheDocument();
+    expect(screen.getAllByRole('region', { name: /tier$|^Not ranked$/ })).toHaveLength(7);
+    // The index beside it holds the active clients, even while searching.
+    expect(indexNames()).toEqual(['Sample, Bo', 'Zed, Ed']);
+    fireEvent.change(screen.getByLabelText('Search contacts'), { target: { value: 'a' } });
+    expect(indexNames()).toEqual(['Sample, Bo']);
+    expect(within(screen.getByRole('region', { name: 'Not ranked' })).getByRole('button', { name: 'Open Sample, Bo' })).toBeInTheDocument();
+  });
+
+  // Below lg the Tiers tab hides the index, yet the search and the board filter still narrow
+  // the tier rows: the controls that clear them must not be hidden with it.
+  it('on a narrow Tiers tab the search and the filter clear sit atop the rows, never in the hidden index', async () => {
+    renderAt('/contacts?tab=tiers&view=unpriced');
+    await screen.findByRole('region', { name: 'Not ranked' });
+    const hidden = (el: HTMLElement) => el.closest('[class~="max-lg:hidden"]') !== null;
+    expect(hidden(screen.getByLabelText('Search contacts'))).toBe(false);
+    expect(hidden(screen.getByRole('button', { name: 'Clear list filter' }))).toBe(false);
+  });
+
+  it('on a wide Tiers tab the search stays atop the index', async () => {
+    setWide(true);
+    renderAt('/contacts?tab=tiers');
+    await screen.findByRole('region', { name: 'Not ranked' });
+    expect(screen.getAllByLabelText('Search contacts')).toHaveLength(1);
+    expect(within(screen.getByLabelText('Search contacts').closest('[class~="lg:w-[300px]"]') as HTMLElement).getByRole('checkbox', { name: 'Select Sample, Bo' })).toBeInTheDocument();
+  });
+
+  it('archived contacts are off every list, and the Archived dialog restores them with the status untouched', async () => {
+    fake.state.tables.contacts[2].archived_at = '2026-03-05T10:00:00Z';
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
-    expect(screen.getByRole('radio', { name: 'All' })).toHaveAttribute('aria-checked', 'true');
+    expect(indexNames()).toEqual(['Ada Example', 'Sample, Bo']);
+    fireEvent.change(screen.getByLabelText('Search contacts'), { target: { value: 'Cy' } });
+    expect(screen.getByText('No contacts match.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Archived (1)' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Archived people' });
+    expect(within(dialog).getByText(/Restores to Hot/)).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Restore Cy Test' }));
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    expect(fake.calls('contacts', 'update')[0].payload).toEqual({ archived_at: null });
+    expect(fake.calls('contacts', 'update')[0].filters[0].value).toEqual([CY]);
+  });
+
+  it('a row archives its contact with archived_at alone, never the status, and offers Undo', async () => {
+    renderAt('/contacts?tab=all');
+    await screen.findByText('Ada Example');
+    fireEvent.click(screen.getByRole('button', { name: 'Archive Ada Example' }));
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    const write = fake.calls('contacts', 'update')[0];
+    expect(Object.keys(write.payload as object)).toEqual(['archived_at']);
+    expect(write.filters[0].value).toEqual([ADA]);
+    expect(await screen.findByText('Ada Example archived. The record is kept.')).toBeInTheDocument();
+    expect(screen.getByText('Archiving does not revoke portal access; turn that off on the record.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Undo' })).toBeInTheDocument();
+  });
+
+  it('a bulk archive the server partly refuses keeps the failures selected', async () => {
+    renderAt('/contacts?tab=all');
+    await screen.findByText('Ada Example');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Cy Test' }));
+    fake.state.errors['contacts:update'] = { message: 'permission denied' };
+    fireEvent.click(within(screen.getByRole('region', { name: 'Selected contacts' })).getByRole('button', { name: 'Archive' }));
+    expect(await screen.findByText(/0 of 2 contacts archived/)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Select Ada Example' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Select Cy Test' })).toBeChecked();
   });
 
   it('bulk status writes every selected row with the status alone (the database stamps client_since)', async () => {
-    renderAt('/contacts');
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Cy Test' }));
@@ -185,7 +285,7 @@ describe('contacts index', () => {
   });
 
   it('"Email them" opens a group email to exactly the selected contacts', async () => {
-    renderAt('/contacts');
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Cy Test' }));
@@ -194,7 +294,7 @@ describe('contacts index', () => {
   });
 
   it('a bulk status the server refuses says so and keeps the contacts selected', async () => {
-    renderAt('/contacts');
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Cy Test' }));
@@ -206,15 +306,15 @@ describe('contacts index', () => {
     expect(screen.getByRole('checkbox', { name: 'Select Cy Test' })).toBeChecked();
   });
 
-  it('offers the Layout switch only on wide screens, where the board and table live', async () => {
-    renderAt('/contacts');
+  it('on a narrow screen the Table tab is the list alone: the table lives on wide screens', async () => {
+    renderAt('/contacts?tab=table');
     await screen.findByText('Ada Example');
-    expect(screen.queryByRole('radiogroup', { name: 'Layout' })).toBeNull();
+    expect(screen.queryByText(/contacts in view/)).toBeNull();
   });
 
   it('bulk delete calls the edge function per contact and reports a partial failure honestly', async () => {
     fake.state.invokeResults[BO] = { data: null, error: functionsHttpError(409, { error: 'delete_in_progress' }) };
-    renderAt('/contacts');
+    renderAt('/contacts?tab=all');
     await screen.findByText('Ada Example');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Sample, Bo' }));
@@ -248,7 +348,7 @@ describe('contacts index', () => {
 
   it('clears every cached query on sign-out', async () => {
     renderAt('/contacts');
-    await screen.findByText('Ada Example');
+    await screen.findByText('Sample, Bo');
     expect(queryClient.getQueryCache().getAll().length).toBeGreaterThan(0);
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
@@ -259,7 +359,7 @@ describe('contacts index', () => {
 
   it('redirects / to the contacts page', async () => {
     renderAt('/');
-    expect(await screen.findByText('Ada Example')).toBeInTheDocument();
+    expect(await screen.findByText('Sample, Bo')).toBeInTheDocument();
     expect(window.location.pathname).toBe('/contacts');
   });
 
@@ -353,20 +453,30 @@ describe('board and table (wide screens)', () => {
   });
 
   it('a column heading filters the index with ?view=, and an unknown view filters nothing', async () => {
-    renderAt('/contacts?view=nonsense');
+    renderAt('/contacts?tab=all&view=nonsense');
     const hot = await screen.findByRole('region', { name: 'Hot column' });
     expect(indexNames()).toHaveLength(3);
     fireEvent.click(within(hot).getAllByRole('button', { pressed: false })[0]);
     await waitFor(() => expect(indexNames()).toEqual(['Cy Test']));
-    expect(window.location.search).toBe('?view=leads_hot');
+    expect(window.location.search).toBe('?tab=all&view=leads_hot');
   });
 
-  it('the Table view counts what is in view and is remembered', async () => {
+  it('the Table tab counts what is in view and is remembered', async () => {
     renderAt('/contacts');
     await screen.findByRole('region', { name: 'Hot column' });
-    fireEvent.click(screen.getByRole('radio', { name: 'Table' }));
+    fireEvent.mouseDown(screen.getByRole('tab', { name: 'Table' }));
     expect(await screen.findByText('3 of 3 contacts in view')).toBeInTheDocument();
-    expect(localStorage.getItem('open-crm:contacts:layout')).toBe('"table"');
+    expect(localStorage.getItem('open-crm:contacts:tab')).toBe('"table"');
+  });
+
+  it('a card archives its person off the board, and the board never shows an archived one', async () => {
+    fake.state.tables.contacts.push(contact('10000000-0000-4000-8000-00000000000d', 'Di', 'Gone', { status: 'hot', archived_at: '2026-03-05T10:00:00Z' }));
+    renderAt('/contacts');
+    const hot = await screen.findByRole('region', { name: 'Hot column' });
+    expect(within(hot).queryByRole('button', { name: 'Show Di Gone' })).toBeNull();
+    fireEvent.click(within(hot).getByRole('button', { name: 'Archive Cy Test' }));
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    expect(Object.keys(fake.calls('contacts', 'update')[0].payload as object)).toEqual(['archived_at']);
   });
 });
 
@@ -468,7 +578,8 @@ describe('intake', () => {
 
 /** Opens an in-place field by its display button, types, and presses Enter. */
 async function editField(label: string, value: string) {
-  fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^${label}:`) }));
+  // The Overview's field: the right bar's quick edit repeats some of them after it.
+  fireEvent.click((await screen.findAllByRole('button', { name: new RegExp(`^${label}:`) }))[0]);
   const input = await screen.findByRole(label === 'Phone' ? 'textbox' : 'textbox', { name: label });
   fireEvent.change(input, { target: { value } });
   fireEvent.keyDown(input, { key: 'Enter' });
@@ -580,6 +691,34 @@ describe('record overview', () => {
     renderAt('/contacts/not-a-uuid');
     expect(await screen.findByText('Contact not found')).toBeInTheDocument();
     expect(fake.state.calls.filter((c) => c.op !== 'select')).toEqual([]);
+  });
+
+  it('archives from the More menu with archived_at alone, and stays on the record', async () => {
+    renderAt(`/contacts/${ADA}`);
+    await screen.findByRole('heading', { name: 'Ada Example' });
+    fireEvent.keyDown(screen.getByRole('button', { name: 'More actions' }), { key: 'Enter' });
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Archive contact' }));
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    expect(Object.keys(fake.calls('contacts', 'update')[0].payload as object)).toEqual(['archived_at']);
+    expect(window.location.pathname).toBe(`/contacts/${ADA}`);
+  });
+
+  it('an archived record opens by link, says so, and Restore clears the archive alone', async () => {
+    fake.state.tables.contacts[0].archived_at = '2026-03-05T10:00:00Z';
+    renderAt(`/contacts/${ADA}`);
+    await screen.findByRole('heading', { name: 'Ada Example' });
+    expect(screen.getByText('Archived')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Restore' }));
+    await waitFor(() => expect(fake.calls('contacts', 'update')).toHaveLength(1));
+    expect(fake.calls('contacts', 'update')[0].payload).toEqual({ archived_at: null });
+  });
+
+  it('the header carries the tier mark; the index rows never do', async () => {
+    fake.state.tables.contacts[1].tier = 'A';
+    renderAt(`/contacts/${BO}?tab=all`);
+    await screen.findByRole('heading', { name: 'Bo Sample' });
+    expect(screen.getByRole('img', { name: 'A tier' })).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Client' })).queryByRole('img', { name: /tier/ })).toBeNull();
   });
 
   it('deletes through the edge function from the More menu and returns to the list', async () => {
@@ -694,7 +833,7 @@ describe('billing', () => {
     renderAt(`/contacts/${ADA}/billing`);
     fireEvent.click(await screen.findByRole('button', { name: 'Add organization' }));
     fireEvent.change(await screen.findByLabelText('Name'), { target: { value: '  acme   llc ' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Add' }));
     expect(await screen.findByText(/Acme LLC is already on this contact/)).toBeInTheDocument();
     expect(fake.calls('organizations', 'insert')).toEqual([]);
   });

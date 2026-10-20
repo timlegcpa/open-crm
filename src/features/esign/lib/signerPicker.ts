@@ -13,6 +13,7 @@
  * the address) hides the primary once the co-signer is added first. The id is only a
  * fallback, for a primary with no address at all.
  */
+import { isArchived } from '@/api/contacts';
 import { matchesContactSearch } from '@/lib/contactSearch';
 
 export interface SignerPickerContact {
@@ -28,6 +29,8 @@ export interface SignerPickerContact {
   spouse_last_name: string | null;
   spouse_email: string | null;
   spouse_phone: string | null;
+  /** Set when the contact is archived: off every working list, this picker included. */
+  archived_at?: string | null;
 }
 
 export interface SignerPickerOption {
@@ -68,8 +71,8 @@ function displayName(c: SignerPickerContact): string {
 }
 
 /**
- * Everyone who can still be added: lost contacts never, anyone whose address is already on
- * the envelope never.
+ * Everyone who can still be added: lost and archived contacts never (isArchived), anyone
+ * whose address is already on the envelope never.
  *
  * @param existingEmails     addresses already on the envelope, lowercased
  * @param existingContactIds contact ids already on the envelope (fallback only)
@@ -80,7 +83,7 @@ export function buildSignerPickerOptions(
   existingContactIds: ReadonlySet<string>,
 ): SignerPickerOption[] {
   const ordered = contacts
-    .filter((c) => !!c.id && c.status !== 'lost')
+    .filter((c) => !!c.id && c.status !== 'lost' && !isArchived(c))
     .sort((a, b) => {
       const sa = STATUS_ORDER[a.status ?? ''] ?? 99;
       const sb = STATUS_ORDER[b.status ?? ''] ?? 99;

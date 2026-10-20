@@ -8,6 +8,7 @@ import { getErrorMessage } from '@/lib/errors';
 import { toast } from '@/components/ui/sonner';
 import {
   createMonthlyGoal,
+  dropArchivedUpsells,
   joinQuotes,
   listContactStatuses,
   listLeadSources,
@@ -34,7 +35,8 @@ export type ContactField = 'source' | 'status' | 'client_since';
  * The three contact-side reads are invalidated together (they share the `contacts` prefix),
  * so an upsell is never summed against a contact list that no longer holds its contact. That
  * is why the upsell rollup can use the shared rule as it stands (an upsell whose contact is
- * not in the map still counts, a guard for reads landing in different orders).
+ * not in the map still counts, a guard for reads landing in different orders). An archived
+ * contact's upsells are dropped first, as its quotes are (dropArchivedUpsells).
  */
 export function useMarketingData() {
   const queryClient = useQueryClient();
@@ -55,9 +57,9 @@ export function useMarketingData() {
     [contactsQ.data, quotesQ.data],
   );
   const upsells = useMemo(() => {
-    if (!upsellsQ.data) return { proposedMRR: 0, proposedARR: 0, proposedAnnual: 0, proposedOneTime: 0 };
-    return aggregateUpsells(upsellsQ.data, new Map(contacts.map((c) => [c.id, c])));
-  }, [upsellsQ.data, contacts]);
+    if (!upsellsQ.data || !contactsQ.data) return { proposedMRR: 0, proposedARR: 0, proposedAnnual: 0, proposedOneTime: 0 };
+    return aggregateUpsells(dropArchivedUpsells(contactsQ.data, upsellsQ.data), new Map(contacts.map((c) => [c.id, c])));
+  }, [upsellsQ.data, contactsQ.data, contacts]);
 
   const sourcesByKey = useByKey(sourcesQ.data);
   const statusesByKey = useByKey(statusesQ.data);

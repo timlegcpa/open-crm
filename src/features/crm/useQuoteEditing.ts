@@ -1,5 +1,5 @@
 import { useCallback } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useIsMutating, useMutation, useQueryClient } from '@tanstack/react-query';
 import type { ContactService } from '@/api/contacts';
 import { queryKeys } from '@/api/queryKeys';
 import { toast } from '@/components/ui/sonner';
@@ -14,6 +14,7 @@ import {
   type NewQuote,
   type QuotePatch,
 } from './api';
+import { contactFieldMutationKey } from './hooks';
 import { contactPatchForQuoteChange, quoteOpMutationKey } from './lib/quotes';
 
 /**
@@ -22,11 +23,15 @@ import { contactPatchForQuoteChange, quoteOpMutationKey } from './lib/quotes';
  * contact patch those quotes imply, all awaited inside one mutation so `busy` spans the
  * whole chain and two edits never derive from the same stale state. The price input is
  * held while `busy` (and while a stage move runs), so no edit starts mid-chain. Every edit for a
- * contact runs under `quoteOpMutationKey`, which the board's stage move waits on.
+ * contact runs under `quoteOpMutationKey`, which the board's stage move and the status fields
+ * wait on. The other way round, every editor (the Billing tab included) waits on the contact's
+ * in-place field save (`contactFieldMutationKey`): `busy` spans it, and an edit that starts
+ * anyway is refused, so a quote never re-derives the status from one about to be replaced.
  */
 export function useQuoteEditing(contact: { id: string }) {
   const queryClient = useQueryClient();
   const contactId = contact.id;
+  const fieldSaving = useIsMutating({ mutationKey: contactFieldMutationKey(contactId) }) > 0;
 
   const quoteOp = useMutation({
     mutationKey: quoteOpMutationKey(contactId),
@@ -49,8 +54,14 @@ export function useQuoteEditing(contact: { id: string }) {
 
   /** Resolves true when the whole chain landed; a failure has already been toasted. */
   const run = useCallback(
-    (op: () => Promise<unknown>) => quoteOp.mutateAsync(op).then(() => true, () => false),
-    [quoteOp],
+    (op: () => Promise<unknown>) => {
+      if (queryClient.isMutating({ mutationKey: contactFieldMutationKey(contactId) }) > 0) {
+        toast('A change to this contact is still saving. Try again in a moment.');
+        return Promise.resolve(false);
+      }
+      return quoteOp.mutateAsync(op).then(() => true, () => false);
+    },
+    [quoteOp, queryClient, contactId],
   );
 
   const patchQuote = useCallback((row: Pick<ContactService, 'id'>, patch: QuotePatch) => run(() => updateQuote(row.id, patch)), [run]);
@@ -60,7 +71,7 @@ export function useQuoteEditing(contact: { id: string }) {
   );
   const removeQuote = useCallback((row: Pick<ContactService, 'id'>) => run(() => deleteQuote(row.id)), [run]);
 
-  return { busy: quoteOp.isPending, run, patchQuote, addQuote, removeQuote };
+  return { busy: quoteOp.isPending || fieldSaving, run, patchQuote, addQuote, removeQuote };
 }
 
 export type QuoteEditing = ReturnType<typeof useQuoteEditing>;

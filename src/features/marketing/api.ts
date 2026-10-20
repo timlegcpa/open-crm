@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { getSupabase } from '@/lib/supabase';
 import { queryKeys } from '@/api/queryKeys';
+import { isArchived } from '@/api/contacts';
 import {
   CONTACT_STATUSES,
   LEAD_SOURCES,
@@ -41,7 +42,7 @@ export const marketingKeys = {
 const amount = z.union([z.number(), z.string()]).nullable();
 
 // The contact columns the page reads, and nothing else: no address, phone or email.
-const CONTACT_COLUMNS = 'id, created_at, submitted_at, full_name, business_name, status, source, client_since';
+const CONTACT_COLUMNS = 'id, created_at, submitted_at, full_name, business_name, status, source, client_since, archived_at';
 
 const contactRow = z.object({
   id: z.string(),
@@ -52,6 +53,7 @@ const contactRow = z.object({
   status: z.string(),
   source: z.string(),
   client_since: z.string().nullable(),
+  archived_at: z.string().nullable().optional(),
 });
 
 const quoteRow = z.object({
@@ -141,7 +143,11 @@ export async function listMonthlyGoals(): Promise<MonthlyGoal[]> {
   return rows.sort((a, b) => b.month.localeCompare(a.month));
 }
 
-/** Quotes joined onto their contacts, so the metrics keep their shape. A quote with no contact is dropped. */
+/**
+ * Quotes joined onto their contacts, so the metrics keep their shape. A quote with no contact
+ * is dropped, and so is an archived contact with its quotes: archiving takes a contact off
+ * every working list, the figures here included.
+ */
 export function joinQuotes(contacts: readonly MarketingContactRow[], quotes: readonly QuoteRow[]): PageContact[] {
   const byContact = new Map<string, MarketingQuote[]>();
   for (const q of quotes) {
@@ -149,7 +155,17 @@ export function joinQuotes(contacts: readonly MarketingContactRow[], quotes: rea
     if (list) list.push(q);
     else byContact.set(q.contact_id, [q]);
   }
-  return contacts.map((c) => ({ ...c, contact_services: byContact.get(c.id) ?? [] }));
+  return contacts.filter((c) => !isArchived(c)).map((c) => ({ ...c, contact_services: byContact.get(c.id) ?? [] }));
+}
+
+/**
+ * The open upsells the figures count: an archived contact's are dropped, as joinQuotes drops
+ * the contact and its quotes (the shared rollup would count an upsell whose contact it cannot
+ * find).
+ */
+export function dropArchivedUpsells(contacts: readonly MarketingContactRow[], upsells: readonly OpenUpsell[]): OpenUpsell[] {
+  const archived = new Set(contacts.filter(isArchived).map((c) => c.id));
+  return upsells.filter((u) => !archived.has(u.contact_id));
 }
 
 // ── Goal writes ─────────────────────────────────────────────────────────────

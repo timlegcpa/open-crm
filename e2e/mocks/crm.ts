@@ -63,6 +63,8 @@ function contact(fields: Row): Row {
     mailing_zip: null,
     source: 'referral',
     client_since: null,
+    tier: null,
+    archived_at: null,
     status_history: [],
     portal_sidebar_config: {},
     contact_services: [],
@@ -85,6 +87,7 @@ export const contacts: Row[] = [
     mailing_zip: '62701',
     status: 'client',
     client_since: '2026-04-01',
+    tier: 'S',
     contact_services: [
       {
         id: '00000000-0000-4000-8000-000000000301',

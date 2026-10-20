@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { Link } from 'react-router-dom';
 import { useIsMutating } from '@tanstack/react-query';
 import {
@@ -15,7 +15,7 @@ import {
   type CollisionDetection,
   type DragEndEvent,
 } from '@dnd-kit/core';
-import { AlertTriangle, Building2, ChevronRight, Filter, Search, Tag, X } from 'lucide-react';
+import { AlertTriangle, Archive, Building2, ChevronRight, Filter, Search, Tag, X } from 'lucide-react';
 import type { Contact } from '@/api/contacts';
 import type { ContactStatus } from '@/api/pickLists';
 import { ContactEmailsManager } from '@/components/contacts/ContactEmailsManager';
@@ -45,7 +45,26 @@ const CompactQuoteEditor = lazy(() => import('../quotes/CompactQuoteEditor').the
 
 const SECTION_HEAD = 'text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground';
 const FIELD_LABEL = 'text-[11px] text-muted-foreground';
-const CARD_CLASS = 'rounded-lg border border-border/70 bg-card p-2.5 shadow-sm';
+// No shadow: surfaces separate by border, and the card's border is the full token so it
+// reads on the lane in both themes. The left edge carries the stage's colour.
+const CARD_CLASS = 'rounded-lg border border-l-[3px] border-border bg-card p-2.5';
+
+const HEX = /^#[0-9a-f]{6}$/;
+
+/**
+ * A stage's colour on the board: a faint wash and a border for its lane, a stronger wash
+ * for the lane's heading, the card's left edge. From `contact_statuses.colour` (the
+ * owner's), drawn only as tints and edges, never as text; no colour draws the plain lane.
+ */
+function stageTone(status: ContactStatus | undefined): { lane?: CSSProperties; head?: CSSProperties; card?: CSSProperties } {
+  const c = status?.colour;
+  if (!c || !HEX.test(c)) return {};
+  return {
+    lane: { borderColor: `${c}40`, backgroundColor: `${c}0a` },
+    head: { backgroundColor: `${c}1f`, borderColor: `${c}40` },
+    card: { borderLeftColor: c },
+  };
+}
 
 /** Drop where the pointer is; fall back to overlap between lanes. */
 const collision: CollisionDetection = (args) => {
@@ -84,7 +103,14 @@ function CardBody({ row, compact, sourceLabel, status }: { row: LeadRow; compact
             >
               {yearly || once ? (
                 <>
-                  <span>{yearly || once}</span>
+                  {/* Each figure stays whole, so a narrow card breaks after the dot, never
+                      between "$6,000" and "ARR". */}
+                  {(yearly || once).split(' · ').map((part, i, parts) => (
+                    <span key={part} className="whitespace-nowrap">
+                      {part}
+                      {i < parts.length - 1 && ' · '}
+                    </span>
+                  ))}
                   {yearly && once && <span className="text-[11.5px] font-normal text-muted-foreground">+ {once}</span>}
                 </>
               ) : (
@@ -118,12 +144,16 @@ function BoardCard(props: {
   compact: boolean;
   sourceLabel: string | null;
   status: ContactStatus | undefined;
+  /** Archive this person; absent hides the action. */
+  onArchive?: (id: string) => void;
+  /** A move or an archive for this person is saving: the card holds still. */
+  busy: boolean;
 }) {
-  const { row, selected, onSelect } = props;
+  const { row, selected, onSelect, onArchive, busy } = props;
   // The card never moves itself: the drag overlay carries a copy above every lane.
-  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id: row.contactId });
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id: row.contactId, disabled: busy });
   return (
-    <li>
+    <li className="group/card relative">
       <div
         ref={setNodeRef}
         {...attributes}
@@ -137,15 +167,28 @@ function BoardCard(props: {
           if (e.key === 'Enter') onSelect(row.contactId);
           else listeners?.onKeyDown?.(e);
         }}
+        style={stageTone(props.status).card}
         className={cn(
           CARD_CLASS,
-          'block cursor-grab touch-none select-none outline-none transition-shadow hover:shadow-md focus-visible:ring-2 focus-visible:ring-ring',
+          'block cursor-grab touch-none select-none outline-none transition-colors hover:border-foreground/30 focus-visible:ring-2 focus-visible:ring-ring',
+          onArchive && 'pr-8',
           selected && 'ring-2 ring-ring',
-          isDragging && 'opacity-40',
+          (isDragging || busy) && 'opacity-40',
         )}
       >
         <CardBody {...props} />
       </div>
+      {onArchive && (
+        <ClickRegion
+          aria-label={`Archive ${row.name}`}
+          title="Archive: off the pipeline, record kept"
+          disabled={busy}
+          onClick={() => onArchive(row.contactId)}
+          className="absolute right-1.5 top-1.5 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:opacity-100 md:opacity-0 md:group-focus-within/card:opacity-100 md:group-hover/card:opacity-100"
+        >
+          <Archive className="h-3.5 w-3.5" aria-hidden="true" />
+        </ClickRegion>
+      )}
     </li>
   );
 }
@@ -160,6 +203,8 @@ function BoardColumn({
   onSelect,
   compact,
   sourceLabel,
+  onArchive,
+  busyIds,
 }: {
   group: LeadGroup;
   label: string;
@@ -170,17 +215,22 @@ function BoardColumn({
   onSelect: (id: string) => void;
   compact: boolean;
   sourceLabel: (contactId: string) => string | null;
+  onArchive?: (id: string) => void;
+  busyIds: ReadonlySet<string>;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: group.status });
   const people = group.rows.length;
   const money = cadenceText(group);
+  const tone = stageTone(status);
   return (
     <section
       ref={setNodeRef}
       aria-label={`${label} column`}
+      style={tone.lane}
       className={cn(
-        'flex min-h-0 min-w-[150px] flex-1 basis-0 flex-col rounded-lg bg-muted/60 p-1.5 transition-colors',
-        isOver && 'bg-muted ring-2 ring-ring/40',
+        // A bordered, lightly tinted lane in the stage's colour; the cards carry their own border.
+        'flex min-h-0 min-w-[150px] flex-1 basis-0 flex-col rounded-lg border border-border bg-muted/40 transition-colors',
+        isOver && 'ring-2 ring-ring ring-offset-2 ring-offset-background',
       )}
     >
       {/* The heading is the filter: it writes ?view=, so the index narrows to this column. */}
@@ -188,7 +238,8 @@ function BoardColumn({
         onClick={onToggle}
         aria-pressed={active}
         disabled={people === 0}
-        className={cn('flex w-full flex-col items-start gap-1 rounded-lg px-1.5 py-1.5', people > 0 && 'hover:bg-background/70', active && 'bg-background ring-1 ring-border')}
+        style={tone.head}
+        className={cn('flex w-full flex-col items-start gap-1 rounded-t-lg border-b border-border px-2.5 py-2', people > 0 && 'hover:bg-background/70', active && 'ring-1 ring-inset ring-ring')}
       >
         <span className="flex w-full items-center gap-1.5">
           <StatusPill dotClassName="bg-muted-foreground" dotStyle={statusDotStyle(status)}>
@@ -202,10 +253,10 @@ function BoardColumn({
         {money && <span className="px-0.5 text-[12px] font-semibold tabular-nums">{money}</span>}
       </ClickRegion>
       {people === 0 ? (
-        <p className="mt-1.5 rounded-lg border border-dashed border-border px-2 py-4 text-center text-[12px] text-muted-foreground">Nobody here right now.</p>
+        <p className="m-1.5 rounded-lg border border-dashed border-border px-2 py-4 text-center text-[12px] text-muted-foreground">Nobody here right now.</p>
       ) : (
-        <ScrollArea className="mt-1 min-h-0 flex-1" fitWidth>
-          <ul className="flex flex-col gap-2 p-0.5" aria-label={label}>
+        <ScrollArea className="min-h-0 flex-1" fitWidth>
+          <ul className="flex flex-col gap-2 p-1.5" aria-label={label}>
             {group.rows.map((row) => (
               <BoardCard
                 key={row.contactId}
@@ -215,6 +266,8 @@ function BoardColumn({
                 compact={compact}
                 sourceLabel={sourceLabel(row.contactId)}
                 status={status}
+                onArchive={onArchive}
+                busy={busyIds.has(row.contactId)}
               />
             ))}
           </ul>
@@ -238,6 +291,7 @@ function CardBar({
   onClose,
   onMoveStage,
   moving,
+  onArchive,
 }: {
   contact: Contact;
   row: LeadRow;
@@ -247,6 +301,7 @@ function CardBar({
   onClose: () => void;
   onMoveStage: (contactId: string, status: string) => void;
   moving: boolean;
+  onArchive?: () => void;
 }) {
   const save = useContactFieldSave(contact);
   const quoteSaving = useIsMutating({ mutationKey: quoteOpMutationKey(contact.id) }) > 0;
@@ -272,6 +327,12 @@ function CardBar({
               {stageOptions.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
             </SelectContent>
           </Select>
+          {onArchive && (
+            <Button type="button" variant="ghost" size="sm" className="justify-start text-muted-foreground" disabled={moving} onClick={onArchive}>
+              <Archive aria-hidden="true" />
+              Archive person
+            </Button>
+          )}
         </div>
         <div className="flex flex-col gap-2 border-b border-border px-3.5 py-2.5">
           <div>
@@ -331,14 +392,33 @@ export interface CrmBoardProps {
   loading: boolean;
   /** Resolves when the move has settled (saved or failed). */
   onMoveStage: (contactId: string, status: string) => Promise<void>;
+  /** Archive a person from their card or its bar; resolves when it has settled. Absent hides the action. */
+  onArchive?: (contact: Contact) => Promise<void>;
+  /** People whose archive is saving: their cards hold still. */
+  archivingIds?: ReadonlySet<string>;
 }
 
 /**
- * The pipeline board: one column per open stage, newest first, never by money. Cards drag
- * between columns; a click opens the card's bar. `/` focuses the search (capture phase, so
- * it wins over any shell listener) and yields while typing.
+ * The pipeline board: one column per open stage, newest first, never by money, each lane in
+ * its stage's colour. Cards drag between columns; a click opens the card's bar; a card's
+ * archive takes the person off the pipeline and keeps their record. `/` focuses the search
+ * (capture phase, so it wins over any shell listener) and yields while typing.
  */
-export function CrmBoard({ contacts, organizations, serviceLabels, statusByKey, search, onSearch, matches, view, onView, loading, onMoveStage }: CrmBoardProps) {
+export function CrmBoard({
+  contacts,
+  organizations,
+  serviceLabels,
+  statusByKey,
+  search,
+  onSearch,
+  matches,
+  view,
+  onView,
+  loading,
+  onMoveStage,
+  onArchive,
+  archivingIds,
+}: CrmBoardProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [movingIds, setMovingIds] = useState<ReadonlySet<string>>(new Set());
@@ -391,6 +471,14 @@ export function CrmBoard({ contacts, organizations, serviceLabels, statusByKey, 
       });
     }
   };
+
+  const busyIds = useMemo(() => new Set([...movingIds, ...(archivingIds ?? [])]), [movingIds, archivingIds]);
+  const archive = onArchive
+    ? (id: string) => {
+        const c = contactById.get(id);
+        if (c) void onArchive(c);
+      }
+    : undefined;
 
   const onDragEnd = (e: DragEndEvent) => {
     setDraggingId(null);
@@ -499,13 +587,15 @@ export function CrmBoard({ contacts, organizations, serviceLabels, statusByKey, 
                       onSelect={(id) => setSelectedId((cur) => (cur === id ? null : id))}
                       compact={selectedRow !== null}
                       sourceLabel={sourceOf}
+                      onArchive={archive}
+                      busyIds={busyIds}
                     />
                   ))}
                 </div>
               </ScrollArea>
               <DragOverlay dropAnimation={null}>
                 {draggingRow && (
-                  <div data-drag-overlay className={cn(CARD_CLASS, 'cursor-grabbing shadow-lg ring-1 ring-border')}>
+                  <div data-drag-overlay style={stageTone(statusByKey.get(draggingRow.status)).card} className={cn(CARD_CLASS, 'cursor-grabbing ring-2 ring-ring/50')}>
                     <CardBody row={draggingRow} compact={selectedRow !== null} sourceLabel={sourceOf(draggingRow.contactId)} status={statusByKey.get(draggingRow.status)} />
                   </div>
                 )}
@@ -522,7 +612,8 @@ export function CrmBoard({ contacts, organizations, serviceLabels, statusByKey, 
                 sourceOptions={sourceOptions}
                 onClose={() => setSelectedId(null)}
                 onMoveStage={(id, status) => void move(id, status)}
-                moving={movingIds.has(selectedContact.id)}
+                moving={busyIds.has(selectedContact.id)}
+                onArchive={archive ? () => archive(selectedContact.id) : undefined}
               />
             )}
           </div>

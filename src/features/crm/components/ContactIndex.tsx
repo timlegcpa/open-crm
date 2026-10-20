@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
-import { ChevronRight } from 'lucide-react';
+import { Archive, ChevronRight } from 'lucide-react';
 import type { Contact } from '@/api/contacts';
 import type { ContactStatus } from '@/api/pickLists';
 import { StatusMonogram } from '@/components/contacts/StatusBadge';
@@ -13,7 +13,9 @@ import { contactRowName, type CrmSection } from '../lib/sections';
 
 /**
  * One 44px index row: the monogram tinted by status, swapped for a checkbox on hover (and
- * kept once anything is selected), then the name. Nothing to the right of a name.
+ * kept once anything is selected), then the name. To its right only the quick archive,
+ * shown on hover or focus on a wide screen and always on a phone. No tier badge here: the
+ * tier lives on the record and the Tiers tab.
  */
 export function ContactIndexRow({
   contact,
@@ -22,6 +24,8 @@ export function ContactIndexRow({
   selecting,
   onToggleSelect,
   search,
+  onArchive,
+  archiving = false,
 }: {
   contact: Contact;
   status: ContactStatus | undefined;
@@ -31,6 +35,10 @@ export function ContactIndexRow({
   onToggleSelect: (id: string) => void;
   /** Carried into the record link so the index keeps its query. */
   search: string;
+  /** Archive this contact; absent hides the action. */
+  onArchive?: (contact: Contact) => void;
+  /** An archive for this contact is saving. */
+  archiving?: boolean;
 }) {
   const name = contactRowName(contact);
   return (
@@ -54,6 +62,17 @@ export function ContactIndexRow({
       >
         {name}
       </NavLink>
+      {onArchive && (
+        <ClickRegion
+          aria-label={`Archive ${name}`}
+          title="Archive: off the working lists, record kept"
+          disabled={archiving}
+          onClick={() => onArchive(contact)}
+          className="shrink-0 rounded-sm p-1 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:opacity-100 lg:opacity-0 lg:group-focus-within:opacity-100 lg:group-hover:opacity-100"
+        >
+          <Archive className="h-3.5 w-3.5" aria-hidden="true" />
+        </ClickRegion>
+      )}
     </li>
   );
 }

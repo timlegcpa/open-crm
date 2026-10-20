@@ -4,12 +4,38 @@ What the owner and clients can do, one section per feature domain. Each domain i
 under `src/features/` (see [architecture.md](architecture.md)); its tables are in the migration
 named in its section.
 
-## Contacts and pipeline (`crm`, `0002_contacts`)
+## Contacts and pipeline (`crm`, `0002_contacts`, `0013_crm`)
 
 **Owner.** Contacts is the home page: a list and a pipeline board of every contact by stage
-(new, active, hot, warm, cold, client, one-time client, former client, lost). Add a contact by
-hand, or let one arrive through lead intake. A contact record holds emails (primary and a
-spouse or partner's), phone, mailing address, lead source, the businesses the contact owns,
+(new, active, hot, warm, cold, client, one-time client, former client, lost), in each stage's
+colour. Tabs across the top switch the list: Clients (the default: every client, one-time
+clients included, in one A to Z list), Pipeline (the open stages), Tiers, All and Table. The
+tab is part of the address, and the last one chosen is remembered in the browser. A search
+looks through everyone, whatever the tab, except on Tiers. Add a contact by hand, or let one
+arrive through lead intake.
+
+**Tiers.** The owner ranks clients by hand, S at the top, then A, B, C, D and E; a contact
+starts not ranked. The Tiers tab shows one row per tier, in tier-list colours, with the active
+(recurring) clients in their rows; drag a client to another row to change their tier. A tier is
+also set on the record's Overview and in its side bar, and shows as a small letter badge in the
+record's header. Nothing computes a tier, and a client never sees it.
+
+**Archive.** Archiving takes a contact off every working list (the index, the board, the table,
+the tiers, contact pickers and group email), and keeps the record whole: quotes, documents,
+notes and history stay. Archive from a list row, a board card or its bar, the bulk bar or the
+record's menu; the Archived button lists everyone archived, searchable, with Restore. Archiving
+leaves the stage alone, so Restore brings a contact back at the stage they left, and a contact
+the e-signature flow created to sign stays exactly that. The database records when, and a
+group email already queued skips a contact archived since. Archiving does not revoke portal
+access: turn that off separately in the record's portal access panel.
+
+**The record.** Overview holds the contact's details and a Billing card with the services
+editor, so a price is entered right there; the Billing tab keeps the upsells and organization
+editing. The side bar edits status, tier, email, phone and source in place, copies the rest,
+and carries the services editor on the tabs that do not. A status change and a quote save for
+one contact wait for each other.
+
+A contact record holds emails (primary and a spouse or partner's), phone, mailing address, lead source, the businesses the contact owns,
 notes (append-only), relationships to other contacts, service quotes and upsells (further work to pitch: open, pitched, won or passed). A quote is
 one service per business with an amount and a cadence (monthly, annual or one-time), proposed
 or accepted. Accepted monthly quotes make up monthly recurring revenue, and with accepted annual

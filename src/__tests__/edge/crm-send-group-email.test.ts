@@ -91,7 +91,7 @@ function deps(over: Partial<GroupEmailDeps> = {}, send?: (m: EmailMessage, n: nu
     checkSendLimit: (ownerId) => checkUserLimit(client, { action: 'group_email', userId: ownerId, max: MAX_CAMPAIGNS_PER_HOUR, windowMinutes: 60 }),
     loadOrg: () => org.load(),
     readContacts: async (ids) =>
-      asServer<ContactRow>(`SELECT id, first_name, email, status FROM public.contacts WHERE id = ANY($1::uuid[])`, [ids]),
+      asServer<ContactRow>(`SELECT id, first_name, email, status, archived_at FROM public.contacts WHERE id = ANY($1::uuid[])`, [ids]),
     readSuppressed: async (addresses) =>
       (await asServer<{ address: string }>(`SELECT address FROM public.email_suppressions WHERE address = ANY($1::text[])`, [addresses])).map((r) => r.address),
     begin: async (i) =>
@@ -288,6 +288,15 @@ describe('crm-send-group-email: who is mailed', () => {
     // The request's order decides who wins: Sam asked first.
     expect(d.sent[0].html).toContain('Hi Sam');
     expect(await rows(`SELECT contact_id, status FROM public.crm_email_recipients`)).toEqual([{ contact_id: SHARED, status: 'sent' }]);
+  });
+
+  it('skips an archived contact before the run: no message, no row', async () => {
+    await db.exec(`UPDATE public.contacts SET archived_at = now() WHERE id = '${ADA}'`);
+    const d = deps();
+    const res = await call(d, send([ADA, GRACE]));
+    expect(res.body).toMatchObject({ sent: 1, skipped: 1 });
+    expect(d.sent.map((m) => m.to)).toEqual(['grace@example.com']);
+    expect(await rows(`SELECT contact_id FROM public.crm_email_recipients`)).toEqual([{ contact_id: GRACE }]);
   });
 
   it('collapses repeated ids and ignores ids that are not contacts', async () => {

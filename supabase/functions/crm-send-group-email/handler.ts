@@ -61,6 +61,8 @@ export interface ContactRow {
   first_name: string | null;
   email: string | null;
   status: string;
+  /** Set when the contact is archived: never mailed (group_email_claim re-checks at send). */
+  archived_at?: string | null;
 }
 
 export interface BeginInput {
@@ -117,7 +119,7 @@ export interface GroupEmailDeps {
   outboundEnv: OutboundEnv;
   checkSendLimit(ownerId: string): Promise<RateLimitOutcome>;
   loadOrg(): Promise<OrgIdentity>;
-  /** contacts id, first_name, email, status for these ids (any order). Throws on error. */
+  /** contacts id, first_name, email, status, archived_at for these ids (any order). Throws on error. */
   readContacts(ids: string[]): Promise<ContactRow[]>;
   /** Which of these (normalized) addresses are suppressed. Throws on error. */
   readSuppressed(addresses: string[]): Promise<string[]>;
@@ -247,6 +249,10 @@ function resolveTargets(ids: string[], rows: ContactRow[]): { targets: Target[];
     const c = byId.get(id);
     // No row: a contact that no longer exists, not a skip.
     if (!c) continue;
+    if (c.archived_at != null) {
+      skips.push({ contactId: c.id, address: null, reason: 'archived' });
+      continue;
+    }
     if (!EMAILABLE_STATUSES.includes(c.status)) {
       skips.push({ contactId: c.id, address: null, reason: `status ${c.status}` });
       continue;

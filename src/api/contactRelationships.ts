@@ -1,5 +1,5 @@
 import { getSupabase } from '@/lib/supabase';
-import { contactDisplayName, isUuid } from '@/api/contacts';
+import { contactDisplayName, isArchived, isUuid } from '@/api/contacts';
 
 export type RelationshipKind = 'spouse' | 'partner' | 'dependent' | 'business_partner' | 'other';
 
@@ -21,6 +21,8 @@ export interface HouseholdLink {
   direction: 'outgoing' | 'incoming';
   otherId: string;
   otherName: string;
+  /** The other contact is archived: shown where the link is, never offered as a new choice. */
+  otherArchived: boolean;
 }
 
 interface RelationshipRow {
@@ -48,14 +50,11 @@ export async function listHousehold(contactId: string): Promise<HouseholdLink[]>
   const otherIds = [...new Set(rows.map((r) => (r.contact_id === contactId ? r.related_contact_id : r.contact_id)))];
   const { data: people, error: peopleError } = await supabase
     .from('contacts')
-    .select('id, full_name, business_name')
+    .select('id, full_name, business_name, archived_at')
     .in('id', otherIds);
   if (peopleError) throw peopleError;
-  const names = new Map(
-    ((people ?? []) as Array<{ id: string; full_name: string; business_name: string | null }>).map((p) => [
-      p.id,
-      contactDisplayName(p),
-    ]),
+  const byId = new Map(
+    ((people ?? []) as Array<{ id: string; full_name: string; business_name: string | null; archived_at: string | null }>).map((p) => [p.id, p]),
   );
 
   return rows.map((r) => {
@@ -66,7 +65,8 @@ export async function listHousehold(contactId: string): Promise<HouseholdLink[]>
       relationship: r.relationship,
       direction: outgoing ? 'outgoing' : 'incoming',
       otherId,
-      otherName: names.get(otherId) ?? 'Unnamed contact',
+      otherName: byId.has(otherId) ? contactDisplayName(byId.get(otherId)!) : 'Unnamed contact',
+      otherArchived: byId.has(otherId) && isArchived(byId.get(otherId)!),
     };
   });
 }
