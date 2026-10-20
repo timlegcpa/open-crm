@@ -1,5 +1,5 @@
 // @vitest-environment node
-// The pure rules of requests: fulfilment, progress, sections, the upload folder's name,
+// The pure rules of requests: fulfilment, progress, the roster's grouping, the upload folder's name,
 // the reminder settings (and that the screen's defaults are the dispatcher's), and the
 // builder's checks. Fixtures are fictional.
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -14,7 +14,9 @@ import {
   normalizeReminderSettings,
   requestFolderName,
   requestFolderPath,
-  requestSections,
+  requestRosterSections,
+  answersToAccept,
+  ARCHIVED_SECTION,
   toDraftItems,
   type RequestItem,
 } from '../lib/requests';
@@ -60,15 +62,46 @@ describe('the fulfilment rule', () => {
   });
 });
 
-describe('sections', () => {
-  it('puts what was handed back first, then waiting, drafts, closed, newest first within', () => {
-    const l = (id: string, status: 'draft' | 'sent' | 'submitted' | 'closed', created_at: string) => ({ id, status, created_at });
-    const out = requestSections([
-      l('a', 'closed', '2026-01-01'), l('b', 'sent', '2026-01-01'), l('c', 'sent', '2026-02-01'), l('d', 'submitted', '2026-01-01'), l('e', 'draft', '2026-01-01'),
-    ]);
-    expect(out.map((s) => [s.status, s.lists.map((x) => x.id)])).toEqual([
-      ['submitted', ['d']], ['sent', ['c', 'b']], ['draft', ['e']], ['closed', ['a']],
-    ]);
+describe('the roster', () => {
+  type Item = { kind: string; status: string };
+  const l = (id: string, status: string, contact = id, items: Item[] = [], created_at = '2026-01-01') =>
+    ({ id, status, contact_id: contact, created_at, items });
+  const names: Record<string, string> = { a: 'Adams', b: 'Baker', c: 'Cole', d: 'Diaz', z: 'Zed' };
+  const nameOf = (id: string) => names[id] ?? id;
+  const ids = (s: { rows: Array<{ id: string }> }) => s.rows.map((r) => r.id);
+
+  it('groups by whose move it is: yours, the client, drafts, archived', () => {
+    const out = requestRosterSections([l('a', 'submitted'), l('b', 'sent'), l('c', 'draft'), l('d', 'closed')], nameOf);
+    expect(out.map((s) => s.label)).toEqual(['Waiting on you', 'Waiting on client', 'Drafts', 'Archived']);
+    expect(out.map(ids)).toEqual([['a'], ['b'], ['c'], ['d']]);
+    expect(out.at(-1)!.key).toBe(ARCHIVED_SECTION);
+  });
+
+  it('puts a sent list with an answer to accept on your side; a note or an accepted answer does not count', () => {
+    const answered = l('a', 'sent', 'a', [{ kind: 'question', status: 'pending' }, { kind: 'document', status: 'fulfilled' }]);
+    const accepted = l('b', 'sent', 'b', [{ kind: 'todo', status: 'reviewed' }, { kind: 'info', status: 'fulfilled' }]);
+    expect(requestRosterSections([answered, accepted], nameOf).map((s) => [s.key, ids(s)])).toEqual([['yours', ['a']], ['client', ['b']]]);
+    expect(answersToAccept(answered)).toBe(1);
+    expect(answersToAccept(accepted)).toBe(0);
+  });
+
+  it('runs A to Z by client inside a section, then newest first, then by id', () => {
+    const out = requestRosterSections(
+      [l('z1', 'sent', 'z'), l('a1', 'sent', 'a', [], '2026-01-01'), l('b1', 'sent', 'b'), l('a2', 'sent', 'a', [], '2026-03-01'),
+        l('a4', 'sent', 'a', [], '2026-02-01'), l('a3', 'sent', 'a', [], '2026-02-01')],
+      nameOf,
+    );
+    expect(ids(out[0])).toEqual(['a2', 'a3', 'a4', 'a1', 'b1', 'z1']);
+  });
+
+  it('drops empty sections and never drops an unknown status', () => {
+    const out = requestRosterSections([l('a', 'sent'), l('z', 'paused')], nameOf);
+    expect(out.map((s) => [s.key, s.label])).toEqual([['client', 'Waiting on client'], ['other:paused', 'paused']]);
+  });
+
+  it('never folds an unknown status into a known section that shares its name', () => {
+    const out = requestRosterSections([l('a', 'closed'), l('b', 'archived')], nameOf);
+    expect(out.map((s) => [s.key, ids(s)])).toEqual([[ARCHIVED_SECTION, ['a']], ['other:archived', ['b']]]);
   });
 });
 

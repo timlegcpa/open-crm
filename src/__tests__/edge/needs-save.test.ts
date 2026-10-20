@@ -67,11 +67,8 @@ function deps(sent: Sent[], over: Partial<NeedsSaveDeps> = {}, status: () => Sen
       return item;
     },
     loadList: ownList,
-    async updateContact(contactId, fields) {
-      const keys = Object.keys(fields);
-      await q(`UPDATE public.contacts SET ${keys.map((k, i) => `${k} = $${i + 2}`).join(', ')} WHERE id = $1`,
-        [contactId, ...keys.map((k) => fields[k as keyof typeof fields])]);
-    },
+    saveContact: (c, l, fields) =>
+      one(`SELECT public.needs_client_save_contact($1, $2, $3::jsonb) AS r`, [c, l, JSON.stringify(fields)]),
     setAnswer: (c, i, text, cipher) =>
       one(`SELECT public.needs_client_set_answer($1, $2, $3, $4) AS r`, [c, i, text, cipher === null ? null : fromBytea(cipher)]),
     markTodo: (c, i, done) => one(`SELECT public.needs_client_mark_todo($1, $2, $3) AS r`, [c, i, done]),
@@ -243,6 +240,15 @@ describe('needs-save: uploads', () => {
     expect(sent).toHaveLength(2);
   });
 
+  it('a notice whose delivery is unknown keeps its claim, so the next upload sends nothing', async () => {
+    const sent: Sent[] = [];
+    const d = deps(sent, {}, () => ({ status: 'unknown', channel: 'resend' }));
+    await save(d, { action: 'link_document', item_id: docItem, document_id: await upload() });
+    await save(d, { action: 'link_document', item_id: docItem, document_id: await upload() });
+    expect(sent).toHaveLength(1);
+    expect(await one(`SELECT upload_notified_at IS NOT NULL AS r FROM public.needs_lists WHERE id = $1`, [listId])).toBe(true);
+  });
+
   it('refuses another contact’s file, an owner-held file, and a non-document item', async () => {
     const theirs = await upload(other);
     expect(await result(await save(deps([]), { action: 'link_document', item_id: docItem, document_id: theirs }))).toEqual([409, 'locked']);
@@ -312,5 +318,20 @@ describe('needs-save: contact details', () => {
     await q(`UPDATE public.needs_lists SET include_contact_confirm = false WHERE id = $1`, [listId]);
     expect(await result(await save(deps([]), { action: 'save_contact', list_id: listId, fields: { phone: '1' } }))).toEqual([409, 'not_open']);
     expect(await result(await save(deps([]), { action: 'save_contact', list_id: randomUUID(), fields: { phone: '1' } }))).toEqual([404, 'not_found']);
+  });
+
+  it('a request closed while the save is on its way refuses it and writes nothing', async () => {
+    const before = (await q<{ phone: string | null }>(`SELECT phone FROM public.contacts WHERE id = $1`, [CLIENT_CONTACT_ID]))[0].phone;
+    const base = deps([]);
+    // The close lands after the handler took the request but before the write reaches the
+    // database: the write's own check, under the list's lock, is what refuses it.
+    const racing = deps([], {
+      async saveContact(c, l, fields) {
+        await q(`UPDATE public.needs_lists SET status = 'closed', closed_at = now() WHERE id = $1`, [l]);
+        return base.saveContact(c, l, fields);
+      },
+    });
+    expect(await result(await save(racing, { action: 'save_contact', list_id: listId, fields: { phone: '555-0199' } }))).toEqual([409, 'not_open']);
+    expect((await q<{ phone: string | null }>(`SELECT phone FROM public.contacts WHERE id = $1`, [CLIENT_CONTACT_ID]))[0].phone).toBe(before);
   });
 });

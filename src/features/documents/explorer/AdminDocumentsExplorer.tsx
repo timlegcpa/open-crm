@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback, useRef, lazy, Suspense } from 'react';
+import { useEffect, useMemo, useState, useCallback, useRef, lazy, Suspense, type ComponentType } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Menu, FileText, Loader2 } from 'lucide-react';
 import { Sheet, SheetContent, SheetTitle, SheetDescription, SheetTrigger } from '@/components/ui/sheet';
@@ -63,6 +63,7 @@ export default function AdminDocumentsExplorer({
   initialClientId,
   lockedClient,
   variant = 'card',
+  contactPanel: ContactPanel,
 }: {
   initialClientId?: string;
   /**
@@ -85,6 +86,12 @@ export default function AdminDocumentsExplorer({
    * See the root element for why the two differ.
    */
   variant?: 'card' | 'flush';
+  /**
+   * Drawn above the picked contact's folders, keyed on the contact so its state starts
+   * fresh with each pick: the Documents page passes the contact's requests here. Additive:
+   * the folder view below it does not change.
+   */
+  contactPanel?: ComponentType<{ contactId: string; contactName: string }>;
 }) {
   const { session } = useAuth();
   const userId = session?.user?.id ?? null;
@@ -667,6 +674,12 @@ export default function AdminDocumentsExplorer({
           aria-label="Upload files"
           onChange={handleFileInputChange}
         />
+
+        {ContactPanel && state.selectedClientId && (
+          <Suspense fallback={null}>
+            <ContactPanel key={state.selectedClientId} contactId={state.selectedClientId} contactName={state.selectedClientName || 'Contact'} />
+          </Suspense>
+        )}
 
         {/* Breadcrumb row, a 40px band. On the full page the toolbar sits in
             the shell's top bar instead (see `header` above), so this row is the breadcrumb alone; inside the workspace

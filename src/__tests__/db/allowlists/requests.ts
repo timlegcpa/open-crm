@@ -33,6 +33,7 @@ export const allowlist: DomainAllowlist = {
     'needs_client_mark_todo(uuid,uuid,boolean)',
     'needs_client_link_document(uuid,uuid,uuid)',
     'needs_client_submit(uuid,uuid)',
+    'needs_client_save_contact(uuid,uuid,jsonb)',
     'needs_claim_upload_notice(uuid)',
     'needs_release_upload_notice(uuid,timestamp with time zone)',
     'start_link_access_revoked(uuid,text,uuid)',

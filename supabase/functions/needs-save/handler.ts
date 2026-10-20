@@ -14,7 +14,7 @@
 //                  key the save is refused rather than stored in the clear
 //   mark_item      tick or untick a to-do
 //   link_document  attach a file the client just uploaded to a document item; the owner
-//                  hears about uploads at most once per list per 30 minutes, with no names
+//                  hears about uploads at most once per list per 24 hours, with no names
 //   submit         hand the list back, only when every required item is answered; the
 //                  owner and the client each get one email, and a second submit none
 //
@@ -90,8 +90,12 @@ export interface NeedsSaveDeps {
   loadItem(contactId: string, itemId: string): Promise<ClientItemRow | null>;
   /** The list, only when it is a non-draft list of this contact. */
   loadList(contactId: string, listId: string): Promise<ClientListRow | null>;
-  /** A service update of the contact's own row (names and phone only). */
-  updateContact(contactId: string, fields: Partial<Record<ContactField, string | null>>): Promise<void>;
+  /**
+   * needs_client_save_contact: the contact's own row (names and phone only), written only
+   * while the list is theirs, sent and asks for the confirmation, checked under the list's
+   * lock in the same transaction, so a close can never land between the check and the write.
+   */
+  saveContact(contactId: string, listId: string, fields: Partial<Record<ContactField, string | null>>): Promise<'saved' | 'not_found' | 'not_open'>;
   /** needs_client_set_answer: the item's new status, or null when the guard matched nothing. */
   setAnswer(contactId: string, itemId: string, text: string | null, ciphertextHex: string | null): Promise<string | null>;
   /** needs_client_mark_todo. */
@@ -158,10 +162,14 @@ export function createNeedsSaveHandler(deps: NeedsSaveDeps): (req: Request) => P
         url: ownerDocumentsUrl(deps.siteUrl, contactId),
       });
       const result = await deps.sendEmail({ to, subject, content, fromName: org.senderName, idempotencyKey: `needs-upload:${listId}:${stamp}` });
+      // Unknown (no answer from the provider) may well have been delivered, so it keeps the
+      // claim: giving it back would let the next upload email the owner again within the day.
       sent = result.status !== 'failed';
       if (!sent) log.warn('upload notice not sent');
     } finally {
-      // A notice that did not go gives its claim back, so the next upload tries again.
+      // A notice the provider refused, or that never reached the send, gives its claim back,
+      // so the next upload tries again instead of the notice going quiet for a day. Only this
+      // claim's own stamp is cleared, never a newer one.
       if (!sent) {
         try {
           await deps.releaseUploadNotice(listId, stamp);
@@ -213,14 +221,13 @@ export function createNeedsSaveHandler(deps: NeedsSaveDeps): (req: Request) => P
         case 'save_contact': {
           if (!isId(input.list_id)) refuse(400, 'Bad request.', 'bad_request');
           const fields = contactUpdate(input.fields);
-          const list = await deps.loadList(contactId, input.list_id);
-          if (!list) refuse(404, 'This request is not available.', 'not_found');
-          if (list.status !== 'sent' || !list.include_contact_confirm) refuse(409, 'This request is not open for changes.', 'not_open');
-          await deps.updateContact(contactId, fields);
+          const outcome = await deps.saveContact(contactId, input.list_id, fields);
+          if (outcome === 'not_found') refuse(404, 'This request is not available.', 'not_found');
+          if (outcome !== 'saved') refuse(409, 'This request is not open for changes.', 'not_open');
           try {
             await deps.logActivity({
               contactId, userId: principal.userId, action: 'profile_update', ip, userAgent,
-              details: { source: 'request', list_id: list.id, fields: Object.keys(fields).sort(), actor_role: 'client' },
+              details: { source: 'request', list_id: input.list_id, fields: Object.keys(fields).sort(), actor_role: 'client' },
             });
           } catch (err) {
             log.error('could not record the profile update', err);
