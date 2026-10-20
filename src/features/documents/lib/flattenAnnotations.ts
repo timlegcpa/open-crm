@@ -3,6 +3,7 @@ import {
   HIGHLIGHT_OPACITY,
   REVIEW_STAMP_META,
   REVIEW_STAMP_TYPO,
+  reviewStampLabelSize,
   STAMP_META,
   isAnnotationData,
   pdfSvgPathFromPoints,
@@ -234,7 +235,8 @@ export async function flattenAnnotatedPdf(
         });
       };
       const [label, when] = reviewStampLines(d);
-      drawLine(label, boxH * REVIEW_STAMP_TYPO.labelSize, REVIEW_STAMP_TYPO.labelBaseline);
+      // Shrunk to the box on a narrow page, by the label's measured width in this font.
+      drawLine(label, reviewStampLabelSize(boxW, boxH, font.widthOfTextAtSize(label, 1)), REVIEW_STAMP_TYPO.labelBaseline);
       drawLine(when, boxH * REVIEW_STAMP_TYPO.whenSize, REVIEW_STAMP_TYPO.whenBaseline);
     } else if (ann.kind === 'stamp') {
       // Explicit, NOT a trailing `else`: a bare else would cast a future kind to

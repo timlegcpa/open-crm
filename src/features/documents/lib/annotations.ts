@@ -2,7 +2,7 @@ import { formatDateTime } from '@/lib/format';
 
 export type AnnotationKind = 'ink' | 'highlight' | 'text' | 'stamp' | 'review_stamp';
 export type StampKey = 'check' | 'cross' | 'question';
-export type ReviewStampKey = 'reviewed' | 'approved';
+export type ReviewStampKey = 'reviewed' | 'approved' | 'not_needed';
 
 // All coordinates: UNROTATED PDF space, points, bottom-left origin (pdf-lib native).
 /**
@@ -63,14 +63,20 @@ export const STAMP_META: Record<StampKey, { label: string; color: string; path: 
   },
 };
 
-export const REVIEW_STAMP_META: Record<ReviewStampKey, { label: string; color: string }> = {
+/**
+ * `labelEm`: the label's width at 1pt in Helvetica Bold, the stamp's on-screen face (the
+ * export measures its own font). A test holds it to pdf-lib's own metrics.
+ */
+export const REVIEW_STAMP_META: Record<ReviewStampKey, { label: string; color: string; labelEm: number }> = {
   // Deep enough to stay legible over a scanned page, and WCAG-AA against white , 
   // t.colors.success (#10B981) fails that, same reasoning as WorkstationRail.
-  reviewed: { label: 'REVIEWED', color: '#15803D' },
-  approved: { label: 'APPROVED', color: '#1D4ED8' },
+  reviewed: { label: 'REVIEWED', color: '#15803D', labelEm: 5.334 },
+  approved: { label: 'APPROVED', color: '#1D4ED8', labelEm: 5.542 },
+  // A mark only, like APPROVED: only REVIEWED sets the document's reviewed state.
+  not_needed: { label: 'NOT NEEDED', color: '#4B5563', labelEm: 6.516 },
 };
 
-/** Review-stamp box, in PDF points. Sized to fit "REVIEWED" plus a date line. */
+/** Review-stamp box, in PDF points. Sized to fit "NOT NEEDED" (the longest label) plus a date line. */
 export const REVIEW_STAMP_SIZE = { width: 168, height: 46 };
 /** Gap from the page's right and bottom edges. */
 export const REVIEW_STAMP_MARGIN = 24;
@@ -87,7 +93,24 @@ export const REVIEW_STAMP_TYPO = {
   whenSize: 0.2,
   labelBaseline: 0.5,
   whenBaseline: 0.22,
+  /** Widest the label may run, as a fraction of the box's DISPLAYED width. */
+  labelMaxWidth: 0.9,
 } as const;
+
+/** The on-screen stamp's face: Helvetica's metrics (Arial shares them), as the export draws. */
+export const REVIEW_STAMP_FONT_FAMILY = 'Helvetica, Arial, sans-serif';
+
+/**
+ * Label font size for a review stamp box: its share of the box height, shrunk until the
+ * label fits the box width. The box narrows with the page (reviewStampRect clamps it to the
+ * page width), and a fixed size ran the longest label past the edges of a narrow page.
+ * `widthAt1` is the label's width at size 1 in the font that draws it.
+ */
+export function reviewStampLabelSize(boxWidth: number, boxHeight: number, widthAt1: number): number {
+  const preferred = boxHeight * REVIEW_STAMP_TYPO.labelSize;
+  if (!(widthAt1 > 0)) return preferred;
+  return Math.min(preferred, (boxWidth * REVIEW_STAMP_TYPO.labelMaxWidth) / widthAt1);
+}
 
 /**
  * `stampKey` state is widened to hold both stamp families, but `StampData.stamp`

@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest';
+import { PDFDocument, StandardFonts } from 'pdf-lib';
 import {
   INK_COLORS,
   HIGHLIGHT_COLORS,
   REVIEW_STAMP_MARGIN,
   REVIEW_STAMP_META,
   REVIEW_STAMP_SIZE,
+  REVIEW_STAMP_TYPO,
   STAMP_META,
   TEXT_MAX_LEN,
   describeAnnotation,
@@ -12,6 +14,7 @@ import {
   isReviewStampKey,
   normalizeRect,
   pdfSvgPathFromPoints,
+  reviewStampLabelSize,
   reviewStampLines,
   reviewStampRect,
   round2,
@@ -221,6 +224,7 @@ describe('review stamps', () => {
     // The narrowing that stops a review key reaching a plain 'stamp' row.
     expect(isReviewStampKey('reviewed')).toBe(true);
     expect(isReviewStampKey('approved')).toBe(true);
+    expect(isReviewStampKey('not_needed')).toBe(true);
     expect(isReviewStampKey('check')).toBe(false);
     expect(isReviewStampKey('cross')).toBe(false);
     expect(isReviewStampKey('question')).toBe(false);
@@ -258,6 +262,7 @@ describe('review stamps', () => {
     expect(when).not.toMatch(/Invalid/);
     expect(when.length).toBeGreaterThan(0);
     expect(reviewStampLines({ ...validReviewStamp, stamp: 'approved' })[0]).toBe('APPROVED');
+    expect(reviewStampLines({ ...validReviewStamp, stamp: 'not_needed' })[0]).toBe('NOT NEEDED');
   });
 
   it('accepts a valid review_stamp', () => {
@@ -275,6 +280,38 @@ describe('review stamps', () => {
     expect(isAnnotationData('review_stamp', { ...validReviewStamp, stamp: 'nope' })).toBe(false);
     expect(isAnnotationData('review_stamp', { ...validReviewStamp, height: 0 })).toBe(false);
     expect(isAnnotationData('review_stamp', { ...validReviewStamp, width: -1 })).toBe(false);
+  });
+
+  it('labelEm is the Helvetica Bold width of the label at 1pt', async () => {
+    const bold = await (await PDFDocument.create()).embedFont(StandardFonts.HelveticaBold);
+    for (const { label, labelEm } of Object.values(REVIEW_STAMP_META)) {
+      expect(labelEm).toBeCloseTo(bold.widthOfTextAtSize(label, 1), 3);
+    }
+  });
+
+  it('every review stamp label fits its box on any page width, on screen and in the export', async () => {
+    const pdf = await PDFDocument.create();
+    const [regular, bold] = await Promise.all([pdf.embedFont(StandardFonts.Helvetica), pdf.embedFont(StandardFonts.HelveticaBold)]);
+    for (let pageWidth = 20; pageWidth <= 2000; pageWidth += 7) {
+      const box = reviewStampRect(pageWidth, 792);
+      for (const { label, labelEm } of Object.values(REVIEW_STAMP_META)) {
+        // The export: Helvetica, measured.
+        const exportSize = reviewStampLabelSize(box.width, box.height, regular.widthOfTextAtSize(label, 1));
+        expect(regular.widthOfTextAtSize(label, exportSize)).toBeLessThanOrEqual(box.width);
+        // The screen: bold, plus its letter spacing.
+        const spacing = label.length * 0.06;
+        const screenSize = reviewStampLabelSize(box.width, box.height, labelEm + spacing);
+        expect(bold.widthOfTextAtSize(label, screenSize) + spacing * screenSize).toBeLessThanOrEqual(box.width);
+        expect(exportSize).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('a full-size box keeps every label at its full size', () => {
+    for (const { labelEm, label } of Object.values(REVIEW_STAMP_META)) {
+      expect(reviewStampLabelSize(REVIEW_STAMP_SIZE.width, REVIEW_STAMP_SIZE.height, labelEm + label.length * 0.06))
+        .toBe(REVIEW_STAMP_SIZE.height * REVIEW_STAMP_TYPO.labelSize);
+    }
   });
 
   it('each review stamp carries a #rrggbb color and a label', () => {

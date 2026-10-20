@@ -3,10 +3,12 @@ import { PDFJS_PARSE_TIMEOUT_MS, type PDFDocumentProxy } from '@/lib/pdfjs';
 import {
   HIGHLIGHT_OPACITY,
   REVIEW_STAMP_META,
+  REVIEW_STAMP_FONT_FAMILY,
   REVIEW_STAMP_TYPO,
   STAMP_META,
   TEXT_MAX_LEN,
   isReviewStampKey,
+  reviewStampLabelSize,
   normalizeRect,
   reviewStampLines,
   reviewStampRect,
@@ -607,7 +609,8 @@ function AnnotatorPage({
       // Type scales with the box so zoom keeps the proportions of a real stamp.
       // Fractions shared with the flatten (REVIEW_STAMP_TYPO) so the export
       // matches this preview; baselines there are y-up, SVG is y-down.
-      const labelSize = rect.height * REVIEW_STAMP_TYPO.labelSize;
+      // Letter spacing adds 0.06 of the size per character to the drawn width.
+      const labelSize = reviewStampLabelSize(rect.width, rect.height, meta.labelEm + label.length * 0.06);
       const whenSize = rect.height * REVIEW_STAMP_TYPO.whenSize;
       return (
         <g key={a.id} {...groupProps}>
@@ -628,6 +631,7 @@ function AnnotatorPage({
             textAnchor="middle"
             fill={meta.color}
             fontSize={labelSize}
+            fontFamily={REVIEW_STAMP_FONT_FAMILY}
             fontWeight={700}
             letterSpacing={labelSize * 0.06}
           >

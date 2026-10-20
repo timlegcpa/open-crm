@@ -1,7 +1,10 @@
 // revoke-portal-access: deactivate one portal account. Owner only.
 //
-// deactivate_portal_account (0012) sets the row to deactivated and revokes the pending
-// links to its address in one transaction. The follow-up is the sign-in user's ban: a
+// deactivate_portal_account (0012, replaced in 0016) sets the row to deactivated, revokes
+// the pending invitations to its address and expires the contact's pending start links,
+// all in one transaction: redeeming a start link creates a fresh active sign-in, so the
+// expiry must not be able to fail apart from the revoke. The follow-up is the sign-in
+// user's ban: a
 // deactivated account must not keep a working password, and the database alone cannot
 // stop a token from refreshing. There is no "sign the user out" step: Auth's admin
 // sign-out takes a session token, not a user id, and the ban is what ends future sign-ins.

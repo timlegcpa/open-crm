@@ -217,7 +217,7 @@ export default function AnnotatorToolbar({
         </>
       )}
       {tool === 'stamp' && (
-        <div className="ml-1 flex items-center gap-1 border-l border-border pl-2">
+        <div className="ml-1 flex flex-wrap items-center gap-1 border-l border-border pl-2">
           {/* Review stamps first: they are the ones the owner reaches for most, and they
               auto-place rather than following the cursor like the glyphs do. */}
           {(Object.keys(REVIEW_STAMP_META) as ReviewStampKey[]).map((k) => {

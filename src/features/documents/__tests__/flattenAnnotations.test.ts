@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { PDFDocument, PDFPage, degrees } from 'pdf-lib';
+import { PDFDocument, PDFPage, StandardFonts, degrees } from 'pdf-lib';
 import { flattenAnnotatedPdf } from '../lib/flattenAnnotations';
-import type { AnnotationData, DocumentAnnotation } from '../lib/annotations';
+import { reviewStampRect, type AnnotationData, type DocumentAnnotation } from '../lib/annotations';
 
 const ann = (
   over: Omit<Partial<DocumentAnnotation>, 'data'> & { data?: unknown },
@@ -294,5 +294,28 @@ describe('flattenAnnotatedPdf', () => {
     const out = await flattenAnnotatedPdf(bytes, annotations);
     const reloaded = await PDFDocument.load(out);
     expect(reloaded.getPageCount()).toBe(2);
+  });
+
+  it('draws the NOT NEEDED label inside its box on a narrow page', async () => {
+    const doc = await PDFDocument.create();
+    doc.addPage([110, 500]);
+    const bytes = await doc.save();
+    const box = reviewStampRect(110, 500);
+    const spy = vi.spyOn(PDFPage.prototype, 'drawText');
+    try {
+      await flattenAnnotatedPdf(bytes, [
+        ann({ kind: 'review_stamp', data: { ...box, stamp: 'not_needed', stampedAt: '2026-08-05T19:42:00.000Z' } }),
+      ]);
+      const call = spy.mock.calls.find(([text]) => text === 'NOT NEEDED');
+      expect(call).toBeDefined();
+      const { size, x } = call![1] as { size: number; x: number };
+      const font = await (await PDFDocument.create()).embedFont(StandardFonts.Helvetica);
+      const width = font.widthOfTextAtSize('NOT NEEDED', size);
+      expect(width).toBeLessThanOrEqual(box.width);
+      expect(x).toBeGreaterThanOrEqual(box.x);
+      expect(x + width).toBeLessThanOrEqual(box.x + box.width);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

@@ -96,6 +96,57 @@ describe('revoke-portal-access', () => {
     expect(retry.banned).toEqual([userId]);
   });
 
+  describe('pending start links', () => {
+    let email: string;
+    let listId: string;
+    let linkId: string;
+
+    beforeEach(async () => {
+      email = `ada-${n}@example.com`;
+      [{ id: listId }] = await rows<{ id: string }>(
+        `INSERT INTO public.needs_lists (contact_id, title, status, sent_at) VALUES ($1, 'Docs', 'sent', now()) RETURNING id`, [contactId]);
+      [{ id: linkId }] = await rows<{ id: string }>(
+        `INSERT INTO public.pending_signup_requests (email, contact_id, needs_list_id, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4, now() + interval '14 days') RETURNING id`,
+        [email, contactId, listId, n.toString(16).padStart(64, '0')]);
+    });
+
+    const linkStatus = async () =>
+      (await rows<{ status: string }>(`SELECT status FROM public.pending_signup_requests WHERE id = $1`, [linkId]))[0].status;
+
+    it('are expired with the revoke, even where the redemption check alone would let one through', async () => {
+      // The revoked account moves to another address; the link's address now belongs to a
+      // second account that is active with no sign-in (what a failed redemption retry
+      // leaves). No clause of start_link_access_revoked refuses that link, so only the
+      // expiry inside the deactivate stops it.
+      await db.query(`UPDATE public.client_portal_accounts SET invited_email = $1 WHERE id = $2`, [`bo-${n}@example.com`, accountId]);
+      await db.query(
+        `INSERT INTO public.client_portal_accounts (contact_id, user_id, status, invited_email, role) VALUES ($1, NULL, 'active', $2, 'secondary')`,
+        [contactId, email]);
+
+      expect((await revoke(deps().d, accountId)).status).toBe(200);
+      expect(await linkStatus()).toBe('expired');
+      const [{ revoked }] = await rows<{ revoked: boolean }>(
+        `SELECT public.start_link_access_revoked($1, $2, $3) AS revoked`, [contactId, email, listId]);
+      expect(revoked).toBe(false);
+
+      const claim = randomUUID();
+      const redeemer = randomUUID();
+      await db.query(`INSERT INTO auth.users (id, email) VALUES ($1, $2)`, [redeemer, `redeemer-${n}@example.com`]);
+      const [{ claimed }] = await rows<{ claimed: boolean }>(`SELECT public.claim_start_link($1, $2) AS claimed`, [linkId, claim]);
+      const [{ linked }] = await rows<{ linked: string | null }>(`SELECT public.link_start_link($1, $2, $3) AS linked`, [linkId, redeemer, claim]);
+      expect(claimed).toBe(false);
+      expect(linked).toBeNull();
+    });
+
+    it('stay pending when the deactivate is refused', async () => {
+      expect((await revoke(deps().d, randomUUID())).status).toBe(404);
+      const failing = deps({ deactivate: async () => { throw new Error('db down'); } });
+      expect((await revoke(failing.d, accountId)).status).toBe(500);
+      expect(await linkStatus()).toBe('pending');
+    });
+  });
+
   it('a missing account is 404', async () => {
     expect((await revoke(deps().d, randomUUID())).status).toBe(404);
   });
