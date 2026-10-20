@@ -1,6 +1,6 @@
 // The contact tools mcp-crm offers, and what each does. Every read and write goes through
-// one mcp_* function in 0007_mcp.sql, which writes its audit row inside the same
-// transaction: a write either commits with its record or not at all, so a retry is safe.
+// one mcp_* function in 0007_mcp.sql or 0015_mcp.sql, which writes its audit row inside the
+// same transaction: a write either commits with its record or not at all, so a retry is safe.
 //
 // Writes are deliberately narrow:
 //   * A quote is written PROPOSED only. Accepting one is the owner's act in the CRM, and it
@@ -10,7 +10,15 @@
 //     a portal account, demands the address the caller read (a compare-and-swap) and, like
 //     delete_quote, the user's explicit go-ahead (confirmed_with_user).
 //   * add_business adds a registry entry and nothing else.
-//   * No tool sets a contact's status.
+//   * A stage changes only through set_contact_status, compare-and-swapped on the stage the
+//     caller read, and never into or out of the system status (a contact created only to
+//     sign, whose address is unproven): promoting one is the owner's call. The status
+//     trigger writes the history and the client-since date, as for the owner's own change.
+//     An archived contact is not searched, moved, or given new board work.
+//
+// The board tools work the owner's work board (0008): a move needs a reason and the lane
+// the caller read, an archived card is not moved, and a note is append-only. Board history
+// is owner-only, so nothing here reaches a client.
 //
 // The request tools work on drafts and never publish one themselves:
 //   * create_request and update_request write a DRAFT, which the client cannot see.
@@ -24,6 +32,12 @@
 //     process (outward.ts), and report the client email and the owner's copy as they
 //     happened, never as assumed.
 //   * delete_request deletes a DRAFT only, at the content the token was verified over.
+//   * close_request and accept_request mirror the owner's Close and Accept all. Each changes
+//     what the client sees, so each needs the user's explicit go-ahead; neither emails
+//     anyone or deletes anything, and a draft is never closed (the client never saw it).
+//   * set_request_reminders pauses or resumes one request's automatic reminders and sends
+//     nothing. list_open_requests is the roster of every open request; it returns no
+//     answer and no token.
 //
 // Tool results are text a model reads; refusals are tool errors (isError) with a fixed
 // message. A database error is never echoed: sentinels are matched, anything else throws
@@ -37,6 +51,7 @@ import type { Logger } from '../_shared/log.ts';
 import type { OutwardRemind, OutwardSend, OwnerCopy, RequestOutward } from './outward.ts';
 import { REVIEW_TOKEN_RE, canonicalRequest, type ReviewList, type ReviewRecipient, type ReviewSigner } from './review-token.ts';
 import {
+  CARD_PRIORITIES,
   CONTACT_CREATABLE,
   CONTACT_UPDATABLE,
   EMAIL_MAX_LEN,
@@ -48,6 +63,9 @@ import {
   REQUEST_ITEM_KINDS,
   normalizeEmail,
   optionalId,
+  parseBoardDate,
+  parseBoardNote,
+  parseCardTitle,
   parseRequestItems,
   parseRequestText,
   pickFrom,
@@ -60,13 +78,26 @@ export interface ToolDb {
   rpc(fn: string, args?: Record<string, unknown>): PromiseLike<{ data: unknown; error: unknown }>;
 }
 
+/** A key and the label the owner gave it. */
+export interface Labelled {
+  key: string;
+  label: string;
+}
+
 /** The active pick-list keys, read once per request when a tool needs them. */
 export interface Vocabulary {
+  /** Every stored status: a search filter, and what a caller may say it read. */
   statuses: string[];
+  /** The stages a model may set: every status but the system one. */
+  selectable_statuses: Labelled[];
+  lead_sources: string[];
   organization_types: string[];
   service_types: string[];
   request_categories: string[];
   request_tags: string[];
+  /** The board's lanes, in order. The owner relabels them, so a model is given both. */
+  board_stages: Labelled[];
+  work_item_types: string[];
 }
 
 export interface ToolContext {
@@ -101,6 +132,10 @@ export const MAX_BUSINESS_NAME_LENGTH = 200;
 export const MAX_SENDS_PER_REQUEST = 1;
 /** Requests list_requests returns; it says so when a contact has more. */
 export const LIST_REQUESTS_LIMIT = 25;
+/** Rows list_open_requests returns; it says so when there are more. */
+export const LIST_OPEN_REQUESTS_LIMIT = 500;
+/** Cards list_board returns; it says so when there are more. */
+export const BOARD_LIST_LIMIT = 200;
 
 const REQUEST_ITEM_SCHEMA = {
   type: 'object',
@@ -129,11 +164,14 @@ export const TOOLS = [
     name: 'search_contacts',
     annotations: { readOnlyHint: true, openWorldHint: false },
     description:
-      'Search CRM contacts by name, email or business name. Returns a compact list with id, name, email, phone, business name and status, newest first. Use it to find a contact id before calling get_contact or update_contact.',
+      'Search CRM contacts by name, email, phone or business name. Returns a compact list with id, name, email, phone, business name and status, newest first. Archived contacts are left out, as they are off the working list. Use it to find a contact id before calling get_contact or update_contact.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'A name, email or business name fragment. Leave it out to list the newest contacts.' },
+        query: {
+          type: 'string',
+          description: 'A name, email, phone or business name fragment. Phone numbers are stored as typed, so search a short run of digits such as the last four. Leave it out to list the newest contacts.',
+        },
         status: { type: 'string', description: 'Optional status filter.' },
         limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Max rows, 1 to 100. Default 25.' },
       },
@@ -154,7 +192,7 @@ export const TOOLS = [
     name: 'create_contact',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     description:
-      'Create a new contact as a lead. Email is required, and the call is refused when a contact already has that address. Use log_call_note to record anything about the conversation. It does not create businesses, quotes or a portal account.',
+      'Create a new contact, for example a lead who just called or emailed. It needs an email OR a phone number (at least one). Search with search_contacts first so you do not create a duplicate; an address already on file is refused. It lands in the first stage of the pipeline unless you pass status. Ask your user how the lead found them and pass it as source; when you do not know, leave it out and it records as other. Use log_call_note to record anything about the conversation. It does not create businesses, quotes or a portal account.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -163,15 +201,16 @@ export const TOOLS = [
         email: { type: 'string' },
         phone: { type: 'string' },
         business_name: { type: 'string' },
+        status: { type: 'string', description: 'The pipeline stage. Defaults to new_lead.' },
+        source: { type: 'string', description: 'How the lead found your user. Defaults to other.' },
       },
-      required: ['email'],
     },
   },
   {
     name: 'update_contact',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     description:
-      "Update an existing contact's first name, last name, phone or business name. Email addresses cannot be changed here, because an address routes portal invitations and sign-in. To correct the contact's address use correct_contact_email, which refuses any contact holding a portal account; a spouse's address changes in the CRM. Notes go through log_call_note. Spouse details, quotes and status are not writable here.",
+      "Update an existing contact's first name, last name, phone or business name. Email addresses cannot be changed here, because an address routes portal invitations and sign-in. To correct the contact's address use correct_contact_email, which refuses any contact holding a portal account; a spouse's address changes in the CRM. Notes go through log_call_note; moving the contact along the pipeline goes through set_contact_status. Spouse details and quotes are not writable here.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -381,6 +420,158 @@ export const TOOLS = [
       required: ['list_id', 'contact_id', 'review_token', 'confirmed_with_user'],
     },
   },
+  {
+    name: 'list_open_requests',
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    description:
+      "Every contact's open requests in one list, grouped by whose move it is: waiting_on_you (the contact submitted it, or a sent request has an answer to accept), waiting_on_client (sent, nothing to accept) and drafts. Closed requests are left out. Each row names the contact, the request id and its title, so you can follow up with list_requests for that contact. At most 500 rows come back; when there are more, truncated is true and you must not call the list complete. Read only: no answers and no review tokens come back here.",
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'close_request',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      "Close a request that has been SENT, whether or not the contact finished it, the same as the owner's Close in the CRM. Closing ends it: the contact can change nothing more on it and its reminder emails stop. Nothing the contact answered or uploaded is deleted. A draft cannot be closed (the contact never saw it; use delete_request). Tell your user which request this is (the contact and the title, from list_requests or list_open_requests) and get their go-ahead first. Closing a request that is already closed is not an error.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'The request id, from list_requests or list_open_requests.' },
+        contact_id: { type: 'string', description: 'The contact the request belongs to. Must match.' },
+        confirmed_with_user: {
+          type: 'boolean',
+          description: 'Must be true. Set it only after your user has heard which request this is and told you to close it.',
+        },
+      },
+      required: ['list_id', 'contact_id', 'confirmed_with_user'],
+    },
+  },
+  {
+    name: 'accept_request',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      "Accept every answer the contact has given on a request, the same as the owner's Accept all in the CRM: an accepted answer is locked, and the contact can no longer change it. Only answered items are accepted; anything still unanswered stays open, and the result says how many. It does not close the request; call close_request after it if your user wants it closed too. Tell your user which request this is and get their go-ahead first.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'The request id, from list_requests or list_open_requests.' },
+        contact_id: { type: 'string', description: 'The contact the request belongs to. Must match.' },
+        confirmed_with_user: {
+          type: 'boolean',
+          description: 'Must be true. Set it only after your user has told you to accept the answers on this request.',
+        },
+      },
+      required: ['list_id', 'contact_id', 'confirmed_with_user'],
+    },
+  },
+  {
+    name: 'set_request_reminders',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    description:
+      'Pause or resume the automatic reminder emails for one request. Pausing stops the automatic reminders about it; resuming lets them continue on their normal schedule. It changes nothing else, sends nothing itself, and leaves any review_token you hold valid.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'The request id, from list_requests or list_open_requests.' },
+        contact_id: { type: 'string', description: 'The contact the request belongs to. Must match.' },
+        paused: { type: 'boolean', description: 'true pauses the reminders, false resumes them.' },
+      },
+      required: ['list_id', 'contact_id', 'paused'],
+    },
+  },
+  {
+    name: 'set_contact_status',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      "Move a contact to another stage of the CRM pipeline. Pass the status you last read (search_contacts or get_contact) as expected_status; the move is refused if it has changed since, so read it again and confirm with your user. Moving someone to a client stage records their client-since date the first time. A contact created only to sign a document (status esign_signer) cannot be moved here, nor can an archived contact: the owner does both in the CRM. This changes the stage only: it accepts no quote.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        status: { type: 'string', description: 'The stage to move them to.' },
+        expected_status: { type: 'string', description: 'The status the contact has now, as you read it.' },
+      },
+      required: ['contact_id', 'status', 'expected_status'],
+    },
+  },
+  {
+    name: 'list_board',
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    description:
+      "List the cards on the work board: your user's own to-dos, each optionally tied to a contact. Cards are private to your user; a contact never sees them. Archived cards are left out, as they are on the board. The answer gives each lane's stored key and the label your user sees; use the key in every other board tool. At most 200 cards come back; when there are more, truncated is true and you must not call the list complete.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        stage: { type: 'string', description: 'Only this lane.' },
+        contact_id: { type: 'string', description: 'Only the cards tied to this contact.' },
+      },
+    },
+  },
+  {
+    name: 'create_work_item',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    description:
+      'Add a card to the work board: a to-do for your user, optionally tied to a contact. Cards are private to your user. It lands in the todo lane unless you pass stage.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'What the work is, 200 characters at most.' },
+        contact_id: { type: 'string', description: 'Optional. The contact this work is for.' },
+        stage: { type: 'string', description: 'The lane, by its key. Defaults to todo.' },
+        work_item_type: { type: 'string', description: 'The kind of work. Defaults to task.' },
+        priority: { type: 'string', enum: [...CARD_PRIORITIES], description: 'Defaults to normal.' },
+        due_date: { type: 'string', description: 'Optional, YYYY-MM-DD.' },
+      },
+      required: ['title'],
+    },
+  },
+  {
+    name: 'update_work_item',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      'Edit a card on the work board: its title, contact, kind of work, priority or due date. Send only the fields you are changing; pass null for contact_id or due_date to clear it. To move it to another lane use move_work_item, which needs a reason.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        work_item_id: { type: 'string' },
+        title: { type: 'string' },
+        contact_id: { type: ['string', 'null'] },
+        work_item_type: { type: 'string' },
+        priority: { type: 'string', enum: [...CARD_PRIORITIES] },
+        due_date: { type: ['string', 'null'], description: 'YYYY-MM-DD, or null to clear it.' },
+      },
+      required: ['work_item_id'],
+    },
+  },
+  {
+    name: 'move_work_item',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      "Move a card to another lane of the work board. A move needs a short reason, the same as dragging a card on the board; it is kept in the card's history. Pass the lane you last read (list_board) as expected_stage; the move is refused if the card has moved since. An archived card is not moved.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        work_item_id: { type: 'string' },
+        to_stage: { type: 'string', description: 'The lane it is going to, by its key.' },
+        expected_stage: { type: 'string', description: 'The lane it is in now, as you read it.' },
+        reason: { type: 'string', description: 'Why it is moving, in a sentence. 2000 characters at most.' },
+      },
+      required: ['work_item_id', 'to_stage', 'expected_stage', 'reason'],
+    },
+  },
+  {
+    name: 'add_work_item_note',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    description:
+      "Add a note to a card's history without moving it. Notes are private to your user and append-only: this can never change or delete an earlier note.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        work_item_id: { type: 'string' },
+        note: { type: 'string', description: 'The note, 2000 characters at most.' },
+      },
+      required: ['work_item_id', 'note'],
+    },
+  },
 ];
 
 
@@ -388,18 +579,38 @@ export const TOOL_NAMES: readonly string[] = TOOLS.map((t) => t.name);
 
 /**
  * The catalog as tools/list returns it: the pick-list enums filled in from the database at
- * request time, so a key the owner adds or deactivates shows up without a deploy.
- * delete_quote's service_type gets no enum on purpose: a quote on a service deactivated
+ * request time, so a key the owner adds or deactivates shows up without a deploy, and the
+ * stage and lane labels appended to the descriptions that need them. delete_quote's service_type gets no enum on purpose: a quote on a service deactivated
  * since must stay deletable.
  */
 export function toolCatalog(vocab: Vocabulary): unknown[] {
   type Props = Record<string, Record<string, unknown>>;
-  const catalog = structuredClone(TOOLS) as unknown as Array<{ name: string; inputSchema: { properties: Props } }>;
+  const catalog = structuredClone(TOOLS) as unknown as Array<{ name: string; description: string; inputSchema: { properties: Props } }>;
   const props = (tool: string) => catalog.find((t) => t.name === tool)!.inputSchema.properties;
   const set = (tool: string, prop: string, values: string[]) => {
     props(tool)[prop].enum = [...values];
   };
+  const stages = vocab.selectable_statuses.map((s) => s.key);
+  const lanes = vocab.board_stages.map((s) => s.key);
   set('search_contacts', 'status', vocab.statuses);
+  set('create_contact', 'status', stages);
+  set('create_contact', 'source', vocab.lead_sources);
+  set('set_contact_status', 'status', stages);
+  set('set_contact_status', 'expected_status', vocab.statuses);
+  for (const [tool, prop] of [['list_board', 'stage'], ['create_work_item', 'stage'], ['move_work_item', 'to_stage'], ['move_work_item', 'expected_stage']]) {
+    set(tool, prop, lanes);
+  }
+  set('create_work_item', 'work_item_type', vocab.work_item_types);
+  set('update_work_item', 'work_item_type', vocab.work_item_types);
+  // The owner names the stages and lanes, and a stored key need not read like its label
+  // ('doing' may show as 'In progress'): a model told only one of the two moves things to
+  // the wrong place. So each description carries both, as the owner has them now.
+  const guide = (label: string, list: Labelled[]) => ` ${label}, stored key = what your user sees: ${list.map((s) => `${s.key} = ${s.label}`).join(', ')}.`;
+  const describe = (tool: string, text: string) => {
+    catalog.find((t) => t.name === tool)!.description += text;
+  };
+  for (const tool of ['create_contact', 'set_contact_status']) describe(tool, guide('Pipeline stages', vocab.selectable_statuses));
+  for (const tool of ['list_board', 'create_work_item', 'move_work_item']) describe(tool, guide('Lanes', vocab.board_stages));
   set('add_business', 'organization_type', vocab.organization_types);
   set('upsert_quote', 'service_type', vocab.service_types);
   for (const tool of ['create_request', 'update_request']) {
@@ -421,7 +632,24 @@ const NO_REQUEST = 'No request with that id for that contact. Read the requests 
 const STALE_TOKEN =
   'That review_token does not match the request as it stands now (its content, its answers or its recipient changed, or the token belongs to another request). Nothing was done. Read it again with list_requests, read it back to your user, and confirm again.';
 const INACTIVE_KEY = 'An item names a category or tag that is not in use any more. List the tools again for the current ones.';
-const SENT_NOT_REWRITTEN = "That request has been sent, so it cannot be rewritten: its items hold the contact's answers. Create a new request instead.";
+const NO_CARD = 'No card with that id. Read the board again with list_board.';
+const INACTIVE_TYPE = 'That kind of work is not in use any more. List the tools again for the current ones.';
+
+/** The roster's sections, in order: what needs the owner first. */
+const ROSTER_SECTIONS = [
+  { key: 'waiting_on_you', label: 'Waiting on you' },
+  { key: 'waiting_on_client', label: 'Waiting on the contact' },
+  { key: 'drafts', label: 'Drafts' },
+] as const;
+
+/** A card's contact refused by mcp_work_item_contact_ok, as a message; null for any other error. */
+function boardContactRefusal(error: unknown, fn: string): string | null {
+  if (sentinel(error, `${fn}: contact_not_found`)) return NO_CONTACT;
+  if (sentinel(error, `${fn}: contact_archived`)) return 'That contact is archived, so no new work is tied to it. The owner restores it in the CRM first. Nothing was saved.';
+  return null;
+}
+
+const SENT_NOT_REWRITTEN ="That request has been sent, so it cannot be rewritten: its items hold the contact's answers. Create a new request instead.";
 
 /** Why a send that reached the publish step sent nothing, by outcome. */
 const SEND_REFUSALS: Record<Exclude<OutwardSend['status'], 'sent' | 'already_sent'>, string> = {
@@ -683,19 +911,40 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
 
   if (name === 'create_contact') {
     const patch = pickFrom(CONTACT_CREATABLE, args);
-    if (patch.email === undefined) return toolError('email is required.');
-    // Normalize BEFORE validating: the pattern check runs on the trimmed address, so a
-    // padded but otherwise valid address is accepted rather than refused.
-    const norm = normalizeEmail(patch.email);
-    if ('error' in norm) return toolError(norm.error);
-    patch.email = norm.email;
+    // A blank address or phone is an absent one, so a lead who phoned in is not refused for
+    // carrying email: "".
+    for (const k of ['email', 'phone'] as const) {
+      if (typeof patch[k] === 'string' && !(patch[k] as string).trim()) delete patch[k];
+    }
+    if (patch.email === undefined && patch.phone === undefined) return toolError('An email or a phone number is required.');
+    if (patch.email !== undefined) {
+      // Normalize BEFORE validating: the pattern check runs on the trimmed address, so a
+      // padded but otherwise valid address is accepted rather than refused.
+      const norm = normalizeEmail(patch.email);
+      if ('error' in norm) return toolError(norm.error);
+      patch.email = norm.email;
+    }
     const bad = validateContactPatch(patch);
     if (bad) return toolError(`${bad}.`);
+    if (typeof patch.phone === 'string') patch.phone = patch.phone.trim();
+    if (args.status !== undefined && args.status !== null) {
+      const stages = (await ctx.vocabulary()).selectable_statuses.map((s) => s.key);
+      if (typeof args.status !== 'string' || !stages.includes(args.status)) return toolError(`status must be one of: ${stages.join(', ')}.`);
+      patch.status = args.status;
+    }
+    if (args.source !== undefined && args.source !== null) {
+      const { lead_sources } = await ctx.vocabulary();
+      if (typeof args.source !== 'string' || !lead_sources.includes(args.source)) return toolError(`source must be one of: ${lead_sources.join(', ')}.`);
+      patch.source = args.source;
+    }
 
     // The duplicate check is inside the function, under a lock, and fails closed: an error
     // there throws, and nothing is inserted on an unverified check.
     const { data, error } = await rpc('mcp_create_contact', { p_patch: patch });
-    if (error) throw error;
+    if (error) {
+      if (sentinel(error, 'mcp_create_contact: inactive_source')) return toolError('That lead source is not in use any more. List the tools again for the current ones.');
+      throw error;
+    }
     const result = data as { outcome?: string; id?: string } | null;
     if (result?.outcome === 'duplicate') return toolError(`A contact with that email already exists (id ${result.id}).`);
     if (result?.outcome !== 'created') throw new Error(`mcp_create_contact returned an unknown outcome: ${String(result?.outcome)}`);
@@ -1237,6 +1486,295 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
       deleted: { list_id: list.id, title: list.title, item_count: (data as { item_count?: number } | null)?.item_count ?? list.items.length },
       note: 'Draft deleted. The contact never saw it. This cannot be undone.',
     });
+  }
+
+  if (name === 'list_open_requests') {
+    const read = await auditedRpc(ctx, 'mcp_list_open_requests', { p_limit: LIST_OPEN_REQUESTS_LIMIT }, {});
+    if ('failed' in read) return toolError(read.failed);
+    const { data, error } = read;
+    if (error) throw error;
+    const roster = data as { rows: Array<{ section: string } & Record<string, unknown>>; truncated: boolean };
+    const sections = ROSTER_SECTIONS.map((s) => {
+      const rows = roster.rows.filter((r) => r.section === s.key).map(({ section: _section, ...row }) => row);
+      return { section: s.key, label: s.label, count: rows.length, rows };
+    }).filter((s) => s.count > 0);
+    return toolText({
+      total: roster.rows.length,
+      truncated: roster.truncated,
+      ...(roster.truncated
+        ? { truncation_note: `There are more than ${LIST_OPEN_REQUESTS_LIMIT} open requests and only the first ${LIST_OPEN_REQUESTS_LIMIT} are listed. Do not tell your user this is all of them; the rest are in the CRM.` }
+        : {}),
+      sections,
+    });
+  }
+
+  if (name === 'close_request') {
+    if (!isUuid(args.list_id)) return toolError('list_id must be a valid id.');
+    if (!isUuid(args.contact_id)) return toolError('contact_id must be a valid id.');
+    if (args.confirmed_with_user !== true) {
+      return toolError(
+        'Not closed. Tell your user which request this is (the contact and the title), get their go-ahead, then call again with confirmed_with_user: true.',
+      );
+    }
+    // One transaction: the list locked, a draft refused, the close and its audit row.
+    const closed = await auditedRpc(ctx, 'mcp_close_request', { p_list_id: args.list_id, p_contact_id: args.contact_id }, auditIds(args));
+    if ('failed' in closed) return toolError(closed.failed);
+    const { data, error } = closed;
+    if (error) throw error;
+    const result = data as { applied?: boolean; reason?: string; from_status?: string } | null;
+    if (result?.applied === true) {
+      return toolText({
+        closed: { list_id: args.list_id, previous_status: result.from_status ?? null },
+        note: 'Closed. The contact can change nothing more on it and its reminders have stopped. Nothing they answered or uploaded was deleted.',
+      });
+    }
+    switch (result?.reason) {
+      case 'already_closed':
+        return toolText({ closed: { list_id: args.list_id }, note: 'It was already closed. Nothing changed.' });
+      case 'draft':
+        return toolError('That request is still a draft and the contact never saw it, so there is nothing to close. Use delete_request if it should not go out.');
+      case 'not_found':
+        return toolError(NO_REQUEST);
+      default:
+        throw new Error(`mcp_close_request returned an unknown outcome: ${String(result?.reason)}`);
+    }
+  }
+
+  if (name === 'accept_request') {
+    if (!isUuid(args.list_id)) return toolError('list_id must be a valid id.');
+    if (!isUuid(args.contact_id)) return toolError('contact_id must be a valid id.');
+    if (args.confirmed_with_user !== true) {
+      return toolError(
+        'Nothing accepted. Tell your user which request this is (the contact and the title), get their go-ahead, then call again with confirmed_with_user: true.',
+      );
+    }
+    // Only answered items move, under a lock on the list, with the audit row.
+    const accepted = await auditedRpc(ctx, 'mcp_accept_request', { p_list_id: args.list_id, p_contact_id: args.contact_id }, auditIds(args));
+    if ('failed' in accepted) return toolError(accepted.failed);
+    const { data, error } = accepted;
+    if (error) throw error;
+    if (!data) return toolError(NO_REQUEST);
+    const result = data as { accepted: number; still_open: number; list_status: string };
+    const open = result.still_open;
+    return toolText({
+      accepted: result.accepted,
+      still_unanswered: open,
+      request_status: result.list_status,
+      note:
+        result.accepted === 0
+          ? 'There were no answered items waiting to be accepted. Nothing changed.'
+          : `Accepted ${result.accepted} answered ${result.accepted === 1 ? 'item' : 'items'}.` +
+            (open > 0 ? ` ${open} still ${open === 1 ? 'has' : 'have'} no answer.` : '') +
+            ' The request is still open; use close_request if your user wants it closed.',
+    });
+  }
+
+  if (name === 'set_request_reminders') {
+    if (!isUuid(args.list_id)) return toolError('list_id must be a valid id.');
+    if (!isUuid(args.contact_id)) return toolError('contact_id must be a valid id.');
+    if (typeof args.paused !== 'boolean') return toolError('paused must be true or false.');
+    const set = await auditedRpc(ctx, 'mcp_set_request_reminders', {
+      p_list_id: args.list_id, p_contact_id: args.contact_id, p_paused: args.paused,
+    }, auditIds(args));
+    if ('failed' in set) return toolError(set.failed);
+    const { data, error } = set;
+    if (error) throw error;
+    if (!data) return toolError(NO_REQUEST);
+    return toolText({
+      request: data,
+      note: args.paused
+        ? 'Automatic reminders for this request are paused. Nothing was sent.'
+        : 'Automatic reminders for this request will continue on their normal schedule. Nothing was sent.',
+    });
+  }
+
+  if (name === 'set_contact_status') {
+    if (!isUuid(args.contact_id)) return toolError('contact_id must be a valid id.');
+    const vocab = await ctx.vocabulary();
+    const stages = vocab.selectable_statuses.map((s) => s.key);
+    if (typeof args.status !== 'string' || !stages.includes(args.status)) return toolError(`status must be one of: ${stages.join(', ')}.`);
+    // A stored status, never free text: it reaches SQL and a refusal names it. The stored
+    // set, so a caller that read the system status gets that refusal, not a validation error.
+    if (typeof args.expected_status !== 'string' || !vocab.statuses.includes(args.expected_status)) {
+      return toolError(`expected_status is required and must be the status the contact has now, one of: ${vocab.statuses.join(', ')}. Read the contact first.`);
+    }
+    // Lock, compare-and-swap, the write and its audit row: one transaction in the function.
+    const { data, error } = await rpc('mcp_set_contact_status', {
+      p_contact_id: args.contact_id, p_status: args.status, p_expected_status: args.expected_status,
+    });
+    if (error) throw error;
+    const result = data as { outcome?: string; current_status?: string } & Record<string, unknown>;
+    switch (result?.outcome) {
+      case 'updated': {
+        const { outcome: _outcome, ...updated } = result;
+        return toolText({ updated });
+      }
+      case 'unchanged':
+        return toolText({ unchanged: { contact_id: args.contact_id, status: result.status }, note: 'The contact was already in that stage. Nothing was written.' });
+      case 'not_found':
+        return toolError(NO_CONTACT);
+      case 'system_status':
+        return toolError('That contact was created only to sign a document, and its address is unproven. The owner promotes it in the CRM, not here. Nothing was changed.');
+      case 'archived':
+        return toolError('That contact is archived. The owner restores it in the CRM first. Nothing was changed.');
+      case 'stale':
+        return toolError(
+          `The contact's status is now ${String(result.current_status)}, not ${args.expected_status}, so nothing was changed. Confirm the move with your user against the current stage, then send it again with expected_status set to it.`,
+        );
+      default:
+        throw new Error(`mcp_set_contact_status returned an unknown outcome: ${String(result?.outcome)}`);
+    }
+  }
+
+  if (name === 'list_board') {
+    let stage: string | null = null;
+    if (args.stage !== undefined && args.stage !== null) {
+      const lanes = (await ctx.vocabulary()).board_stages.map((s) => s.key);
+      if (typeof args.stage !== 'string' || !lanes.includes(args.stage)) return toolError(`stage must be one of: ${lanes.join(', ')}.`);
+      stage = args.stage;
+    }
+    const contact = optionalId(args.contact_id, isUuid);
+    if ('error' in contact) return toolError('contact_id must be a valid id, or left out.');
+    const { data, error } = await rpc('mcp_list_board', { p_stage: stage, p_contact_id: contact.id, p_limit: BOARD_LIST_LIMIT });
+    if (error) throw error;
+    const board = data as { truncated: boolean } & Record<string, unknown>;
+    return toolText({
+      ...board,
+      ...(board.truncated
+        ? { truncation_note: `The board has more than ${BOARD_LIST_LIMIT} cards here and only the first ${BOARD_LIST_LIMIT} are listed. Do not tell your user this is all of them.` }
+        : {}),
+    });
+  }
+
+  if (name === 'create_work_item') {
+    const title = parseCardTitle(args.title);
+    if ('error' in title) return toolError(title.error);
+    const vocab = await ctx.vocabulary();
+    const lanes = vocab.board_stages.map((s) => s.key);
+    if (args.stage !== undefined && args.stage !== null && (typeof args.stage !== 'string' || !lanes.includes(args.stage))) {
+      return toolError(`stage must be one of: ${lanes.join(', ')}.`);
+    }
+    if (args.work_item_type !== undefined && args.work_item_type !== null
+      && (typeof args.work_item_type !== 'string' || !vocab.work_item_types.includes(args.work_item_type))) {
+      return toolError(`work_item_type must be one of: ${vocab.work_item_types.join(', ')}.`);
+    }
+    if (args.priority !== undefined && args.priority !== null && !(CARD_PRIORITIES as readonly unknown[]).includes(args.priority)) {
+      return toolError(`priority must be one of: ${CARD_PRIORITIES.join(', ')}.`);
+    }
+    let dueDate: string | null = null;
+    if (args.due_date !== undefined && args.due_date !== null) {
+      const d = parseBoardDate(args.due_date);
+      if ('error' in d) return toolError(d.error);
+      dueDate = d.date;
+    }
+    const contact = optionalId(args.contact_id, isUuid);
+    if ('error' in contact) return toolError('contact_id must be a valid id, or left out.');
+    // NULL takes the column defaults: the todo lane, the task type, normal priority.
+    const { data, error } = await rpc('mcp_create_work_item', {
+      p_title: title.title,
+      p_contact_id: contact.id,
+      p_work_item_type: typeof args.work_item_type === 'string' ? args.work_item_type : null,
+      p_stage: typeof args.stage === 'string' ? args.stage : null,
+      p_priority: typeof args.priority === 'string' ? args.priority : null,
+      p_due_date: dueDate,
+    });
+    if (error) {
+      const refusal = boardContactRefusal(error, 'mcp_create_work_item');
+      if (refusal) return toolError(refusal);
+      if (sentinel(error, 'mcp_create_work_item: inactive_type')) return toolError(INACTIVE_TYPE);
+      throw error;
+    }
+    return toolText({ created: data });
+  }
+
+  if (name === 'update_work_item') {
+    if (!isUuid(args.work_item_id)) return toolError('work_item_id must be a valid id.');
+    if (args.stage !== undefined) return toolError('The lane cannot be changed here. Use move_work_item, which needs a reason. Nothing was updated.');
+    // PRESENCE decides what is written: an absent key leaves the field alone, an explicit
+    // null clears the contact or the due date.
+    const patch: Record<string, unknown> = {};
+    if (args.title !== undefined) {
+      const title = parseCardTitle(args.title);
+      if ('error' in title) return toolError(title.error);
+      patch.title = title.title;
+    }
+    if (args.work_item_type !== undefined) {
+      const { work_item_types } = await ctx.vocabulary();
+      if (typeof args.work_item_type !== 'string' || !work_item_types.includes(args.work_item_type)) {
+        return toolError(`work_item_type must be one of: ${work_item_types.join(', ')}.`);
+      }
+      patch.work_item_type = args.work_item_type;
+    }
+    if (args.priority !== undefined) {
+      if (!(CARD_PRIORITIES as readonly unknown[]).includes(args.priority)) return toolError(`priority must be one of: ${CARD_PRIORITIES.join(', ')}.`);
+      patch.priority = args.priority;
+    }
+    if (args.due_date !== undefined) {
+      const d = parseBoardDate(args.due_date);
+      if ('error' in d) return toolError(d.error);
+      patch.due_date = d.date;
+    }
+    if (args.contact_id !== undefined) {
+      const contact = optionalId(args.contact_id, isUuid);
+      if ('error' in contact) return toolError('contact_id must be a valid id, or null to clear it.');
+      patch.contact_id = contact.id;
+    }
+    if (Object.keys(patch).length === 0) return toolError('No updatable fields supplied.');
+    const { data, error } = await rpc('mcp_update_work_item', { p_id: args.work_item_id, p_patch: patch });
+    if (error) {
+      const refusal = boardContactRefusal(error, 'mcp_update_work_item');
+      if (refusal) return toolError(refusal);
+      if (sentinel(error, 'mcp_update_work_item: inactive_type')) return toolError(INACTIVE_TYPE);
+      throw error;
+    }
+    if (!data) return toolError(NO_CARD);
+    return toolText({ updated: data });
+  }
+
+  if (name === 'move_work_item') {
+    if (!isUuid(args.work_item_id)) return toolError('work_item_id must be a valid id.');
+    const lanes = (await ctx.vocabulary()).board_stages;
+    const keys = lanes.map((s) => s.key);
+    if (typeof args.to_stage !== 'string' || !keys.includes(args.to_stage) || typeof args.expected_stage !== 'string' || !keys.includes(args.expected_stage)) {
+      return toolError(`to_stage and expected_stage must each be one of: ${keys.join(', ')}.`);
+    }
+    const reason = parseBoardNote(args.reason, 'reason');
+    if ('error' in reason) return toolError(reason.error);
+    const { data, error } = await rpc('mcp_move_work_item', {
+      p_id: args.work_item_id, p_stage: args.to_stage, p_expected_stage: args.expected_stage, p_note: reason.note,
+    });
+    if (error) throw error;
+    const result = data as { outcome?: string; current_stage?: string } | null;
+    const lane = (key: unknown) => {
+      const found = lanes.find((s) => s.key === key);
+      return found ? `${found.label} (${found.key})` : String(key);
+    };
+    switch (result?.outcome) {
+      case 'moved':
+        return toolText({ moved: { work_item_id: args.work_item_id, from: lane(args.expected_stage), to: lane(args.to_stage) } });
+      case 'unchanged':
+        return toolText({ unchanged: { work_item_id: args.work_item_id, stage: args.to_stage }, note: 'The card was already in that lane. Nothing was written.' });
+      case 'not_found':
+        return toolError(NO_CARD);
+      case 'not_on_board':
+        return toolError('That card is archived, so it is not on the board. Nothing was moved. The owner restores it from Archived on the board first.');
+      case 'stale':
+        return toolError(
+          `The card is now in ${lane(result.current_stage)}, not ${lane(args.expected_stage)}, so nothing was moved. Read it again with list_board and confirm the move against its current lane.`,
+        );
+      default:
+        throw new Error(`mcp_move_work_item returned an unknown outcome: ${String(result?.outcome)}`);
+    }
+  }
+
+  if (name === 'add_work_item_note') {
+    if (!isUuid(args.work_item_id)) return toolError('work_item_id must be a valid id.');
+    const note = parseBoardNote(args.note);
+    if ('error' in note) return toolError(note.error);
+    const { data, error } = await rpc('mcp_add_work_item_note', { p_id: args.work_item_id, p_note: note.note });
+    if (error) throw error;
+    if (data !== true) return toolError(NO_CARD);
+    return toolText({ logged: { work_item_id: args.work_item_id } });
   }
 
   return toolError(`Unknown tool: ${name}`);

@@ -21,6 +21,8 @@ import {
   createMcpOauthEndpoints,
   createMcpOauthHandler,
   jwtAal,
+  parseExtraRedirectUris,
+  rejectedCallbacks,
   validRedirectUri,
   type McpOauthDeps,
 } from '../../../supabase/functions/mcp-oauth/handler';
@@ -149,6 +151,8 @@ describe('validRedirectUri', () => {
     ['a query on an allowlisted callback', `${REDIRECT}?next=https://attacker.example`],
     ['another path on an allowlisted host', 'https://claude.ai/attacker/cb'],
     ['a fragment', `${REDIRECT}#x`],
+    ['a bare trailing fragment mark', `${REDIRECT}#`],
+    ['a bare trailing query mark', `${REDIRECT}?`],
     ['credentials in the URL', 'https://user:pw@claude.ai/api/mcp/auth_callback'],
     ['a look-alike host', 'https://claude.ai.attacker.example/api/mcp/auth_callback'],
     ['plain http to a public host', 'http://claude.ai/api/mcp/auth_callback'],
@@ -159,6 +163,44 @@ describe('validRedirectUri', () => {
     ['an overlong URL', `http://localhost/${'x'.repeat(500)}`],
   ])('refuses %s', (_label, uri) => {
     expect(validRedirectUri(uri)).toBe(false);
+  });
+});
+
+describe('the adopter\u2019s extra callbacks', () => {
+  const EXTRA = 'https://assistant.example.com/oauth/callback';
+
+  it('parses exact https addresses, and refuses anything else without widening the list', () => {
+    expect(parseExtraRedirectUris(undefined)).toEqual({ uris: [], rejected: [] });
+    expect(parseExtraRedirectUris(` ${EXTRA} ,, https://Other.Example.com/cb `)).toEqual({
+      uris: [EXTRA, 'https://other.example.com/cb'], rejected: [],
+    });
+    const parsed = parseExtraRedirectUris(
+      `${EXTRA}?next=x, ${EXTRA}#, http://assistant.example.com/cb, https://user:pw@assistant.example.com/cb, not a url, ${EXTRA}?`,
+    );
+    expect(parsed.uris).toEqual([]);
+    // Named by scheme, host and path only: never the query, credentials or fragment.
+    expect(parsed.rejected).toEqual([
+      'https://assistant.example.com/oauth/callback', 'https://assistant.example.com/oauth/callback',
+      'http://assistant.example.com/cb', 'https://assistant.example.com/cb', '<unparseable>',
+      'https://assistant.example.com/oauth/callback',
+    ]);
+  });
+
+  it('an extra callback is valid only when configured, and only exactly', () => {
+    const extra = new Set(parseExtraRedirectUris(EXTRA).uris);
+    expect(validRedirectUri(EXTRA)).toBe(false);
+    expect(validRedirectUri(EXTRA, extra)).toBe(true);
+    for (const uri of [`${EXTRA}/more`, `${EXTRA}?x=1`, `${EXTRA}#`, 'https://assistant.example.com/', `http://assistant.example.com/oauth/callback`]) {
+      expect([uri, validRedirectUri(uri, extra)]).toEqual([uri, false]);
+    }
+  });
+
+  it('rejectedCallbacks names only the refused entries, by scheme, host and path', () => {
+    expect(rejectedCallbacks([REDIRECT, 'https://new.example.com/cb?token=secret#frag', 42, null])).toEqual([
+      'https://new.example.com/cb', '<number>', '<null>',
+    ]);
+    expect(rejectedCallbacks('https://user:pw@new.example.com/cb')).toEqual(['https://new.example.com/cb']);
+    expect(rejectedCallbacks(Array(9).fill('nope'))).toHaveLength(5);
   });
 });
 
@@ -322,6 +364,40 @@ describe('/register', () => {
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toBe(error);
     expect((await db.query<{ n: number }>(`SELECT count(*)::int AS n FROM public.mcp_oauth_clients`)).rows[0].n).toBe(before);
+  });
+});
+
+describe('/register with an extra callback, and the refusal log', () => {
+  const EXTRA = 'https://assistant.example.com/oauth/callback';
+
+  it('registers a configured extra callback, and parks a request to it', async () => {
+    const h = createMcpOauthHandler(liveDeps({ extraRedirectUris: [EXTRA] }));
+    const reg = await h(new Request(`${FN}/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ redirect_uris: [EXTRA] }) }));
+    expect(reg.status).toBe(201);
+    const clientId = ((await reg.json()) as { client_id: string }).client_id;
+    const q = new URLSearchParams({
+      response_type: 'code', client_id: clientId, redirect_uri: EXTRA, state: 's',
+      code_challenge: await pkceChallenge(VERIFIER), code_challenge_method: 'S256', scope: 'mcp:crm', resource: RESOURCE,
+    });
+    expect((await h(new Request(`${FN}/authorize?${q}`))).status).toBe(302);
+    // Without the configuration the same client is refused at /authorize.
+    expect((await handler(new Request(`${FN}/authorize?${q}`))).status).toBe(400);
+  });
+
+  it('logs the refused callbacks by scheme, host and path, never a query, credentials or the whole name', async () => {
+    const lines: string[] = [];
+    const h = createMcpOauthHandler(liveDeps({ logSink: (_level, line) => lines.push(line) }));
+    const res = await h(new Request(`${FN}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [REDIRECT, 'https://user:pw@new.example.com/agents/cb?code=abc123#frag'], client_name: 'New assistant\n' + 'x'.repeat(100) }),
+    }));
+    expect(res.status).toBe(400);
+    const line = lines.find((l) => l.includes('register refused'));
+    expect(line).toBeDefined();
+    expect(line).toContain('https://new.example.com/agents/cb');
+    expect(line).toContain('count=2');
+    for (const leak of ['user:pw', 'code=abc123', 'frag', 'x'.repeat(61), 'claude.ai']) expect([leak, line!.includes(leak)]).toEqual([leak, false]);
   });
 });
 

@@ -40,9 +40,11 @@ export function normalizeEmail(v: unknown): { email: string } | { error: string 
 }
 
 /**
- * The fields a model may set on a contact: the four base fields. Status, source, spouse
- * details, addresses and the client-since date are not writable by a model; the
- * connector's provenance lives in the audit log, not the lead source.
+ * The fields a model may set on a contact: the four base fields. Spouse details, addresses
+ * and the client-since date are not writable by a model. A new contact may also be given a
+ * stage and a lead source (create_contact checks each against the vocabulary itself), and
+ * an existing one moves stage only through set_contact_status, compare-and-swapped. The
+ * connector's provenance lives in the audit log either way.
  */
 export const CONTACT_BASE_WRITABLE = ['first_name', 'last_name', 'phone', 'business_name'] as const;
 /** Creation may set the address. An update may not: an address is a routing control. */
@@ -190,4 +192,42 @@ export function parseRequestText(title: unknown, intro: unknown): { title: strin
   const text = typeof intro === 'string' ? intro.trim() : '';
   if (text.length > MAX_REQUEST_INTRO) return { error: `intro_message must be ${MAX_REQUEST_INTRO} characters or fewer.` };
   return { title: title.trim(), intro: text || null };
+}
+
+/** work_items.title's bound (0008). */
+export const WORK_ITEM_TITLE_MAX = 200;
+/** work_item_events_note_length: every board history note, a move's reason included. */
+export const BOARD_NOTE_MAX = 2000;
+/** work_items.priority's CHECK (0008). */
+export const CARD_PRIORITIES = ['urgent', 'normal', 'low'] as const;
+
+/**
+ * A card's due date: YYYY-MM-DD that is a real calendar day, or null to clear it. The
+ * calendar check matters: '2027-02-30' matches the pattern and would fail the ::date cast
+ * in the database as a generic error the caller could do nothing with.
+ */
+export function parseBoardDate(v: unknown): { date: string | null } | { error: string } {
+  if (v === null) return { date: null };
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return { error: 'due_date must be YYYY-MM-DD, or null to clear it.' };
+  const [y, m, d] = v.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return { error: 'due_date is not a real calendar date.' };
+  if (y < 2000 || y > 2100) return { error: 'due_date must fall between 2000 and 2100.' };
+  return { date: v };
+}
+
+/** A board history note (or a move's reason): trimmed, required, within the database's cap. */
+export function parseBoardNote(v: unknown, field = 'note'): { note: string } | { error: string } {
+  const note = typeof v === 'string' ? v.trim() : '';
+  if (!note) return { error: `${field} is required.` };
+  if (note.length > BOARD_NOTE_MAX) return { error: `${field} must be ${BOARD_NOTE_MAX} characters or fewer.` };
+  return { note };
+}
+
+/** A card's title: trimmed, required, within the column's bound. */
+export function parseCardTitle(v: unknown): { title: string } | { error: string } {
+  const title = typeof v === 'string' ? v.trim() : '';
+  if (!title) return { error: 'title is required.' };
+  if (title.length > WORK_ITEM_TITLE_MAX) return { error: `title must be ${WORK_ITEM_TITLE_MAX} characters or fewer.` };
+  return { title };
 }

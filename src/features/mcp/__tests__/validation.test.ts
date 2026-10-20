@@ -8,8 +8,13 @@ import {
   KEY_RE,
   MAX_AMOUNT,
   MAX_REQUEST_ITEMS,
+  BOARD_NOTE_MAX,
+  WORK_ITEM_TITLE_MAX,
   normalizeEmail,
   optionalId,
+  parseBoardDate,
+  parseBoardNote,
+  parseCardTitle,
   parseRequestItems,
   parseRequestText,
   pickFrom,
@@ -107,6 +112,39 @@ describe('KEY_RE', () => {
   });
 });
 
+const VOCAB = {
+  statuses: ['new_lead', 'client', 'esign_signer'],
+  selectable_statuses: [{ key: 'new_lead', label: 'New' }, { key: 'client', label: 'Client' }],
+  lead_sources: ['referral', 'other'],
+  organization_types: ['llc'], service_types: ['retainer'],
+  request_categories: ['general', 'contract'], request_tags: ['general'],
+  board_stages: [{ key: 'todo', label: 'To do' }, { key: 'doing', label: 'In progress' }],
+  work_item_types: ['task'],
+};
+
+describe('the board inputs', () => {
+  it('parseBoardDate takes a real calendar day or null, and nothing else', () => {
+    expect(parseBoardDate('2027-04-15')).toEqual({ date: '2027-04-15' });
+    expect(parseBoardDate(null)).toEqual({ date: null });
+    // Each matches nothing a ::date cast would accept, or is outside the bound.
+    for (const v of ['2027-02-30', '2027-13-01', '4/15/2027', '', 20270415, '1999-12-31', '2101-01-01', undefined]) {
+      expect([v, 'error' in parseBoardDate(v)]).toEqual([v, true]);
+    }
+  });
+
+  it('parseBoardNote trims, requires text and holds the history note cap', () => {
+    expect(parseBoardNote('  called them  ')).toEqual({ note: 'called them' });
+    expect(parseBoardNote('x'.repeat(BOARD_NOTE_MAX))).toEqual({ note: 'x'.repeat(BOARD_NOTE_MAX) });
+    for (const v of ['   ', undefined, 5, 'x'.repeat(BOARD_NOTE_MAX + 1)]) expect('error' in parseBoardNote(v)).toBe(true);
+    expect(parseBoardNote('', 'reason')).toEqual({ error: 'reason is required.' });
+  });
+
+  it('parseCardTitle trims, requires text and holds the title bound', () => {
+    expect(parseCardTitle(' Call back ')).toEqual({ title: 'Call back' });
+    for (const v of [' ', null, 7, 'x'.repeat(WORK_ITEM_TITLE_MAX + 1)]) expect('error' in parseCardTitle(v)).toBe(true);
+  });
+});
+
 describe('the tool handlers refuse bad input before any database call', () => {
   /** The calls made, less the refusal records: send, remind and delete record each refusal and touch nothing else. */
   const acting = (rpc: ReturnType<typeof vi.fn>) =>
@@ -123,10 +161,7 @@ describe('the tool handlers refuse bad input before any database call', () => {
       actor: ID,
       ip: null,
       userAgent: null,
-      vocabulary: async () => ({
-        statuses: ['new_lead'], organization_types: ['llc'], service_types: ['retainer'],
-        request_categories: ['general', 'contract'], request_tags: ['general'],
-      }),
+      vocabulary: async () => VOCAB,
       budget: { sends: 0 },
       review: createReviewSigner('test-review-secret-0123456789abcdef'),
       outward: { send: outwardCalls, remind: outwardCalls, receipt: outwardCalls, alert: outwardCalls },
@@ -149,6 +184,44 @@ describe('the tool handlers refuse bad input before any database call', () => {
     ['search_contacts', { limit: 2.5 }],
     ['search_contacts', { limit: '5' }],
     ['create_contact', {}],
+    ['create_contact', { email: '  ', phone: '' }],
+    ['create_contact', { phone: 5551234 }],
+    ['create_contact', { phone: '555 0100', status: 'esign_signer' }],
+    ['create_contact', { phone: '555 0100', status: 'made_up' }],
+    ['create_contact', { phone: '555 0100', source: 'made_up' }],
+    ['create_contact', { phone: '555 0100', source: 7 }],
+    ['set_contact_status', { contact_id: 'nope', status: 'client', expected_status: 'new_lead' }],
+    ['set_contact_status', { contact_id: ID, status: 'esign_signer', expected_status: 'new_lead' }],
+    ['set_contact_status', { contact_id: ID, status: 'client' }],
+    ['set_contact_status', { contact_id: ID, status: 'client', expected_status: 'whatever it was' }],
+    ['list_board', { stage: 'made_up' }],
+    ['list_board', { contact_id: '' }],
+    ['create_work_item', { title: '  ' }],
+    ['create_work_item', { title: 'x'.repeat(201) }],
+    ['create_work_item', { title: 'T', stage: 'made_up' }],
+    ['create_work_item', { title: 'T', priority: 'high' }],
+    ['create_work_item', { title: 'T', work_item_type: 'made_up' }],
+    ['create_work_item', { title: 'T', due_date: '2027-02-30' }],
+    ['create_work_item', { title: 'T', contact_id: 'nope' }],
+    ['update_work_item', { work_item_id: ID }],
+    ['update_work_item', { work_item_id: ID, stage: 'doing' }],
+    ['update_work_item', { work_item_id: ID, title: '' }],
+    ['update_work_item', { work_item_id: ID, contact_id: '' }],
+    ['update_work_item', { work_item_id: ID, due_date: '15/04/2027' }],
+    ['update_work_item', { work_item_id: 'nope', title: 'T' }],
+    ['move_work_item', { work_item_id: ID, to_stage: 'doing', expected_stage: 'todo' }],
+    ['move_work_item', { work_item_id: ID, to_stage: 'doing', expected_stage: 'todo', reason: 'x'.repeat(2001) }],
+    ['move_work_item', { work_item_id: ID, to_stage: 'made_up', expected_stage: 'todo', reason: 'r' }],
+    ['move_work_item', { work_item_id: ID, to_stage: 'doing', reason: 'r' }],
+    ['add_work_item_note', { work_item_id: ID, note: '  ' }],
+    ['add_work_item_note', { work_item_id: 'nope', note: 'n' }],
+    ['close_request', { list_id: ID, contact_id: ID }],
+    ['close_request', { list_id: ID, contact_id: ID, confirmed_with_user: 'true' }],
+    ['close_request', { list_id: 'nope', contact_id: ID, confirmed_with_user: true }],
+    ['accept_request', { list_id: ID, contact_id: ID, confirmed_with_user: 1 }],
+    ['accept_request', { list_id: ID, contact_id: { a: 1 }, confirmed_with_user: true }],
+    ['set_request_reminders', { list_id: ID, contact_id: ID, paused: 'true' }],
+    ['set_request_reminders', { list_id: ID, contact_id: ID }],
     ['create_contact', { email: 'not-an-email' }],
     ['create_contact', { email: 'a@example.com', first_name: 7 }],
     ['update_contact', { contact_id: ID }],
@@ -226,6 +299,32 @@ describe('the tool handlers refuse bad input before any database call', () => {
     });
   });
 
+  it('create takes a phone alone, and a blank address is an absent one', async () => {
+    const c = ctx();
+    c.rpc.mockResolvedValueOnce({ data: { outcome: 'created', id: ID }, error: null });
+    await callTool('create_contact', { email: '', phone: ' 555 0100 ', status: 'client', source: 'referral' }, c);
+    expect(c.rpc).toHaveBeenCalledWith('mcp_create_contact', expect.objectContaining({
+      p_patch: { phone: '555 0100', status: 'client', source: 'referral' },
+    }));
+  });
+
+  it('a stage move passes the stage read back, and the new stage, through unchanged', async () => {
+    const c = ctx();
+    c.rpc.mockResolvedValueOnce({ data: { outcome: 'system_status', current_status: 'esign_signer' }, error: null });
+    const res = await callTool('set_contact_status', { contact_id: ID, status: 'client', expected_status: 'esign_signer' }, c);
+    expect(c.rpc).toHaveBeenCalledWith('mcp_set_contact_status', expect.objectContaining({ p_status: 'client', p_expected_status: 'esign_signer' }));
+    expect(res.isError).toBe(true);
+  });
+
+  it('update_work_item writes only what is present: an explicit null clears, an absent key is left', async () => {
+    const c = ctx();
+    c.rpc.mockResolvedValueOnce({ data: { id: ID }, error: null });
+    await callTool('update_work_item', { work_item_id: ID, contact_id: null, due_date: null, priority: 'low' }, c);
+    expect(c.rpc).toHaveBeenCalledWith('mcp_update_work_item', expect.objectContaining({
+      p_id: ID, p_patch: { contact_id: null, due_date: null, priority: 'low' },
+    }));
+  });
+
   it('create normalizes before validating: a padded valid address is accepted, trimmed', async () => {
     const c = ctx();
     c.rpc.mockResolvedValueOnce({ data: { outcome: 'created', id: ID }, error: null });
@@ -255,7 +354,7 @@ describe('the tool handlers refuse bad input before any database call', () => {
 
 describe('toolCatalog', () => {
   it('fills the pick lists and leaves the static catalog untouched', () => {
-    const vocab = { statuses: ['a'], organization_types: ['b'], service_types: ['c'], request_categories: ['d'], request_tags: ['e'] };
+    const vocab = { ...VOCAB, statuses: ['a'], organization_types: ['b'], service_types: ['c'], request_categories: ['d'], request_tags: ['e'] };
     const catalog = toolCatalog(vocab) as typeof TOOLS;
     type Props = Record<string, { enum?: unknown; items?: { properties: Record<string, { enum?: unknown }> } }>;
     const prop = (tools: typeof TOOLS, tool: string, p: string) => (tools.find((t) => t.name === tool)!.inputSchema.properties as unknown as Props)[p];
@@ -266,6 +365,19 @@ describe('toolCatalog', () => {
       expect(prop(catalog, tool, 'items').items!.properties.category.enum).toEqual(['d']);
       expect(prop(catalog, tool, 'items').items!.properties.tag.enum).toEqual(['e']);
     }
+    expect(prop(catalog, 'create_contact', 'status').enum).toEqual(['new_lead', 'client']);
+    expect(prop(catalog, 'create_contact', 'source').enum).toEqual(['referral', 'other']);
+    expect(prop(catalog, 'set_contact_status', 'status').enum).toEqual(['new_lead', 'client']);
+    expect(prop(catalog, 'set_contact_status', 'expected_status').enum).toEqual(['a']);
+    for (const [tool, p] of [['list_board', 'stage'], ['create_work_item', 'stage'], ['move_work_item', 'to_stage'], ['move_work_item', 'expected_stage']]) {
+      expect(prop(catalog, tool, p).enum).toEqual(['todo', 'doing']);
+    }
+    expect(prop(catalog, 'update_work_item', 'work_item_type').enum).toEqual(['task']);
+    // The owner's labels travel with the keys, so a lane is never picked by a guessed name.
+    const described = (tools: typeof TOOLS, tool: string) => tools.find((t) => t.name === tool)!.description;
+    for (const tool of ['list_board', 'create_work_item', 'move_work_item']) expect(described(catalog, tool)).toContain('todo = To do, doing = In progress');
+    expect(described(catalog, 'set_contact_status')).toContain('new_lead = New, client = Client');
+    expect(described(TOOLS, 'move_work_item')).not.toContain('doing = In progress');
     expect(prop(TOOLS, 'upsert_quote', 'service_type').enum).toBeUndefined();
     expect(prop(TOOLS, 'create_request', 'items').items!.properties.category.enum).toBeUndefined();
   });

@@ -45,7 +45,8 @@ export const MAX_TOOL_CALLS = 20;
 
 /**
  * Browser origins a connector may present, beyond the app's own. Adding one is a code
- * change, like the OAuth callback list.
+ * change. (The OAuth callback list is wider: an adopter adds a callback with
+ * MCP_EXTRA_REDIRECT_URIS, see mcp-oauth.)
  */
 export const CONNECTOR_ORIGINS = ['https://claude.ai'];
 

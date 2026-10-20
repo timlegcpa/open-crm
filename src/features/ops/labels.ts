@@ -80,6 +80,16 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   mcp_send_request: 'Agent sent a request',
   mcp_remind_request: 'Agent sent a request reminder',
   mcp_delete_request: 'Agent deleted a draft request',
+  mcp_set_contact_status: "Agent moved a contact's stage",
+  mcp_list_board: 'Agent read the board',
+  mcp_create_work_item: 'Agent added a card',
+  mcp_update_work_item: 'Agent edited a card',
+  mcp_move_work_item: 'Agent moved a card',
+  mcp_add_work_item_note: 'Agent noted a card',
+  mcp_close_request: 'Agent closed a request',
+  mcp_accept_request: "Agent accepted a request's answers",
+  mcp_set_request_reminders: "Agent paused or resumed a request's reminders",
+  mcp_list_open_requests: 'Agent read the open requests',
 };
 
 /** The portal's activity actions (0002_contacts.sql), every one. */
