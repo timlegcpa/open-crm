@@ -22,6 +22,7 @@ import { mcpResourceUrl, protectedResourceMetadataUrl } from '../../../supabase/
 import { createRequestOutward, type RequestOutward } from '../../../supabase/functions/mcp-crm/outward';
 import { createReviewSigner } from '../../../supabase/functions/mcp-crm/review-token';
 import type { NeedsSendStore } from '../../../supabase/functions/send-needs-list/handler';
+import { requestRosterSections as browserRoster } from '../../features/requests/lib/requests';
 
 const SUPABASE_URL = 'https://abcdefghijklmnopqrst.supabase.co';
 const SITE = 'https://crm.example.com';
@@ -107,8 +108,8 @@ async function seedGrant(token: string, approvedBy = DB_OWNER_ID): Promise<strin
     [['https://claude.ai/api/mcp/auth_callback']],
   );
   const { rows } = await db.query<{ id: string }>(
-    `INSERT INTO public.mcp_oauth_grants (client_id, scope, approved_by, approved_at, absolute_expires_at)
-     VALUES ('mcpc_${'c'.repeat(43)}', 'mcp:crm', $1, now(), now() + interval '30 days') RETURNING id`,
+    `INSERT INTO public.mcp_oauth_grants (client_id, scope, approved_by, approved_at, absolute_expires_at, consent_version)
+     VALUES ('mcpc_${'c'.repeat(43)}', 'mcp:crm', $1, now(), now() + interval '30 days', public.mcp_consent_version()) RETURNING id`,
     [approvedBy],
   );
   await db.query(
@@ -1203,6 +1204,54 @@ describe('the request follow-up tools', () => {
     expect(out.json().note).toMatch(/1 still has no answer/);
     expect((await db.query(`SELECT status FROM public.needs_items WHERE list_id = $1 ORDER BY sort_order`, [r.list])).rows)
       .toEqual([{ status: 'reviewed' }, { status: 'pending' }]);
+  });
+
+  it('accepting the last outstanding answer closes the request on its own, and says so', async () => {
+    const r = await seeded('sent', ['fulfilled', 'reviewed']);
+    const out = (await toolJson('accept_request', { list_id: r.list, contact_id: r.contact, confirmed_with_user: true })).json();
+    expect(out).toMatchObject({ accepted: 1, still_unanswered: 0, request_status: 'closed' });
+    expect(out.note).toMatch(/closed itself/);
+    expect(out.note).not.toMatch(/still open/);
+    expect((await db.query(`SELECT status FROM public.needs_lists WHERE id = $1`, [r.list])).rows).toEqual([{ status: 'closed' }]);
+  });
+
+  it('a request still asking the contact to confirm their details stays sent after its last answer is accepted', async () => {
+    const r = await seeded('sent', ['fulfilled']);
+    await db.query(`UPDATE public.needs_lists SET include_contact_confirm = true WHERE id = $1`, [r.list]);
+    const out = (await toolJson('accept_request', { list_id: r.list, contact_id: r.contact, confirmed_with_user: true })).json();
+    expect(out).toMatchObject({ accepted: 1, still_unanswered: 0, request_status: 'sent' });
+    expect(out.note).toMatch(/still open/);
+  });
+
+  it('an answer waiting to be accepted and an accepted one land in different sections in both tools, as on the requests screen', async () => {
+    const answered = await seeded('sent', ['fulfilled', 'pending'], 'Roster answered');
+    const accepted = await seeded('sent', ['reviewed', 'pending'], 'Roster accepted');
+    // The browser's roster over the same rows (src/features/requests reads them with their items).
+    const rows = (await db.query<{ id: string; status: string; contact_id: string; created_at: string; items: Array<{ kind: string; status: string }> }>(
+      `SELECT l.id, l.status, l.contact_id, l.created_at::text AS created_at,
+              (SELECT jsonb_agg(jsonb_build_object('kind', i.kind, 'status', i.status)) FROM public.needs_items i WHERE i.list_id = l.id) AS items
+         FROM public.needs_lists l WHERE l.id = ANY($1)`, [[answered.list, accepted.list]])).rows;
+    const browser = new Map(browserRoster(rows, () => '').flatMap((s) => s.rows.map((l) => [l.id, s.key] as const)));
+    expect([browser.get(answered.list), browser.get(accepted.list)]).toEqual(['yours', 'client']);
+    const asTool = { yours: 'waiting_on_you', client: 'waiting_on_client' } as Record<string, string>;
+
+    const open = (await toolJson('list_open_requests', {})).json();
+    const sectionIn = (id: string) => open.sections.find((s: { rows: Array<{ list_id: string }> }) => s.rows.some((r) => r.list_id === id))?.section;
+    expect(sectionIn(answered.list)).toBe(asTool[browser.get(answered.list)!]);
+    expect(sectionIn(accepted.list)).toBe(asTool[browser.get(accepted.list)!]);
+    const rowOf = (id: string) => open.sections.flatMap((s: { rows: Array<Record<string, unknown>> }) => s.rows).find((r: { list_id: string }) => r.list_id === id);
+    expect(rowOf(answered.list)).toMatchObject({ items: 2, answers_to_accept: 1 });
+    expect(rowOf(accepted.list)).toMatchObject({ items: 2, answers_to_accept: 0 });
+
+    for (const [r, id] of [[answered, answered.list], [accepted, accepted.list]] as const) {
+      const listed = (await toolJson('list_requests', { contact_id: r.contact })).json();
+      const req = listed.requests.find((x: { list_id: string }) => x.list_id === id);
+      expect(req.section).toBe(asTool[browser.get(id)!]);
+    }
+    const one = (await toolJson('list_requests', { contact_id: answered.contact })).json().requests[0];
+    const two = (await toolJson('list_requests', { contact_id: accepted.contact })).json().requests[0];
+    expect([one.answers_to_accept, one.items.map((i: { answered: boolean; accepted: boolean }) => [i.answered, i.accepted])]).toEqual([1, [[true, false], [false, false]]]);
+    expect([two.answers_to_accept, two.items.map((i: { answered: boolean; accepted: boolean }) => [i.answered, i.accepted])]).toEqual([0, [[true, true], [false, false]]]);
   });
 
   it('pauses reminders on one request, sending nothing', async () => {

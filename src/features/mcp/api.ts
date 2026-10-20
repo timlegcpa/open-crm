@@ -73,8 +73,16 @@ export function readRequest(requestId: string): Promise<PendingRequest> {
   return invokeEdge('mcp-oauth', { action: 'read', request_id: requestId }, { parse: (d) => pendingRequestSchema.parse(d) });
 }
 
-/** Approve or deny; answers where to send the browser (the assistant's callback). */
-export async function decideRequest(requestId: string, approve: boolean): Promise<string> {
-  const answer = await invokeEdge('mcp-oauth', { action: 'decide', request_id: requestId, approve }, { parse: (d) => decisionSchema.parse(d) });
+/**
+ * Approve or deny; answers where to send the browser (the assistant's callback). The
+ * consent version names the wording the owner was shown: the server refuses an approval
+ * of any version but the current one.
+ */
+export async function decideRequest(requestId: string, approve: boolean, consentVersion: number): Promise<string> {
+  const answer = await invokeEdge(
+    'mcp-oauth',
+    { action: 'decide', request_id: requestId, approve, consent_version: consentVersion },
+    { parse: (d) => decisionSchema.parse(d) },
+  );
   return answer.redirect_to;
 }

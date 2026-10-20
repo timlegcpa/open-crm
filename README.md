@@ -272,7 +272,7 @@ conversation before they act; every call is recorded in the audit log.
 | `send_request`, `remind_request` | Email the client. Go-ahead, one email per call. |
 | `delete_request` | Deletes a draft. Go-ahead. |
 | `list_open_requests` | Every open request, by whose move it is. |
-| `accept_request`, `close_request` | Accept all answers; close a sent request. Go-ahead. |
+| `accept_request`, `close_request` | Accept all answers (the last one closes the request); close a sent request. Go-ahead. |
 | `set_request_reminders` | Pauses or resumes one request's reminders. |
 | `list_board` | The board's cards, with each lane's name. |
 | `create_work_item`, `update_work_item`, `move_work_item`, `add_work_item_note` | Board cards: add, edit, move with a reason, note. |

@@ -25,10 +25,16 @@ import { getErrorMessage } from '@/lib/errors';
 import { connectorUrl, decideRequest, listGrants, mcpKeys, readRequest, revokeGrant, type Grant } from './api';
 
 /**
+ * The version of the wording below. The screen sends it with an approval, and the server
+ * grants a connection only when it equals mcp_consent_version() in 0015_mcp.sql. Bump both
+ * together whenever CAN or CANNOT changes (src/__tests__/db/mcp.test.ts holds them equal).
+ */
+export const CONSENT_VERSION = 2;
+
+/**
  * What a connected assistant can and cannot do, as the consent screen states it. Every
  * power a tool grants is named here: a new kind of tool means a new line, and a bump of
- * CONSENT_VERSION in 0015_mcp.sql so connections approved on the old wording must be
- * approved again.
+ * CONSENT_VERSION so connections approved on the old wording must be approved again.
  */
 export const CAN = [
   'Search and read contacts, their businesses, quotes and recent notes',
@@ -129,7 +135,7 @@ export function ConnectPage() {
     staleTime: Infinity,
   });
   const [leaving, setLeaving] = useState(false);
-  const decide = useMutation({ mutationFn: (approve: boolean) => decideRequest(requestId, approve) });
+  const decide = useMutation({ mutationFn: (approve: boolean) => decideRequest(requestId, approve, CONSENT_VERSION) });
 
   const answer = async (approve: boolean) => {
     try {

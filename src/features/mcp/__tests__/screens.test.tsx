@@ -12,7 +12,7 @@ const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock('sonner', () => ({ toast }));
 
 import { functionsHttpError } from '@/__tests__/fakeSupabase';
-import { ConnectorSettings, ConnectPage } from '../pages';
+import { CONSENT_VERSION, ConnectorSettings, ConnectPage } from '../pages';
 import { connectorUrl, safeRedirect } from '../api';
 
 const REQUEST = { request_id: 'req-1', client_name: 'Example assistant', redirect_uri: 'https://claude.ai/api/mcp/auth_callback', scope: 'mcp:crm' };
@@ -77,7 +77,7 @@ describe('ConnectPage', () => {
     expect(screen.getByText('claude.ai')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
     await waitFor(() => expect(assign).toHaveBeenCalledWith(CALLBACK));
-    expect(client.functions.invoke).toHaveBeenLastCalledWith('mcp-oauth', expect.objectContaining({ body: { action: 'decide', request_id: 'req-1', approve: true } }));
+    expect(client.functions.invoke).toHaveBeenLastCalledWith('mcp-oauth', expect.objectContaining({ body: { action: 'decide', request_id: 'req-1', approve: true, consent_version: CONSENT_VERSION } }));
   });
 
   it('Deny sends approve false and follows the answer', async () => {
@@ -85,7 +85,7 @@ describe('ConnectPage', () => {
     renderAt('/connect?request=req-1', <ConnectPage />);
     fireEvent.click(await screen.findByRole('button', { name: 'Deny' }));
     await waitFor(() => expect(assign).toHaveBeenCalledTimes(1));
-    expect(client.functions.invoke).toHaveBeenLastCalledWith('mcp-oauth', expect.objectContaining({ body: { action: 'decide', request_id: 'req-1', approve: false } }));
+    expect(client.functions.invoke).toHaveBeenLastCalledWith('mcp-oauth', expect.objectContaining({ body: { action: 'decide', request_id: 'req-1', approve: false, consent_version: CONSENT_VERSION } }));
   });
 
   it('never assigns an address that is not https or loopback, even if the server said so', async () => {

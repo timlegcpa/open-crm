@@ -112,9 +112,11 @@ and read contacts (by name, email, phone or business; archived contacts are left
 them from an email or a phone number with a stage and lead source, update them, move them along
 the pipeline, add businesses, log call notes, and manage quotes. It works the board (list,
 create, edit, move with a reason, and note cards), and handles requests end to end: create,
-send and remind them, see every open request by whose move it is, accept answers, close a
-request, and pause its reminders. Every call is audited. When the consent screen gains a power,
-connections approved on the older screen stop working until the owner approves again. Settings, AI connector lists the
+send and remind them, see every open request by whose move it is (the same sections as the
+requests screen), accept answers (accepting the last one closes the request, as in the CRM),
+close a request, and pause its reminders. Every call is audited. When the consent screen gains a
+power, connections approved on the older screen stop working until the owner approves again, and
+an approval given on the older screen can never become a connection. Settings, AI connector lists the
 connections and revokes them. The full tool list is in the README.
 
 ## Settings (`settings`, `0011_control_center`)

@@ -5,10 +5,13 @@
 -- stage move), the work board of 0008 (list, create, edit, move and note a card), and the
 -- request follow-up (close a request, accept its answers, pause or resume its reminders,
 -- and one roster of every open request), and the consent version that makes a connection
--- approved before these powers existed be approved again. Six 0007 functions are replaced
+-- approved before these powers existed be approved again. Eight 0007 functions are replaced
 -- in place, with their signatures and privileges unchanged: mcp_tool_vocabulary,
--- mcp_search_contacts, mcp_create_contact, mcp_oauth_authenticate, mcp_oauth_rotate_refresh
--- and mcp_list_grants. One column is added to a 0007 table: mcp_oauth_grants.consent_version.
+-- mcp_search_contacts, mcp_create_contact, mcp_oauth_authenticate, mcp_oauth_rotate_refresh,
+-- mcp_list_grants, mcp_oauth_consume_code and mcp_request_snapshot. Two take a new
+-- argument, so they are dropped and created again with their privileges restated:
+-- mcp_oauth_decide and mcp_oauth_create_grant. One column is added to each of two 0007
+-- tables: mcp_oauth_requests.consent_version and mcp_oauth_grants.consent_version.
 --
 -- Written to run once on top of 0001 to 0014: CREATE OR REPLACE for the replaced
 -- functions, CREATE for the new ones. 0001 to 0012 may already be applied on a project, so
@@ -102,12 +105,18 @@
 --     a closed request changes nothing. Nothing is deleted.
 --   * accept: every answered item ('fulfilled') becomes accepted ('reviewed'), as the
 --     owner's Accept all does, under a lock on the list. An unanswered item is never
---     accepted. It does not close the request.
+--     accepted. Accepting the last answer closes the request through 0014's trigger
+--     (unless it still asks the client to confirm their details); the status returned is
+--     the one stored after the items move, so the tool reports what happened.
 --   * reminders: reminders_paused is not client-visible, so the content version does not
 --     move and a review token read before a pause still verifies after it.
---   * The roster reads every open request (draft, sent, submitted) by whose move it is:
---     waiting on the owner (submitted, or sent with an answer to accept), waiting on the
---     client (sent, nothing to accept), and drafts. No answer and no token leaves here.
+--   * The roster reads every open request (draft, sent, submitted) with each item's kind
+--     and status, never an answer or a token. Which section a request lands in (whose
+--     move it is) is decided in ONE place, supabase/functions/_shared/request-roster.ts,
+--     which the browser's roster also uses; nothing here sorts requests into sections, so
+--     the connector and the screen cannot disagree. mcp_request_snapshot carries each
+--     item's status for the same reason, so list_requests can tell an answer waiting to be
+--     accepted from an accepted one.
 
 -- ---------------------------------------------------------------------------
 -- Consent version: a connection approved on older wording must be approved again
@@ -116,14 +125,24 @@
 -- The consent screen lists every power the connector's tools grant (src/features/mcp/
 -- pages.tsx, CAN). This file adds powers the owner was never asked about (stage moves,
 -- board writes, closing and accepting requests), and a grant lives up to 30 days, so a
--- connection approved before it would pick the new tools up silently. Each grant records
--- the consent version it was approved under (the column default, so the grant writer
--- needs no change), and authentication, refresh and the owner's list honour only the
--- current one. An older connection gets the ordinary answers (401 on a call, invalid_grant
--- on a refresh), which send the assistant back through the consent screen.
+-- connection approved before it would pick the new tools up silently. Authentication,
+-- refresh and the owner's list honour only grants of the current version. An older
+-- connection gets the ordinary answers (401 on a call, invalid_grant on a refresh), which
+-- send the assistant back through the consent screen.
 --
--- To change what a connection may do: add the line to CAN, bump the number returned
--- here, and ship both together.
+-- The version is bound to the APPROVAL, never to the moment the grant is written. The
+-- consent screen sends the version of the wording it showed (CONSENT_VERSION in pages.tsx),
+-- mcp_oauth_decide refuses an approval of any other version and stores it on the request,
+-- mcp_oauth_consume_code hands it on, and mcp_oauth_create_grant refuses anything but the
+-- current version and writes it explicitly. A column default was the first design and was
+-- wrong: a request approved on the old screen, or decided on a page loaded before the
+-- upgrade, became a current-version grant when its code was exchanged afterwards. An
+-- approval stored before this file ran has no version (NULL) and can never become a grant.
+-- The grants column keeps no default, so a writer that forgets the version fails loudly.
+--
+-- To change what a connection may do: add the line to CAN, bump CONSENT_VERSION there and
+-- the number returned here, and ship both together (src/__tests__/db/mcp.test.ts holds the
+-- two equal).
 CREATE FUNCTION public.mcp_consent_version()
 RETURNS integer
 LANGUAGE sql
@@ -131,10 +150,144 @@ IMMUTABLE
 SET search_path = ''
 AS $$ SELECT 2 $$;
 
--- Grants that exist now were approved on the older wording: version 1. New ones take the
--- current version.
+-- Grants that exist now were approved on the older wording: version 1. The default only
+-- backfills them; it is dropped at once.
 ALTER TABLE public.mcp_oauth_grants ADD COLUMN consent_version integer NOT NULL DEFAULT 1;
-ALTER TABLE public.mcp_oauth_grants ALTER COLUMN consent_version SET DEFAULT public.mcp_consent_version();
+ALTER TABLE public.mcp_oauth_grants ALTER COLUMN consent_version DROP DEFAULT;
+
+-- The version the owner approved, set by mcp_oauth_decide on an approval. NULL on a
+-- pending or denied request, and on every approval made before this file ran.
+ALTER TABLE public.mcp_oauth_requests ADD COLUMN consent_version integer;
+
+-- 0007's decision, with the version of the screen the owner approved on. An approval of
+-- any version but the current one is refused before anything changes: the request stays
+-- pending, so the owner can reload the screen and decide on the current wording. A denial
+-- needs no version.
+DROP FUNCTION public.mcp_oauth_decide(text, boolean, text, timestamptz, uuid, text, text);
+CREATE FUNCTION public.mcp_oauth_decide(
+  p_request_id text, p_approve boolean, p_code_hash text, p_code_expires timestamptz,
+  p_consent_version integer, p_actor uuid, p_ip text, p_user_agent text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v record;
+BEGIN
+  IF p_actor IS DISTINCT FROM (SELECT o.owner_user_id FROM public.org_profile o) THEN
+    RAISE EXCEPTION 'mcp_oauth_decide: actor_not_owner' USING ERRCODE = '42501';
+  END IF;
+  IF p_approve IS NULL OR (p_approve AND (p_code_hash IS NULL OR p_code_expires IS NULL)) THEN
+    RAISE EXCEPTION 'mcp_oauth_decide: incomplete_decision';
+  END IF;
+  IF p_approve AND p_consent_version IS DISTINCT FROM public.mcp_consent_version() THEN
+    RAISE EXCEPTION 'mcp_oauth_decide: stale_consent';
+  END IF;
+
+  UPDATE public.mcp_oauth_requests r
+     SET status = CASE WHEN p_approve THEN 'approved' ELSE 'denied' END,
+         approved_by = p_actor,
+         approved_at = CASE WHEN p_approve THEN now() END,
+         code_hash = CASE WHEN p_approve THEN p_code_hash END,
+         code_expires_at = CASE WHEN p_approve THEN p_code_expires END,
+         consent_version = CASE WHEN p_approve THEN p_consent_version END
+   WHERE r.request_id = p_request_id AND r.status = 'pending' AND r.expires_at > now()
+  RETURNING r.redirect_uri, r.state, r.client_id INTO v;
+
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  PERFORM public.mcp_audit_row(
+    p_actor, CASE WHEN p_approve THEN 'mcp_oauth_approved' ELSE 'mcp_oauth_denied' END,
+    jsonb_build_object('source', 'mcp_oauth', 'client_id', v.client_id), p_ip, p_user_agent);
+
+  RETURN jsonb_build_object('redirect_uri', v.redirect_uri, 'state', v.state, 'client_id', v.client_id);
+END;
+$$;
+
+-- 0007's code exchange, handing on the version the owner approved. Still single use,
+-- whatever happens next; an approval without a version comes back with consent_version
+-- null, which mcp_oauth_create_grant refuses.
+CREATE OR REPLACE FUNCTION public.mcp_oauth_consume_code(p_code_hash text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v record;
+BEGIN
+  UPDATE public.mcp_oauth_requests r
+     SET status = 'consumed'
+   WHERE r.code_hash = p_code_hash AND r.status = 'approved' AND r.code_expires_at > now()
+  RETURNING r.client_id, r.redirect_uri, r.code_challenge, r.scope, r.resource, r.approved_by, r.approved_at,
+            r.consent_version INTO v;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+  -- An approval given before the approver's MFA recovery is void, like every session of
+  -- that time. The code stays burned.
+  IF EXISTS (SELECT 1 FROM public.mfa_recovery_lockouts l
+              WHERE l.user_id = v.approved_by AND v.approved_at < l.revoked_before) THEN
+    RETURN NULL;
+  END IF;
+  RETURN jsonb_build_object(
+    'client_id', v.client_id, 'redirect_uri', v.redirect_uri, 'code_challenge', v.code_challenge,
+    'scope', v.scope, 'resource', v.resource, 'approved_by', v.approved_by, 'approved_at', v.approved_at,
+    'consent_version', v.consent_version);
+END;
+$$;
+
+-- 0007's grant writer, with the approval's consent version written explicitly. Refused
+-- unless it is the current version: an approval on older wording (or one with no version)
+-- issues nothing, and the assistant is sent back through the consent screen.
+DROP FUNCTION public.mcp_oauth_create_grant(text, text, text, timestamptz, text, timestamptz, timestamptz, uuid, timestamptz, text, text);
+CREATE FUNCTION public.mcp_oauth_create_grant(
+  p_client_id text, p_scope text, p_access_hash text, p_access_expires timestamptz,
+  p_refresh_hash text, p_refresh_expires timestamptz, p_absolute_expires timestamptz,
+  p_approved_by uuid, p_approved_at timestamptz, p_consent_version integer, p_ip text, p_user_agent text)
+RETURNS uuid
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+DECLARE
+  v_grant_id uuid;
+BEGIN
+  IF p_approved_by IS DISTINCT FROM (SELECT o.owner_user_id FROM public.org_profile o) THEN
+    RAISE EXCEPTION 'mcp_oauth_create_grant: approver_not_owner' USING ERRCODE = '42501';
+  END IF;
+  IF p_approved_at IS NULL OR EXISTS (SELECT 1 FROM public.mfa_recovery_lockouts l
+                                       WHERE l.user_id = p_approved_by AND p_approved_at < l.revoked_before) THEN
+    RAISE EXCEPTION 'mcp_oauth_create_grant: approval_revoked' USING ERRCODE = '42501';
+  END IF;
+  IF p_consent_version IS DISTINCT FROM public.mcp_consent_version() THEN
+    RAISE EXCEPTION 'mcp_oauth_create_grant: stale_consent' USING ERRCODE = '42501';
+  END IF;
+
+  INSERT INTO public.mcp_oauth_grants (client_id, client_name, scope, approved_by, approved_at, absolute_expires_at, consent_version)
+  SELECT c.client_id, c.client_name, p_scope, p_approved_by, p_approved_at, p_absolute_expires, p_consent_version
+  FROM public.mcp_oauth_clients c
+  WHERE c.client_id = p_client_id
+  RETURNING id INTO v_grant_id;
+
+  IF v_grant_id IS NULL THEN
+    RAISE EXCEPTION 'mcp_oauth_create_grant: unknown_client';
+  END IF;
+
+  INSERT INTO public.mcp_oauth_tokens (grant_id, token_hash, kind, expires_at)
+  VALUES (v_grant_id, p_access_hash, 'access', p_access_expires),
+         (v_grant_id, p_refresh_hash, 'refresh', least(p_refresh_expires, p_absolute_expires));
+
+  UPDATE public.mcp_oauth_clients SET last_used_at = now() WHERE client_id = p_client_id;
+
+  PERFORM public.mcp_audit_row(
+    p_approved_by, 'mcp_oauth_grant_created',
+    jsonb_build_object('source', 'mcp_oauth', 'client_id', p_client_id, 'grant_id', v_grant_id),
+    p_ip, p_user_agent);
+
+  RETURN v_grant_id;
+END;
+$$;
 
 -- 0007's authentication, with the consent version.
 CREATE OR REPLACE FUNCTION public.mcp_oauth_authenticate(p_access_hash text)
@@ -852,11 +1005,11 @@ BEGIN
 END;
 $$;
 
--- Every open request, across every contact, each with the section it belongs to:
--- waiting_on_you, waiting_on_client or drafts (see the header). Sections in that order,
--- clients A to Z within one, newest first for one client, the id breaking a tie. One more
--- row than the limit is read, only to learn whether more exist. Narrow columns: no
--- answer, no token, nothing a client typed.
+-- The roster's rows: every open request (draft, sent, submitted) with its client, and each
+-- item's kind and status (never an answer). Sorting a request into a section is NOT done
+-- here: mcp-crm groups these rows through supabase/functions/_shared/request-roster.ts,
+-- the one rule the browser's roster uses too. Rows run by the client's name A to Z, then
+-- newest first, then id, so a cut at the limit is stable whatever the sections.
 CREATE FUNCTION public.mcp_list_open_requests(p_limit integer, p_actor uuid, p_ip text, p_user_agent text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -871,36 +1024,19 @@ BEGIN
          COALESCE(jsonb_agg(m.obj ORDER BY m.n) FILTER (WHERE m.n <= v_limit), '[]'::jsonb)
     INTO v_found, v_rows
     FROM (
-      SELECT row_number() OVER (
-               ORDER BY r.section_rank, lower(r.client), r.created_at DESC, r.id) AS n,
+      SELECT row_number() OVER (ORDER BY lower(c.full_name), l.created_at DESC, l.id) AS n,
              jsonb_build_object(
-               'section', r.section, 'list_id', r.id, 'contact_id', r.contact_id, 'client', r.client,
-               'title', r.title, 'status', r.status, 'items', r.items, 'answers_to_accept', r.to_accept,
-               'sent_at', r.sent_at, 'submitted_at', r.submitted_at,
-               'reminders_paused', r.reminders_paused, 'reminder_count', r.reminder_count) AS obj
-        FROM (
-          SELECT l.id, l.contact_id, c.full_name AS client, l.title, l.status, l.created_at, l.sent_at,
-                 l.submitted_at, l.reminders_paused, l.reminder_count, q.items, q.to_accept,
-                 CASE
-                   WHEN l.status = 'submitted' OR (l.status = 'sent' AND q.to_accept > 0) THEN 'waiting_on_you'
-                   WHEN l.status = 'sent' THEN 'waiting_on_client'
-                   ELSE 'drafts'
-                 END AS section,
-                 CASE
-                   WHEN l.status = 'submitted' OR (l.status = 'sent' AND q.to_accept > 0) THEN 1
-                   WHEN l.status = 'sent' THEN 2
-                   ELSE 3
-                 END AS section_rank
-            FROM public.needs_lists l
-            JOIN public.contacts c ON c.id = l.contact_id
-           CROSS JOIN LATERAL (
-             SELECT count(*)::integer AS items,
-                    (count(*) FILTER (WHERE i.status = 'fulfilled'))::integer AS to_accept
-               FROM public.needs_items i
-              WHERE i.list_id = l.id
-           ) q
-           WHERE l.status IN ('draft', 'sent', 'submitted')
-        ) r
+               'list_id', l.id, 'contact_id', l.contact_id, 'client', c.full_name,
+               'title', l.title, 'status', l.status, 'created_at', l.created_at,
+               'sent_at', l.sent_at, 'submitted_at', l.submitted_at,
+               'reminders_paused', l.reminders_paused, 'reminder_count', l.reminder_count,
+               'items', COALESCE((
+                 SELECT jsonb_agg(jsonb_build_object('kind', i.kind, 'status', i.status) ORDER BY i.sort_order, i.id)
+                   FROM public.needs_items i
+                  WHERE i.list_id = l.id), '[]'::jsonb)) AS obj
+        FROM public.needs_lists l
+        JOIN public.contacts c ON c.id = l.contact_id
+       WHERE l.status IN ('draft', 'sent', 'submitted')
        ORDER BY n
        LIMIT v_limit + 1
     ) m;
@@ -913,10 +1049,75 @@ BEGIN
 END;
 $$;
 
+-- 0007's request snapshot, with each item's stored status beside its fulfilled flag, so
+-- list_requests can place a request in the shared roster and tell an answer waiting to be
+-- accepted ('fulfilled') from an accepted one ('reviewed'). The review token is minted
+-- over named fields (mcp-crm/review-token.ts canonicalRequest), never the status, so no
+-- token moves. Everything else is 0007's body unchanged.
+CREATE OR REPLACE FUNCTION public.mcp_request_snapshot(p_contact_id uuid, p_list_id uuid, p_limit integer)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SET search_path = ''
+AS $$
+DECLARE
+  v_limit integer := least(greatest(COALESCE(p_limit, 25), 1), 100);
+  v_contact jsonb;
+  v_lists jsonb;
+  v_found integer;
+BEGIN
+  SELECT jsonb_build_object('id', c.id, 'first_name', c.first_name, 'last_name', c.last_name, 'email', c.email)
+    INTO v_contact
+    FROM public.contacts c
+   WHERE c.id = p_contact_id;
+  IF v_contact IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  -- One more than the limit is read, only to learn whether more exist: a silent cap would
+  -- let a model call 25 requests "all of them".
+  SELECT count(*)::integer,
+         COALESCE(jsonb_agg(m.obj ORDER BY m.created_at DESC, m.id DESC) FILTER (WHERE m.n <= v_limit), '[]'::jsonb)
+    INTO v_found, v_lists
+    FROM (
+      SELECT l.id, l.created_at,
+             row_number() OVER (ORDER BY l.created_at DESC, l.id DESC) AS n,
+             jsonb_build_object(
+               'id', l.id, 'status', l.status, 'title', l.title, 'intro_message', l.intro_message,
+               'include_contact_confirm', l.include_contact_confirm, 'created_at', l.created_at,
+               'sent_at', l.sent_at, 'content_version', l.content_version,
+               'items', COALESCE((
+                 SELECT jsonb_agg(jsonb_build_object(
+                          'sort_order', i.sort_order, 'kind', i.kind, 'label', i.label,
+                          'description', i.description, 'required', i.required, 'sensitive', i.sensitive,
+                          'category', i.category, 'tag', i.tag, 'status', i.status,
+                          'fulfilled', CASE i.kind
+                            WHEN 'document' THEN EXISTS (SELECT 1 FROM public.needs_item_documents d WHERE d.item_id = i.id)
+                            WHEN 'todo' THEN i.status IN ('fulfilled', 'reviewed')
+                            WHEN 'question' THEN i.answer_ciphertext IS NOT NULL
+                                                 OR (i.answer_text IS NOT NULL AND i.answer_text ~ '[^[:space:]]')
+                            ELSE false
+                          END)
+                        ORDER BY i.sort_order, i.id)
+                   FROM public.needs_items i
+                  WHERE i.list_id = l.id), '[]'::jsonb)) AS obj
+        FROM public.needs_lists l
+       WHERE l.contact_id = p_contact_id
+         AND (p_list_id IS NULL OR l.id = p_list_id)
+       ORDER BY l.created_at DESC, l.id DESC
+       LIMIT v_limit + 1
+    ) m;
+
+  RETURN jsonb_build_object('contact', v_contact, 'lists', v_lists, 'truncated', v_found > v_limit);
+END;
+$$;
+
 -- ---------------------------------------------------------------------------
--- Function privileges: the functions this file creates, never a sweep. The three it
--- replaces (and the three OAuth functions above) keep the privileges 0007 gave them
--- (CREATE OR REPLACE does not change them).
+-- Function privileges: the functions this file creates, never a sweep. The ones it
+-- replaces with CREATE OR REPLACE keep the privileges 0007 gave them (that does not change
+-- them). mcp_oauth_decide and mcp_oauth_create_grant were dropped and created again with a
+-- new argument, so they are new functions and are listed here, exactly as 0007 granted
+-- them: the server alone.
 -- ---------------------------------------------------------------------------
 
 REVOKE ALL ON FUNCTION
@@ -931,11 +1132,13 @@ REVOKE ALL ON FUNCTION
   public.mcp_close_request(uuid, uuid, uuid, text, text),
   public.mcp_accept_request(uuid, uuid, uuid, text, text),
   public.mcp_set_request_reminders(uuid, uuid, boolean, uuid, text, text),
-  public.mcp_list_open_requests(integer, uuid, text, text)
+  public.mcp_list_open_requests(integer, uuid, text, text),
+  public.mcp_oauth_decide(text, boolean, text, timestamptz, integer, uuid, text, text),
+  public.mcp_oauth_create_grant(text, text, text, timestamptz, text, timestamptz, timestamptz, uuid, timestamptz, integer, text, text)
 FROM PUBLIC, anon, authenticated, service_role;
 
--- The consent version is read by the column default, which runs in the grant writer's
--- transaction (the server's), and by the three functions above.
+-- The consent version is read by the decision, the grant writer and the three functions
+-- above, all in the server's transaction.
 GRANT EXECUTE ON FUNCTION
   public.mcp_consent_version(),
   public.mcp_set_contact_status(uuid, text, text, uuid, text, text),
@@ -948,5 +1151,7 @@ GRANT EXECUTE ON FUNCTION
   public.mcp_close_request(uuid, uuid, uuid, text, text),
   public.mcp_accept_request(uuid, uuid, uuid, text, text),
   public.mcp_set_request_reminders(uuid, uuid, boolean, uuid, text, text),
-  public.mcp_list_open_requests(integer, uuid, text, text)
+  public.mcp_list_open_requests(integer, uuid, text, text),
+  public.mcp_oauth_decide(text, boolean, text, timestamptz, integer, uuid, text, text),
+  public.mcp_oauth_create_grant(text, text, text, timestamptz, text, timestamptz, timestamptz, uuid, timestamptz, integer, text, text)
 TO service_role;

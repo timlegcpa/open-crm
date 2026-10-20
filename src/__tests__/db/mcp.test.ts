@@ -5,6 +5,7 @@
 // inside a transaction that is rolled back, so each test starts from the same fixtures.
 import type { PGlite } from '@electric-sql/pglite';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { isReminderDue } from '../../../supabase/functions/needs-reminder-dispatcher/handler';
 import {
@@ -84,6 +85,8 @@ const asServerTx = <T>(fn: (tx: Tx) => Promise<T>) => session(db, asServer, fn);
 
 const audit = { p_actor: OWNER_ID, p_ip: '203.0.113.7', p_user_agent: 'test-agent' };
 const later = (ms: number) => new Date(Date.now() + ms).toISOString();
+/** The consent version the screen states (src/features/mcp/pages.tsx); a test below holds it equal to mcp_consent_version(). */
+const CONSENT = Number(/export const CONSENT_VERSION = (\d+);/.exec(readFileSync('src/features/mcp/pages.tsx', 'utf8'))?.[1]);
 
 /** A registered client, a live grant approved by `approvedBy`, and its access and refresh tokens. */
 async function seedGrant(
@@ -96,9 +99,9 @@ async function seedGrant(
     [CLIENT_ID, [REDIRECT]],
   );
   const { rows } = await tx.query<{ id: string }>(
-    `INSERT INTO public.mcp_oauth_grants (client_id, client_name, scope, approved_by, approved_at, absolute_expires_at, revoked_at, last_used_at)
+    `INSERT INTO public.mcp_oauth_grants (client_id, client_name, scope, approved_by, approved_at, absolute_expires_at, revoked_at, last_used_at, consent_version)
      VALUES ($1, 'Example assistant', 'mcp:crm', $2, now() - interval '1 minute', now() + CASE WHEN $3 THEN interval '-1 minute' ELSE interval '30 days' END,
-             CASE WHEN $4 THEN now() END, now() - $5::interval)
+             CASE WHEN $4 THEN now() END, now() - $5::interval, public.mcp_consent_version())
      RETURNING id`,
     [CLIENT_ID, opts.approvedBy ?? OWNER_ID, opts.expired ?? false, opts.revoked ?? false, opts.lastUsedAgo ?? '1 hour'],
   );
@@ -174,9 +177,9 @@ const SERVER_FUNCTIONS = [
   'mcp_audit_row(uuid,text,jsonb,text,text)',
   'mcp_oauth_client(text)',
   'mcp_oauth_pending_request(text)',
-  'mcp_oauth_decide(text,boolean,text,timestamp with time zone,uuid,text,text)',
+  'mcp_oauth_decide(text,boolean,text,timestamp with time zone,integer,uuid,text,text)',
   'mcp_oauth_consume_code(text)',
-  'mcp_oauth_create_grant(text,text,text,timestamp with time zone,text,timestamp with time zone,timestamp with time zone,uuid,timestamp with time zone,text,text)',
+  'mcp_oauth_create_grant(text,text,text,timestamp with time zone,text,timestamp with time zone,timestamp with time zone,uuid,timestamp with time zone,integer,text,text)',
   'mcp_oauth_rotate_refresh(text,text,text,timestamp with time zone,text,timestamp with time zone,text,text)',
   'mcp_oauth_revoke_token(text,text,text)',
   'mcp_oauth_authenticate(text)',
@@ -381,7 +384,7 @@ describe('mcp_oauth_decide and mcp_oauth_consume_code', () => {
   const decide = (tx: Tx, approve: boolean, requestId = 'req-1', actor = OWNER_ID) =>
     call(tx, 'mcp_oauth_decide', {
       p_request_id: requestId, p_approve: approve, p_code_hash: approve ? 'code-hash' : null,
-      p_code_expires: approve ? later(300_000) : null, p_actor: actor, p_ip: 'not-an-ip', p_user_agent: 'ua',
+      p_code_expires: approve ? later(300_000) : null, p_consent_version: approve ? CONSENT : null, p_actor: actor, p_ip: 'not-an-ip', p_user_agent: 'ua',
     });
 
   it('the pending request reads back with its client name; decided, it is gone', async () => {
@@ -412,7 +415,7 @@ describe('mcp_oauth_decide and mcp_oauth_consume_code', () => {
     await expectDenied(asServerTx(async (tx) => { await park(tx); return decide(tx, true, 'req-1', SYSTEM_ID); }));
     await expect(asServerTx(async (tx) => {
       await park(tx);
-      return call(tx, 'mcp_oauth_decide', { p_request_id: 'req-1', p_approve: true, p_code_hash: null, p_code_expires: null, ...audit });
+      return call(tx, 'mcp_oauth_decide', { p_request_id: 'req-1', p_approve: true, p_code_hash: null, p_code_expires: null, p_consent_version: CONSENT, ...audit });
     })).rejects.toThrow(/incomplete_decision/);
   });
 
@@ -426,7 +429,7 @@ describe('mcp_oauth_decide and mcp_oauth_consume_code', () => {
       await decide(tx, false, 'req-2');
       await park(tx, 'req-3');
       await call(tx, 'mcp_oauth_decide', {
-        p_request_id: 'req-3', p_approve: true, p_code_hash: 'old-code', p_code_expires: later(-1000), ...audit,
+        p_request_id: 'req-3', p_approve: true, p_code_hash: 'old-code', p_code_expires: later(-1000), p_consent_version: CONSENT, ...audit,
       });
       return { first, again, expired: await call(tx, 'mcp_oauth_consume_code', { p_code_hash: 'old-code' }) };
     });
@@ -440,7 +443,7 @@ describe('mcp_oauth_create_grant', () => {
   const grantArgs = (approvedBy: string) => ({
     p_client_id: CLIENT_ID, p_scope: 'mcp:crm', p_access_hash: 'ah', p_access_expires: later(600_000),
     p_refresh_hash: 'rh', p_refresh_expires: later(40 * 86_400_000), p_absolute_expires: later(30 * 86_400_000),
-    p_approved_by: approvedBy, p_approved_at: later(-60_000), p_ip: '198.51.100.4', p_user_agent: 'ua',
+    p_approved_by: approvedBy, p_approved_at: later(-60_000), p_consent_version: CONSENT, p_ip: '198.51.100.4', p_user_agent: 'ua',
   });
 
   it('creates the grant, both tokens (refresh capped at the grant) and the audit row together', async () => {
@@ -463,6 +466,121 @@ describe('mcp_oauth_create_grant', () => {
       await tx.query(`INSERT INTO public.mcp_oauth_clients (client_id, redirect_uris) VALUES ($1, $2)`, [CLIENT_ID, [REDIRECT]]);
       return call(tx, 'mcp_oauth_create_grant', grantArgs(SYSTEM_ID));
     }));
+  });
+});
+
+describe('the consent version is bound to the approval', () => {
+  async function parked(tx: Tx, requestId: string) {
+    await tx.query(
+      `INSERT INTO public.mcp_oauth_clients (client_id, client_name, redirect_uris) VALUES ($1, 'Example assistant', $2) ON CONFLICT DO NOTHING`,
+      [CLIENT_ID, [REDIRECT]],
+    );
+    await tx.query(
+      `INSERT INTO public.mcp_oauth_requests (request_id, client_id, redirect_uri, state, code_challenge, scope, resource, expires_at)
+       VALUES ($1, $2, $3, 'st', 'challenge', 'mcp:crm', 'r', now() + interval '10 minutes')`,
+      [requestId, CLIENT_ID, REDIRECT],
+    );
+  }
+  const approve = (tx: Tx, requestId: string, version: number | null) =>
+    call(tx, 'mcp_oauth_decide', {
+      p_request_id: requestId, p_approve: true, p_code_hash: `code-${requestId}`, p_code_expires: later(300_000),
+      p_consent_version: version, ...audit,
+    });
+  /** The exchange as mcp-oauth runs it: consume, then write the grant with what the consume handed on. */
+  async function exchange(tx: Tx, requestId: string) {
+    const consumed = await call<{ approved_by: string; approved_at: string; consent_version: number | null }>(
+      tx, 'mcp_oauth_consume_code', { p_code_hash: `code-${requestId}` });
+    // A savepoint kept on success (attempt() always rolls back), undone only on a refusal.
+    await tx.query('SAVEPOINT exchange');
+    const error = await Promise.resolve(
+      call(tx, 'mcp_oauth_create_grant', {
+        p_client_id: CLIENT_ID, p_scope: 'mcp:crm', p_access_hash: `ah-${requestId}`, p_access_expires: later(600_000),
+        p_refresh_hash: `rh-${requestId}`, p_refresh_expires: later(86_400_000), p_absolute_expires: later(30 * 86_400_000),
+        p_approved_by: consumed.approved_by, p_approved_at: consumed.approved_at, p_consent_version: consumed.consent_version,
+        p_ip: null, p_user_agent: null,
+      }),
+    ).then(
+      async () => { await tx.query('RELEASE SAVEPOINT exchange'); return null; },
+      async (e: Error) => { await tx.query('ROLLBACK TO SAVEPOINT exchange'); return e.message; },
+    );
+    const grants = (await tx.query<{ consent_version: number }>(`SELECT consent_version FROM public.mcp_oauth_grants`)).rows;
+    return { handedOn: consumed.consent_version, error, grants };
+  }
+
+  it('the screen and the database state the same version', async () => {
+    const v = await asServerTx(async (tx) => (await tx.query<{ v: number }>(`SELECT public.mcp_consent_version() AS v`)).rows[0].v);
+    expect(Number.isInteger(CONSENT)).toBe(true);
+    expect(v).toBe(CONSENT);
+  });
+
+  it('an approval on any other version is refused and the request stays pending', async () => {
+    const out = await asServerTx(async (tx) => {
+      await parked(tx, 'req-old');
+      const older = await attempt(tx, () => approve(tx, 'req-old', CONSENT - 1));
+      const none = await attempt(tx, () => approve(tx, 'req-old', null));
+      const row = (await tx.query(`SELECT status, code_hash, consent_version FROM public.mcp_oauth_requests WHERE request_id = 'req-old'`)).rows[0];
+      return { older, none, row, audit: await auditRows(tx, 'mcp_oauth_approved') };
+    });
+    expect(out.older).toMatch(/mcp_oauth_decide: stale_consent/);
+    expect(out.none).toMatch(/mcp_oauth_decide: stale_consent/);
+    expect(out.row).toEqual({ status: 'pending', code_hash: null, consent_version: null });
+    expect(out.audit).toEqual([]);
+  });
+
+  it('an approval on the current version is stored on the request and becomes a grant of that version', async () => {
+    const out = await asServerTx(async (tx) => {
+      await parked(tx, 'req-now');
+      await approve(tx, 'req-now', CONSENT);
+      const stored = (await tx.query(`SELECT consent_version FROM public.mcp_oauth_requests WHERE request_id = 'req-now'`)).rows[0];
+      return { stored, ...(await exchange(tx, 'req-now')) };
+    });
+    expect(out.stored).toEqual({ consent_version: CONSENT });
+    expect(out.handedOn).toBe(CONSENT);
+    expect(out.error).toBeNull();
+    expect(out.grants).toEqual([{ consent_version: CONSENT }]);
+  });
+
+  it('a request decided on version N cannot yield a grant once the version is bumped', async () => {
+    const out = await asServerTx(async (tx) => {
+      await parked(tx, 'req-bump');
+      await approve(tx, 'req-bump', CONSENT);
+      // The upgrade lands between the approval and the code exchange (rolled back with the test).
+      await becomeSuperuser(tx);
+      await tx.exec(`CREATE OR REPLACE FUNCTION public.mcp_consent_version() RETURNS integer LANGUAGE sql IMMUTABLE SET search_path = '' AS $$ SELECT ${CONSENT + 1} $$`);
+      await become(tx, asServer);
+      return exchange(tx, 'req-bump');
+    });
+    expect(out.handedOn).toBe(CONSENT);
+    expect(out.error).toMatch(/mcp_oauth_create_grant: stale_consent/);
+    expect(out.grants).toEqual([]);
+  });
+
+  it('an approval stored before versions were recorded (NULL) yields no grant, and its code stays burned', async () => {
+    const out = await asServerTx(async (tx) => {
+      await parked(tx, 'req-pre');
+      await becomeSuperuser(tx);
+      await tx.query(
+        `UPDATE public.mcp_oauth_requests SET status = 'approved', code_hash = 'code-req-pre', approved_by = $1, approved_at = now(),
+                code_expires_at = now() + interval '5 minutes' WHERE request_id = 'req-pre'`, [OWNER_ID]);
+      await become(tx, asServer);
+      const result = await exchange(tx, 'req-pre');
+      const status = (await tx.query(`SELECT status FROM public.mcp_oauth_requests WHERE request_id = 'req-pre'`)).rows[0];
+      return { ...result, status };
+    });
+    expect(out.handedOn).toBeNull();
+    expect(out.error).toMatch(/mcp_oauth_create_grant: stale_consent/);
+    expect(out.grants).toEqual([]);
+    expect(out.status).toEqual({ status: 'consumed' });
+  });
+
+  it('a grant cannot be written without a version: the column has no default', async () => {
+    const error = await asServerTx(async (tx) => {
+      await tx.query(`INSERT INTO public.mcp_oauth_clients (client_id, redirect_uris) VALUES ($1, $2)`, [CLIENT_ID, [REDIRECT]]);
+      return attempt(tx, () => tx.query(
+        `INSERT INTO public.mcp_oauth_grants (client_id, scope, approved_by, approved_at, absolute_expires_at)
+         VALUES ($1, 'mcp:crm', $2, now(), now() + interval '30 days')`, [CLIENT_ID, OWNER_ID]));
+    });
+    expect(error).toMatch(/consent_version/);
   });
 });
 
@@ -627,7 +745,7 @@ describe('the approver\u2019s MFA recovery ends every grant made before it', () 
         [CLIENT_ID, REDIRECT],
       );
       await call(tx, 'mcp_oauth_decide', {
-        p_request_id: 'req-i', p_approve: true, p_code_hash: 'code-i', p_code_expires: later(300_000), ...audit,
+        p_request_id: 'req-i', p_approve: true, p_code_hash: 'code-i', p_code_expires: later(300_000), p_consent_version: CONSENT, ...audit,
       });
       const consumed = await call<{ approved_by: string; approved_at: string }>(tx, 'mcp_oauth_consume_code', { p_code_hash: 'code-i' });
       await becomeSuperuser(tx);
@@ -638,7 +756,7 @@ describe('the approver\u2019s MFA recovery ends every grant made before it', () 
           await call(tx, 'mcp_oauth_create_grant', {
             p_client_id: CLIENT_ID, p_scope: 'mcp:crm', p_access_hash: 'ah-i', p_access_expires: later(600_000),
             p_refresh_hash: 'rh-i', p_refresh_expires: later(86_400_000), p_absolute_expires: later(30 * 86_400_000),
-            p_approved_by: consumed.approved_by, p_approved_at: consumed.approved_at, p_ip: null, p_user_agent: null,
+            p_approved_by: consumed.approved_by, p_approved_at: consumed.approved_at, p_consent_version: CONSENT, p_ip: null, p_user_agent: null,
           });
           return null;
         } catch (err) {
@@ -1213,7 +1331,7 @@ describe('mcp_request_snapshot and mcp_list_requests', () => {
     const sent = out.snap!.lists.find((l) => l.id === out.ids.sent)!;
     expect(sent).toMatchObject({ status: 'sent', title: 'Sent one', intro_message: null, include_contact_confirm: false });
     expect(sent.items.map((i) => [i.kind, i.fulfilled])).toEqual([['document', true], ['question', true], ['todo', false]]);
-    expect(sent.items[1]).toEqual({ ...ITEMS[1], fulfilled: true });
+    expect(sent.items[1]).toEqual({ ...ITEMS[1], status: 'fulfilled', fulfilled: true });
   });
 
   it('never returns an answer, typed or encrypted', async () => {
@@ -1880,25 +1998,26 @@ describe('the request follow-up functions', () => {
     expect(out.audit).toEqual(['draft', 'already_closed']);
   });
 
-  it('reports the status as stored after the items move: a trigger that closes a fully accepted request is reported as closed', async () => {
+  it('accepting the last outstanding answer closes the request through 0014’s trigger, and the result says closed', async () => {
     const out = await asServerTx(async (tx) => {
-      // Stands in for the requests domain's trigger (0014): once no item is left to accept
-      // or answer, the request closes itself.
-      await asSetup(tx, `
-        CREATE FUNCTION public.mut_close_when_accepted() RETURNS trigger LANGUAGE plpgsql SET search_path = '' AS $f$
-        BEGIN
-          UPDATE public.needs_lists l SET status = 'closed', closed_at = now()
-           WHERE l.id IN (SELECT DISTINCT n.list_id FROM new_items n) AND l.status IN ('sent', 'submitted')
-             AND NOT EXISTS (SELECT 1 FROM public.needs_items i WHERE i.list_id = l.id AND i.kind <> 'info' AND i.status <> 'reviewed');
-          RETURN NULL;
-        END $f$`);
-      await asSetup(tx, `CREATE TRIGGER mut_close_when_accepted AFTER UPDATE ON public.needs_items
-          REFERENCING NEW TABLE AS new_items FOR EACH STATEMENT EXECUTE FUNCTION public.mut_close_when_accepted();`);
-      const id = await request(tx, 'submitted', [{ status: 'fulfilled' }, { status: 'reviewed' }]);
+      const id = await request(tx, 'sent', [{ status: 'fulfilled' }, { status: 'reviewed' }, { kind: 'info', status: 'pending' }]);
+      return {
+        result: await accept(tx, id),
+        stored: (await tx.query(`SELECT status, closed_at IS NOT NULL AS stamped FROM public.needs_lists WHERE id = $1`, [id])).rows[0],
+      };
+    });
+    expect(out.result).toEqual({ accepted: 1, still_open: 0, list_status: 'closed' });
+    expect(out.stored).toEqual({ status: 'closed', stamped: true });
+  });
+
+  it('a sent request that still asks the client to confirm their details stays sent when its last answer is accepted', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await request(tx, 'sent', [{ status: 'fulfilled' }]);
+      await asSetup(tx, `UPDATE public.needs_lists SET include_contact_confirm = true WHERE id = $1`, [id]);
       return { result: await accept(tx, id), stored: (await tx.query(`SELECT status FROM public.needs_lists WHERE id = $1`, [id])).rows[0] };
     });
-    expect(out.stored).toEqual({ status: 'closed' });
-    expect(out.result).toEqual({ accepted: 1, still_open: 0, list_status: 'closed' });
+    expect(out.result).toEqual({ accepted: 1, still_open: 0, list_status: 'sent' });
+    expect(out.stored).toEqual({ status: 'sent' });
   });
 
   it('accepts only the answered items, counts what is still open (not the read-only ones), and leaves the request open', async () => {
@@ -1951,27 +2070,29 @@ describe('the request follow-up functions', () => {
     expect(out.audit).toEqual([true]);
   });
 
-  it('the roster reads every open request by whose move it is, clients A to Z, never a closed one or an answer', async () => {
+  it('the roster reads every open request with its items’ kinds and statuses, clients A to Z, never a closed one or an answer', async () => {
     const out = await asServerTx(async (tx) => {
       const submitted = await request(tx, 'submitted', [], contactB, 'Year end');
       const toAccept = await request(tx, 'sent', [{ status: 'fulfilled' }, { status: 'pending' }], contactA, 'Kickoff');
       const waiting = await request(tx, 'sent', [{ status: 'pending' }], contactA, 'Follow up');
       const draft = await request(tx, 'draft', [], contactA, 'Next');
       await request(tx, 'closed', [], contactA, 'Old');
+      // One transaction shares one now(): spread the creation times so newest first is decided.
+      for (const [id, ago] of [[toAccept, 3], [waiting, 2], [draft, 1]] as const) {
+        await asSetup(tx, `UPDATE public.needs_lists SET created_at = now() - make_interval(mins => $2) WHERE id = $1`, [id, ago]);
+      }
       const read = (limit = 500) => call<{ rows: Array<Record<string, unknown>>; truncated: boolean }>(tx, 'mcp_list_open_requests', { p_limit: limit, ...audit });
       return { ids: { submitted, toAccept, waiting, draft }, all: await read(), cut: await read(1), audit: (await auditRows(tx, 'mcp_list_open_requests')).map((r) => r.details) };
     });
     const rows = out.all.rows;
-    expect(rows.map((r) => [r.section, r.list_id])).toEqual([
-      ['waiting_on_you', out.ids.toAccept],
-      ['waiting_on_you', out.ids.submitted],
-      ['waiting_on_client', out.ids.waiting],
-      ['drafts', out.ids.draft],
-    ]);
-    expect(rows[0]).toMatchObject({ client: 'Ada Lovelace', title: 'Kickoff', items: 2, answers_to_accept: 1, status: 'sent' });
+    // Clients A to Z, then newest first: no sections here (mcp-crm groups through the shared roster).
+    expect(rows.map((r) => r.list_id)).toEqual([out.ids.draft, out.ids.waiting, out.ids.toAccept, out.ids.submitted]);
+    expect(rows.find((r) => r.list_id === out.ids.toAccept)).toMatchObject({
+      client: 'Ada Lovelace', title: 'Kickoff', status: 'sent', items: [{ kind: 'todo', status: 'fulfilled' }, { kind: 'todo', status: 'pending' }],
+    });
     for (const r of rows) {
       expect(Object.keys(r).sort()).toEqual([
-        'answers_to_accept', 'client', 'contact_id', 'items', 'list_id', 'reminder_count', 'reminders_paused', 'section', 'sent_at', 'status', 'submitted_at', 'title',
+        'client', 'contact_id', 'created_at', 'items', 'list_id', 'reminder_count', 'reminders_paused', 'sent_at', 'status', 'submitted_at', 'title',
       ]);
     }
     expect(out.all.truncated).toBe(false);
@@ -2056,16 +2177,17 @@ describe('the consent version', () => {
   });
 
   it('a grant that existed before this migration is version 1, so its approver must consent again', async () => {
-    const { rows } = await db.query<{ d: string }>(
-      `SELECT pg_get_expr(d.adbin, d.adrelid) AS d FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    const { rows } = await db.query(
+      `SELECT 1 FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
         WHERE d.adrelid = 'public.mcp_oauth_grants'::regclass AND a.attname = 'consent_version'`);
     // The column was added with DEFAULT 1 (filling the rows already there), then the default
-    // moved to the current version; the source says so in that order.
-    expect(rows[0].d).toBe('mcp_consent_version()');
+    // was dropped, so every grant written after states its version; the source says so in
+    // that order, and the catalog holds no default.
+    expect(rows).toEqual([]);
     const sql = (await import('node:fs')).readFileSync('supabase/migrations/0015_mcp.sql', 'utf8');
     const add = sql.indexOf('ADD COLUMN consent_version integer NOT NULL DEFAULT 1;');
-    const move = sql.indexOf('ALTER COLUMN consent_version SET DEFAULT public.mcp_consent_version();');
+    const drop = sql.indexOf('ALTER COLUMN consent_version DROP DEFAULT;');
     expect(add).toBeGreaterThan(0);
-    expect(move).toBeGreaterThan(add);
+    expect(drop).toBeGreaterThan(add);
   });
 });

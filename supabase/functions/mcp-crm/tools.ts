@@ -38,7 +38,10 @@
 //     anyone or deletes anything, and a draft is never closed (the client never saw it).
 //   * set_request_reminders pauses or resumes one request's automatic reminders and sends
 //     nothing. list_open_requests is the roster of every open request; it returns no
-//     answer and no token.
+//     answer and no token. It and list_requests sort requests by whose move it is through
+//     _shared/request-roster.ts, the rule the browser's roster uses, never one of their own.
+//     Accepting the last answer can close a request (0014); accept_request reports the
+//     status as stored afterwards.
 //
 // Tool results are text a model reads; refusals are tool errors (isError) with a fixed
 // message. A database error is never echoed: sentinels are matched, anything else throws
@@ -50,7 +53,8 @@
 import { isUuid } from '../_shared/http.ts';
 import type { Logger } from '../_shared/log.ts';
 import type { OutwardRemind, OutwardSend, OwnerCopy, RequestOutward } from './outward.ts';
-import { REVIEW_TOKEN_RE, canonicalRequest, type ReviewList, type ReviewRecipient, type ReviewSigner } from './review-token.ts';
+import { answersToAccept, requestRosterSections } from '../_shared/request-roster.ts';
+import { REVIEW_TOKEN_RE, canonicalRequest, type ReviewItem, type ReviewList, type ReviewRecipient, type ReviewSigner } from './review-token.ts';
 import {
   CARD_PRIORITIES,
   CONTACT_CREATABLE,
@@ -357,7 +361,7 @@ export const TOOLS = [
     name: 'list_requests',
     annotations: { readOnlyHint: true, openWorldHint: false },
     description:
-      "List a contact's requests, newest first, with everything the contact sees: the recipient's name and address, and for each request its id, title, intro message, status, and every item's label, description, kind, whether it is required, whether it is sensitive and whether it has been answered. The contact's ANSWERS are never returned. At most 25 requests come back; when there are more, truncated is true and you must not call the list complete. Each draft and each sent request carries a review_token, which update_request, send_request, remind_request and delete_request require. Any change to the request, its items, its answers or the recipient makes the token stale, so read it again after a change.",
+      "List a contact's requests, newest first, with everything the contact sees: the recipient's name and address, and for each request its id, title, intro message, status, and every item's label, description, kind, whether it is required, whether it is sensitive, whether it has been answered and whether that answer has been accepted. Each request also says whose move it is (section: waiting_on_you when the contact submitted it or an answer waits to be accepted, waiting_on_client, drafts or archived, the same sections as the CRM's requests screen) and how many answers wait to be accepted. The contact's ANSWERS are never returned. At most 25 requests come back; when there are more, truncated is true and you must not call the list complete. Each draft and each sent request carries a review_token, which update_request, send_request, remind_request and delete_request require. Any change to the request, its items, its answers or the recipient makes the token stale, so read it again after a change.",
     inputSchema: {
       type: 'object',
       properties: { contact_id: { type: 'string' } },
@@ -425,7 +429,7 @@ export const TOOLS = [
     name: 'list_open_requests',
     annotations: { readOnlyHint: true, openWorldHint: false },
     description:
-      "Every contact's open requests in one list, grouped by whose move it is: waiting_on_you (the contact submitted it, or a sent request has an answer to accept), waiting_on_client (sent, nothing to accept) and drafts. Closed requests are left out. Each row names the contact, the request id and its title, so you can follow up with list_requests for that contact. At most 500 rows come back; when there are more, truncated is true and you must not call the list complete. Read only: no answers and no review tokens come back here.",
+      "Every contact's open requests in one list, grouped by whose move it is, the same sections as the CRM's requests screen: waiting_on_you (the contact submitted it, or a sent request has an answer to accept), waiting_on_client (sent, nothing to accept) and drafts. Closed requests are left out. Each row names the contact, the request id and its title, so you can follow up with list_requests for that contact. At most 500 rows come back; when there are more, truncated is true and you must not call the list complete. Read only: no answers and no review tokens come back here.",
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -450,7 +454,7 @@ export const TOOLS = [
     name: 'accept_request',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     description:
-      "Accept every answer the contact has given on a request, the same as the owner's Accept all in the CRM: an accepted answer is locked, and the contact can no longer change it. Only answered items are accepted; anything still unanswered stays open, and the result says how many. It does not close the request; call close_request after it if your user wants it closed too. Tell your user which request this is and get their go-ahead first.",
+      "Accept every answer the contact has given on a request, the same as the owner's Accept all in the CRM: an accepted answer is locked, and the contact can no longer change it. Only answered items are accepted; anything still unanswered stays open, and the result says how many. When that leaves nothing to do on the request, it closes itself (request_status says closed), as in the CRM; a request still asking the contact to confirm their details stays open until they submit. Otherwise call close_request after it if your user wants it closed too. Tell your user which request this is and get their go-ahead first.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -639,12 +643,13 @@ const ARCHIVED_CARD = (what: 'edited' | 'moved' | 'noted') =>
   `That card is archived, so it is not on the board. Nothing was ${what}. The owner restores it from Archived on the board first.`;
 const INACTIVE_TYPE = 'That kind of work is not in use any more. List the tools again for the current ones.';
 
-/** The roster's sections, in order: what needs the owner first. */
-const ROSTER_SECTIONS = [
-  { key: 'waiting_on_you', label: 'Waiting on you' },
-  { key: 'waiting_on_client', label: 'Waiting on the contact' },
-  { key: 'drafts', label: 'Drafts' },
-] as const;
+/**
+ * The roster's section keys as this server names them. Which section a request is in, and
+ * the order, are decided only by _shared/request-roster.ts (the browser's roster too); this
+ * renames two keys so a model reads whose move it is. Any other key passes through.
+ */
+const SECTION_NAMES: Record<string, string> = { yours: 'waiting_on_you', client: 'waiting_on_client' };
+const sectionName = (key: string) => SECTION_NAMES[key] ?? key;
 
 /** A card's contact refused by mcp_work_item_contact_ok, as a message; null for any other error. */
 function boardContactRefusal(error: unknown, fn: string): string | null {
@@ -674,11 +679,26 @@ const REMIND_REFUSALS: Record<Exclude<OutwardRemind['status'], 'reminded'>, stri
   in_progress: 'Another reminder for this request is being sent right now. Nothing was sent from here.',
 };
 
-/** mcp_request_snapshot's answer: the shape the review tokens are minted over. */
+/** mcp_request_snapshot's answer: the shape the review tokens are minted over, plus each item's stored status. */
 interface RequestSnapshot {
   contact: ReviewRecipient;
-  lists: ReviewList[];
+  lists: Array<Omit<ReviewList, 'items'> & { items: Array<ReviewItem & { status: string }> }>;
   truncated: boolean;
+}
+
+/** One row of mcp_list_open_requests: a request with each item's kind and status, never an answer. */
+interface OpenRequestRow {
+  list_id: string;
+  contact_id: string;
+  client: string | null;
+  title: string;
+  status: string;
+  created_at: string;
+  sent_at: string | null;
+  submitted_at: string | null;
+  reminders_paused: boolean;
+  reminder_count: number;
+  items: Array<{ kind: string; status: string }>;
 }
 
 /** One request of one contact, read through the one snapshot function the tokens are minted from. */
@@ -1233,12 +1253,21 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
     if (error) throw error;
     const snap = data as RequestSnapshot | null;
     if (!snap) return toolError(NO_CONTACT);
+    // Whose move each request is, by the one roster rule the browser uses.
+    const sectionOf = new Map<string, { section: string; label: string }>();
+    for (const s of requestRosterSections(snap.lists.map((l) => ({ ...l, contact_id: snap.contact.id })), () => '')) {
+      for (const l of s.rows) sectionOf.set(l.id, { section: sectionName(s.key), label: s.label });
+    }
     const requests = [];
     for (const list of snap.lists) {
+      const placed = sectionOf.get(list.id);
       requests.push({
         list_id: list.id,
         title: list.title,
         status: list.status,
+        section: placed?.section,
+        section_label: placed?.label,
+        answers_to_accept: answersToAccept(list),
         intro_message: list.intro_message,
         asks_contact_to_confirm_details: list.include_contact_confirm,
         created_at: list.created_at,
@@ -1246,7 +1275,7 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
         item_count: list.items.length,
         items: list.items.map((it) => ({
           label: it.label, kind: it.kind, description: it.description, required: it.required, sensitive: it.sensitive,
-          category: it.category, tag: it.tag, answered: it.fulfilled,
+          category: it.category, tag: it.tag, answered: it.fulfilled, accepted: it.status === 'reviewed',
         })),
         // A draft is a send target and a sent request a reminder target, so both get a
         // token. A submitted or closed one is neither.
@@ -1497,11 +1526,17 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
     if ('failed' in read) return toolError(read.failed);
     const { data, error } = read;
     if (error) throw error;
-    const roster = data as { rows: Array<{ section: string } & Record<string, unknown>>; truncated: boolean };
-    const sections = ROSTER_SECTIONS.map((s) => {
-      const rows = roster.rows.filter((r) => r.section === s.key).map(({ section: _section, ...row }) => row);
-      return { section: s.key, label: s.label, count: rows.length, rows };
-    }).filter((s) => s.count > 0);
+    const roster = data as { rows: OpenRequestRow[]; truncated: boolean };
+    // Grouped and ordered by the one roster rule the browser uses; the item statuses it
+    // reads stay here, and each row says only how many items there are and how many wait.
+    const names = new Map(roster.rows.map((r) => [r.contact_id, r.client ?? '']));
+    const grouped = requestRosterSections(roster.rows.map((r) => ({ ...r, id: r.list_id })), (id) => names.get(id) ?? '');
+    const sections = grouped.map((s) => ({
+      section: sectionName(s.key),
+      label: s.label,
+      count: s.rows.length,
+      rows: s.rows.map(({ id: _id, created_at: _created, items, ...row }) => ({ ...row, items: items.length, answers_to_accept: answersToAccept({ items }) })),
+    }));
     return toolText({
       total: roster.rows.length,
       truncated: roster.truncated,
@@ -1560,6 +1595,12 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
     if (!data) return toolError(NO_REQUEST);
     const result = data as { accepted: number; still_open: number; list_status: string };
     const open = result.still_open;
+    // The status is the one stored after the items moved: accepting the last answer closes
+    // the request on its own (0014), so the note never claims it is still open.
+    const after =
+      result.list_status === 'closed'
+        ? ' Nothing was left to do on it, so the request closed itself; the contact can change nothing more on it.'
+        : ' The request is still open; use close_request if your user wants it closed.';
     return toolText({
       accepted: result.accepted,
       still_unanswered: open,
@@ -1569,7 +1610,7 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
           ? 'There were no answered items waiting to be accepted. Nothing changed.'
           : `Accepted ${result.accepted} answered ${result.accepted === 1 ? 'item' : 'items'}.` +
             (open > 0 ? ` ${open} still ${open === 1 ? 'has' : 'have'} no answer.` : '') +
-            ' The request is still open; use close_request if your user wants it closed.',
+            after,
     });
   }
 

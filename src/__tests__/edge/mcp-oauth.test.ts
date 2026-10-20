@@ -284,6 +284,9 @@ function at(path: string, init: { method?: string; headers?: Record<string, stri
   return handler(new Request(`${FN}${path}`, { method: init.method ?? (body ? 'POST' : 'GET'), headers, body }));
 }
 
+/** The consent version the screen sends: mcp_consent_version() (checked against the database below). */
+const CONSENT = 2;
+
 const consent = (body: unknown, token = OWNER_TOKEN) =>
   at('', { headers: { Authorization: `Bearer ${token}`, Origin: ALLOWED_ORIGIN }, body });
 
@@ -308,7 +311,7 @@ const requestIdOf = (res: Response) => new URL(res.headers.get('Location')!).sea
 async function approvedCode(): Promise<{ code: string; clientId: string }> {
   const clientId = await register();
   const requestId = requestIdOf(await park(clientId));
-  const res = await consent({ action: 'decide', request_id: requestId, approve: true });
+  const res = await consent({ action: 'decide', request_id: requestId, approve: true, consent_version: CONSENT });
   const to = new URL(((await res.json()) as { redirect_to: string }).redirect_to);
   return { code: to.searchParams.get('code')!, clientId };
 }
@@ -462,7 +465,7 @@ describe('the consent calls', () => {
 
   it('refuses an owner signed in without a second factor, and decides nothing', async () => {
     const requestId = requestIdOf(await park(await register()));
-    const res = await consent({ action: 'decide', request_id: requestId, approve: true }, AAL1_OWNER_TOKEN);
+    const res = await consent({ action: 'decide', request_id: requestId, approve: true, consent_version: CONSENT }, AAL1_OWNER_TOKEN);
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ error: 'Approving a connection needs a two-factor sign-in.', code: 'mfa_required' });
     expect((await db.query(`SELECT status, code_hash FROM public.mcp_oauth_requests WHERE request_id = $1`, [requestId])).rows[0]).toEqual({ status: 'pending', code_hash: null });
@@ -476,7 +479,7 @@ describe('the consent calls', () => {
 
   it('refuses a session the database says is not the owner’s', async () => {
     const requestId = requestIdOf(await park(await register()));
-    const res = await consent({ action: 'decide', request_id: requestId, approve: true }, NOT_OWNER_TOKEN);
+    const res = await consent({ action: 'decide', request_id: requestId, approve: true, consent_version: CONSENT }, NOT_OWNER_TOKEN);
     expect(res.status).toBe(500);
     expect(await consent({ action: 'read', request_id: requestId })).toHaveProperty('status', 200);
   });
@@ -484,6 +487,9 @@ describe('the consent calls', () => {
   it.each([
     [{ action: 'decide', request_id: 'r' }],
     [{ action: 'decide', request_id: 'r', approve: 'yes' }],
+    [{ action: 'decide', request_id: 'r', approve: true }],
+    [{ action: 'decide', request_id: 'r', approve: true, consent_version: '2' }],
+    [{ action: 'decide', request_id: 'r', approve: true, consent_version: 1.5 }],
     [{ action: 'delete', request_id: 'r' }],
     [{ action: 'read' }],
     [{ action: 'read', request_id: 'x'.repeat(201) }],
@@ -493,13 +499,25 @@ describe('the consent calls', () => {
 
   it('approval answers the callback with a code and the state, once', async () => {
     const requestId = requestIdOf(await park(await register()));
-    const res = await consent({ action: 'decide', request_id: requestId, approve: true });
+    const res = await consent({ action: 'decide', request_id: requestId, approve: true, consent_version: CONSENT });
     const to = new URL(((await res.json()) as { redirect_to: string }).redirect_to);
     expect(`${to.origin}${to.pathname}`).toBe(REDIRECT);
     expect(to.searchParams.get('state')).toBe('state-1');
     expect(to.searchParams.get('code')).toMatch(/^[A-Za-z0-9_-]{43}$/);
     const again = await consent({ action: 'decide', request_id: requestId, approve: false });
     expect(again.status).toBe(404);
+  });
+
+  it('refuses an approval on older consent wording (409), leaving the request pending', async () => {
+    expect((await db.query<{ v: number }>(`SELECT public.mcp_consent_version() AS v`)).rows[0].v).toBe(CONSENT);
+    const requestId = requestIdOf(await park(await register()));
+    const res = await consent({ action: 'decide', request_id: requestId, approve: true, consent_version: CONSENT - 1 });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'consent_changed' });
+    expect((await db.query(`SELECT status, code_hash, consent_version FROM public.mcp_oauth_requests WHERE request_id = $1`, [requestId])).rows[0])
+      .toEqual({ status: 'pending', code_hash: null, consent_version: null });
+    // A denial needs no version.
+    expect((await consent({ action: 'decide', request_id: requestId, approve: false })).status).toBe(200);
   });
 
   it('denial answers the callback with access_denied and no code', async () => {
@@ -517,6 +535,23 @@ describe('/token', () => {
     expect(t.access_token).toMatch(/^mcpat_[A-Za-z0-9_-]{43}$/);
     expect(t.refresh_token).toMatch(/^mcprt_[A-Za-z0-9_-]{43}$/);
     expect((await liveGrant(t.access_token)).g).toMatchObject({ actor: DB_OWNER_ID });
+  });
+
+  it('a code approved on older consent wording (or before versions were recorded) issues no grant', async () => {
+    for (const stored of [CONSENT - 1, null]) {
+      const { code, clientId } = await approvedCode();
+      // As if the owner approved before the upgrade: the version on the approval is not current.
+      await db.query(`UPDATE public.mcp_oauth_requests SET consent_version = $1 WHERE client_id = $2`, [stored, clientId]);
+      const res = await exchange({ grant_type: 'authorization_code', code, code_verifier: VERIFIER, client_id: clientId, redirect_uri: REDIRECT, resource: RESOURCE });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe('invalid_grant');
+      expect((await db.query(`SELECT 1 FROM public.mcp_oauth_grants WHERE client_id = $1`, [clientId])).rows).toHaveLength(0);
+    }
+  });
+
+  it('the grant carries the version the owner approved', async () => {
+    const t = await tokens();
+    expect((await db.query(`SELECT consent_version FROM public.mcp_oauth_grants WHERE client_id = $1`, [t.clientId])).rows).toEqual([{ consent_version: CONSENT }]);
   });
 
   it('consumes the code first: a wrong verifier burns it, and the right one then fails', async () => {

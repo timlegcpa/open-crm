@@ -289,16 +289,35 @@ export function createMcpOauthEndpoints(deps: McpOauthDeps) {
       if (typeof b.approve !== 'boolean') {
         throw new HttpError(REFUSALS.badRequest.status, REFUSALS.badRequest.error, REFUSALS.badRequest.code);
       }
+      // The version of the wording the owner was shown; an approval needs one. The database
+      // refuses any but the current version, so a screen loaded before an upgrade cannot
+      // approve the new powers on the old wording.
+      const version = b.consent_version;
+      if (b.approve && !(Number.isInteger(version) && (version as number) > 0 && (version as number) < 1_000_000)) {
+        throw new HttpError(REFUSALS.badRequest.status, REFUSALS.badRequest.error, REFUSALS.badRequest.code);
+      }
       const code = b.approve ? randomToken() : null;
-      const decided = await rpc<{ redirect_uri: string; state: string; client_id: string } | null>('mcp_oauth_decide', {
-        p_request_id: requestId,
-        p_approve: b.approve,
-        p_code_hash: code ? await sha256Hex(code) : null,
-        p_code_expires: code ? new Date(now() + CODE_TTL_MS).toISOString() : null,
-        p_actor: principal.userId,
-        p_ip: ip,
-        p_user_agent: userAgent,
-      });
+      let decided: { redirect_uri: string; state: string; client_id: string } | null;
+      try {
+        decided = await rpc('mcp_oauth_decide', {
+          p_request_id: requestId,
+          p_approve: b.approve,
+          p_code_hash: code ? await sha256Hex(code) : null,
+          p_code_expires: code ? new Date(now() + CODE_TTL_MS).toISOString() : null,
+          p_consent_version: b.approve ? version : null,
+          p_actor: principal.userId,
+          p_ip: ip,
+          p_user_agent: userAgent,
+        });
+      } catch (err) {
+        if (String((err as { message?: unknown })?.message ?? '').includes('mcp_oauth_decide: stale_consent')) {
+          return json(409, {
+            error: 'What a connection may do has changed since this page opened. Reload the page, read it again, then answer.',
+            code: 'consent_changed',
+          });
+        }
+        throw err;
+      }
       if (!decided) return json(404, gone);
 
       // Built here, never in the browser: the page only assigns what it is given.
@@ -455,7 +474,7 @@ export function createMcpOauthEndpoints(deps: McpOauthDeps) {
         // Consume FIRST: a code is single-use even when the rest of the exchange fails.
         const consumed = await rpc<{
           client_id: string; redirect_uri: string; code_challenge: string; scope: string; resource: string;
-          approved_by: string | null; approved_at: string | null;
+          approved_by: string | null; approved_at: string | null; consent_version: number | null;
         } | null>('mcp_oauth_consume_code', { p_code_hash: await sha256Hex(code) });
         if (!consumed) return oauthError(400, 'invalid_grant', 'The code is invalid, expired, or already used');
         const mismatch =
@@ -494,14 +513,16 @@ export function createMcpOauthEndpoints(deps: McpOauthDeps) {
           p_absolute_expires: new Date(at + GRANT_ABSOLUTE_MS).toISOString(),
           p_approved_by: consumed.approved_by,
           p_approved_at: consumed.approved_at,
+          p_consent_version: consumed.consent_version,
           p_ip: ip,
           p_user_agent: userAgent,
         });
         if (error) {
-          // The person who approved is no longer the owner: nothing to issue.
-          // Or an MFA recovery of theirs landed after the approval.
+          // The person who approved is no longer the owner: nothing to issue. Or an MFA
+          // recovery of theirs landed after the approval. Or the approval was given on
+          // older consent wording than the connector now needs.
           const message = String((error as { message?: unknown }).message ?? '');
-          if (message.includes('approver_not_owner') || message.includes('approval_revoked')) {
+          if (message.includes('approver_not_owner') || message.includes('approval_revoked') || message.includes('stale_consent')) {
             return oauthError(400, 'invalid_grant', 'The approval is no longer valid');
           }
           throw error;

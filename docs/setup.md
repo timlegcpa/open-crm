@@ -26,7 +26,7 @@ install.
 npx supabase db push
 ```
 
-This applies the migrations in `supabase/migrations/` in order (`0001_core` to `0012_portal`).
+This applies every migration in `supabase/migrations/`, in filename order (from `0001_core` on).
 See [architecture.md](architecture.md#migrations) for what each one holds.
 
 ## 3. Apply the Auth settings
