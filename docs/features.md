@@ -104,13 +104,18 @@ the address is then never sent group email again.
 **Owner.** Leads and won clients by month and by source, monthly targets, ad spend with cost
 per lead and cost per acquisition, and recurring revenue from accepted quotes.
 
-## AI connector (`mcp`, `0007_mcp`)
+## AI connector (`mcp`, `0007_mcp`, `0015_mcp`)
 
 **Owner.** Connect an AI assistant (any MCP client) through OAuth: the assistant asks, and the
 owner approves on a consent screen with a second-factor session. The assistant can then search
-and read contacts, create and update them, add businesses, log call notes, manage quotes, and
-create, send and remind requests. Every call is audited. Settings, AI connector lists the
-connections and revokes them.
+and read contacts (by name, email, phone or business; archived contacts are left out), create
+them from an email or a phone number with a stage and lead source, update them, move them along
+the pipeline, add businesses, log call notes, and manage quotes. It works the board (list,
+create, edit, move with a reason, and note cards), and handles requests end to end: create,
+send and remind them, see every open request by whose move it is, accept answers, close a
+request, and pause its reminders. Every call is audited. When the consent screen gains a power,
+connections approved on the older screen stop working until the owner approves again. Settings, AI connector lists the
+connections and revokes them. The full tool list is in the README.
 
 ## Settings (`settings`, `0011_control_center`)
 

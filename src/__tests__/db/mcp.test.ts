@@ -1,6 +1,6 @@
 // @vitest-environment node
-// 0007_mcp on the real migrations: who may touch the OAuth tables and call the connector's
-// functions, and what each function does. Every call runs as the role that makes it in
+// 0007_mcp and 0015_mcp on the real migrations: who may touch the OAuth tables and call the
+// connector's functions, and what each function does. Every call runs as the role that makes it in
 // production (service_role for the edge functions, a signed-in session for the owner's two)
 // inside a transaction that is rolled back, so each test starts from the same fixtures.
 import type { PGlite } from '@electric-sql/pglite';
@@ -45,6 +45,9 @@ let viewAsClient: Principal;
 
 beforeAll(async () => {
   db = await createDb();
+  // The contacts archive column arrives with the contacts domain's own migration (0013);
+  // added here only when this tree does not carry it yet, so the suite runs either way.
+  await db.query('ALTER TABLE public.contacts ADD COLUMN IF NOT EXISTS archived_at timestamptz');
   await seedCore(db);
   contactA = await seedContact(db, { first_name: 'Ada', last_name: 'Lovelace', email: 'ada@example.com', business_name: 'Acme LLC' });
   contactB = await seedContact(db, { first_name: 'Bo', last_name: 'Baker', email: 'bo@example.com' });
@@ -179,6 +182,7 @@ const SERVER_FUNCTIONS = [
   'mcp_oauth_authenticate(text)',
   'mcp_oauth_cleanup()',
   'mcp_tool_vocabulary()',
+  'mcp_consent_version()',
   'mcp_search_contacts(text,text,integer,uuid,text,text)',
   'mcp_get_contact(uuid,uuid,text,text)',
   'mcp_create_contact(jsonb,uuid,text,text)',
@@ -197,6 +201,18 @@ const SERVER_FUNCTIONS = [
   'mcp_delete_request(uuid,uuid,integer,uuid,text,text)',
   'mcp_claim_reminder(uuid,uuid)',
   'mcp_release_reminder(uuid,timestamp with time zone,timestamp with time zone)',
+  // 0015_mcp.
+  'mcp_set_contact_status(uuid,text,text,uuid,text,text)',
+  'mcp_list_board(text,uuid,integer,uuid,text,text)',
+  'mcp_work_item_contact_ok(uuid,text)',
+  'mcp_create_work_item(text,uuid,text,text,text,date,uuid,text,text)',
+  'mcp_update_work_item(uuid,jsonb,uuid,text,text)',
+  'mcp_move_work_item(uuid,text,text,text,uuid,text,text)',
+  'mcp_add_work_item_note(uuid,text,uuid,text,text)',
+  'mcp_close_request(uuid,uuid,uuid,text,text)',
+  'mcp_accept_request(uuid,uuid,uuid,text,text)',
+  'mcp_set_request_reminders(uuid,uuid,boolean,uuid,text,text)',
+  'mcp_list_open_requests(integer,uuid,text,text)',
 ];
 const OWNER_FUNCTIONS = ['mcp_list_grants()', 'mcp_revoke_grant(uuid)'];
 
@@ -228,7 +244,13 @@ describe('function privileges', () => {
     for (const who of [asOwner, clientA]) {
       await expectDenied(as(db, who, `SELECT public.mcp_oauth_authenticate('x')`));
       await expectDenied(as(db, who, `SELECT public.mcp_get_contact($1, $2, NULL, NULL)`, [contactA, OWNER_ID]));
+      await expectDenied(as(db, who, `SELECT public.mcp_set_contact_status($1, 'client', 'new_lead', $2, NULL, NULL)`, [contactA, OWNER_ID]));
+      await expectDenied(as(db, who, `SELECT public.mcp_close_request($1, $2, $3, NULL, NULL)`, [randomUUID(), contactA, OWNER_ID]));
+      await expectDenied(as(db, who, `SELECT public.mcp_list_board(NULL, NULL, 10, $1, NULL, NULL)`, [OWNER_ID]));
     }
+    // A View-as-client session is a client session: refused like one.
+    await expectDenied(as(db, viewAsClient, `SELECT public.mcp_accept_request($1, $2, $3, NULL, NULL)`, [randomUUID(), contactA, OWNER_ID]));
+    await expectDenied(as(db, asAnon, `SELECT public.mcp_list_open_requests(10, $1, NULL, NULL)`, [OWNER_ID]));
     await expectDenied(as(db, asAnon, `SELECT public.mcp_tool_vocabulary()`));
   });
 
@@ -1466,9 +1488,584 @@ describe('audit rows', () => {
   });
 
   it('every action the connector writes is a valid audit action', async () => {
-    const src = (await import('node:fs')).readFileSync('supabase/migrations/0007_mcp.sql', 'utf8');
+    const fs = await import('node:fs');
+    const src = ['0007_mcp.sql', '0015_mcp.sql'].map((f) => fs.readFileSync(`supabase/migrations/${f}`, 'utf8')).join('\n');
     const actions = [...src.matchAll(/'(mcp_[a-z_]+)'/g)].map((m) => m[1]).filter((a) => !a.startsWith('mcp_oauth_') || /approved|denied|grant_created|refreshed|revoked|replay/.test(a));
     expect(actions.length).toBeGreaterThan(10);
     for (const a of actions) expect(a).toMatch(/^[a-z][a-z0-9_.]{0,99}$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0015_mcp: the pipeline, the work board and the request follow-up
+// ---------------------------------------------------------------------------
+
+/** As the database superuser for setup, then back to the server for the call under test. */
+async function asSetup(tx: Tx, sql: string, params: unknown[] = []) {
+  await becomeSuperuser(tx);
+  const rows = (await tx.query<Record<string, unknown>>(sql, params)).rows;
+  await become(tx, asServer);
+  return rows;
+}
+
+describe('mcp_tool_vocabulary: the pipeline and the board', () => {
+  it('offers every stage but the system one, with labels; the lead sources a model may set; the lanes with labels; the active card types', async () => {
+    const out = await asServerTx(async (tx) => {
+      await asSetup(tx, `UPDATE public.lead_sources SET is_active = false WHERE key = 'event'`);
+      await asSetup(tx, `UPDATE public.work_item_types SET is_active = false WHERE key = 'meeting'`);
+      await asSetup(tx, `UPDATE public.board_stages SET label = 'Doing now' WHERE key = 'doing'`);
+      return {
+        vocab: await call<{
+          selectable_statuses: Array<{ key: string; label: string }>; lead_sources: string[];
+          board_stages: Array<{ key: string; label: string }>; work_item_types: string[];
+        }>(tx, 'mcp_tool_vocabulary'),
+        statuses: (await tx.query<{ key: string; label: string }>(`SELECT key, label FROM public.contact_statuses ORDER BY sort_order, key`)).rows,
+      };
+    });
+    expect(out.vocab.selectable_statuses).toEqual(out.statuses.filter((s) => s.key !== 'esign_signer'));
+    expect(out.vocab.selectable_statuses.map((s) => s.key)).not.toContain('esign_signer');
+    expect(out.vocab.lead_sources).toContain('referral');
+    expect(out.vocab.lead_sources).toContain('other');
+    for (const key of ['event', 'lead_intake', 'esign']) expect(out.vocab.lead_sources).not.toContain(key);
+    expect(out.vocab.board_stages).toEqual([
+      { key: 'todo', label: 'To do' }, { key: 'waiting', label: 'Waiting' }, { key: 'doing', label: 'Doing now' }, { key: 'done', label: 'Done' },
+    ]);
+    expect(out.vocab.work_item_types).toContain('task');
+    expect(out.vocab.work_item_types).not.toContain('meeting');
+  });
+});
+
+describe('mcp_search_contacts: phone and archive', () => {
+  it('matches a run of the phone as stored, and never returns an archived contact', async () => {
+    const out = await asServerTx(async (tx) => {
+      await asSetup(tx, `UPDATE public.contacts SET phone = '(555) 010-4477' WHERE id = $1`, [contactB]);
+      const search = (q: string) =>
+        call<{ contacts: Array<{ id: string }> }>(tx, 'mcp_search_contacts', { p_query: q, p_status: null, p_limit: 25, ...audit });
+      const byPhone = (await search('4477')).contacts.map((c) => c.id);
+      await asSetup(tx, `UPDATE public.contacts SET archived_at = now() WHERE id = $1`, [contactB]);
+      return {
+        byPhone,
+        archivedByPhone: (await search('4477')).contacts.map((c) => c.id),
+        archivedByName: (await search('baker')).contacts.map((c) => c.id),
+        all: (await search('')).contacts.map((c) => c.id),
+      };
+    });
+    expect(out.byPhone).toEqual([contactB]);
+    expect(out.archivedByPhone).toEqual([]);
+    expect(out.archivedByName).toEqual([]);
+    expect(out.all).toEqual([contactA]);
+  });
+});
+
+describe('mcp_create_contact: email or phone, stage and source', () => {
+  const create = (tx: Tx, patch: Record<string, unknown>) => call<Record<string, unknown>>(tx, 'mcp_create_contact', { p_patch: patch, ...audit });
+
+  it('creates a lead from a phone alone, with no address and no duplicate check on the phone', async () => {
+    const out = await asServerTx(async (tx) => {
+      const first = await create(tx, { phone: '555 0100', first_name: 'Grace' });
+      const second = await create(tx, { phone: '555 0100' });
+      const row = (await tx.query(`SELECT email, phone, status, source FROM public.contacts WHERE id = $1`, [first.id])).rows[0];
+      return { first, second, row };
+    });
+    expect(out.first).toMatchObject({ outcome: 'created', email: null, phone: '555 0100', status: 'new_lead', source: 'other' });
+    expect(out.second).toMatchObject({ outcome: 'created' });
+    expect(out.row).toEqual({ email: null, phone: '555 0100', status: 'new_lead', source: 'other' });
+  });
+
+  it('records the stage and source given; a client stage stamps client_since and one history entry, through the trigger', async () => {
+    const out = await asServerTx(async (tx) => {
+      const created = await create(tx, { email: 'grace@example.com', status: 'client', source: 'referral' });
+      const row = (await tx.query<{ status: string; source: string; client_since: string | null; status_history: unknown[] }>(
+        `SELECT status, source, client_since::text, status_history FROM public.contacts WHERE id = $1`, [created.id])).rows[0];
+      return { row, rows: await auditRows(tx, 'mcp_create_contact') };
+    });
+    expect(out.row).toMatchObject({ status: 'client', source: 'referral' });
+    expect(out.row.client_since).not.toBeNull();
+    expect(out.row.status_history).toHaveLength(1);
+    // The lead source sits under its own key: details.source is the audit's own ('mcp').
+    expect(out.rows[0].details).toMatchObject({ source: 'mcp', status: 'client', lead_source: 'referral' });
+  });
+
+  it.each([
+    ['neither an address nor a phone', {}, /email_or_phone_required/],
+    ['a blank address and a blank phone', { email: ' ', phone: '' }, /email_or_phone_required/],
+    ['the system status', { phone: '1', status: 'esign_signer' }, /invalid_status/],
+    ['an unknown status', { phone: '1', status: 'made_up' }, /invalid_status/],
+    ['a source the code assigns', { phone: '1', source: 'lead_intake' }, /inactive_source/],
+    ['the e-signature source', { phone: '1', source: 'esign' }, /inactive_source/],
+    ['an unknown source', { phone: '1', source: 'made_up' }, /inactive_source/],
+  ])('refuses %s, writing nothing', async (_label, patch, error) => {
+    const out = await asServerTx(async (tx) => {
+      const before = (await tx.query<{ n: number }>(`SELECT count(*)::int AS n FROM public.contacts`)).rows[0].n;
+      const err = await attempt(tx, () => create(tx, patch));
+      return { err, before, after: (await tx.query<{ n: number }>(`SELECT count(*)::int AS n FROM public.contacts`)).rows[0].n };
+    });
+    expect(out.err).toMatch(error);
+    expect(out.after).toBe(out.before);
+  });
+
+  it('refuses a source the owner retired', async () => {
+    const err = await asServerTx(async (tx) => {
+      await asSetup(tx, `UPDATE public.lead_sources SET is_active = false WHERE key = 'referral'`);
+      return attempt(tx, () => create(tx, { phone: '1', source: 'referral' }));
+    });
+    expect(err).toMatch(/inactive_source/);
+  });
+});
+
+describe('mcp_set_contact_status', () => {
+  const move = (tx: Tx, contact: string, status: string, expected: string) =>
+    call<Record<string, unknown>>(tx, 'mcp_set_contact_status', { p_contact_id: contact, p_status: status, p_expected_status: expected, ...audit });
+
+  it('moves the stage on a matching read; the trigger appends the history and stamps client_since', async () => {
+    const out = await asServerTx(async (tx) => {
+      const before = (await tx.query<{ h: unknown[] }>(`SELECT status_history AS h FROM public.contacts WHERE id = $1`, [contactA])).rows[0].h.length;
+      const result = await move(tx, contactA, 'client', 'new_lead');
+      const row = (await tx.query<{ status: string; client_since: string | null; h: Array<{ status: string }> }>(
+        `SELECT status, client_since::text, status_history AS h FROM public.contacts WHERE id = $1`, [contactA])).rows[0];
+      return { before, result, row, rows: await auditRows(tx, 'mcp_set_contact_status') };
+    });
+    expect(out.result).toMatchObject({ outcome: 'updated', id: contactA, from: 'new_lead', status: 'client' });
+    expect(out.row.status).toBe('client');
+    expect(out.row.client_since).not.toBeNull();
+    expect(out.row.h).toHaveLength(out.before + 1);
+    expect(out.row.h.at(-1)!.status).toBe('client');
+    expect(out.rows).toEqual([{ user_id: OWNER_ID, details: { source: 'mcp', contact_id: contactA, from: 'new_lead', to: 'client' }, ip_address: '203.0.113.7' }]);
+  });
+
+  it('refuses a stale read with the stored stage, and an unchanged move, writing nothing; each refusal is audited by outcome', async () => {
+    const out = await asServerTx(async (tx) => {
+      const stale = await move(tx, contactA, 'client', 'cold');
+      const unchanged = await move(tx, contactA, 'new_lead', 'new_lead');
+      const row = (await tx.query(`SELECT status FROM public.contacts WHERE id = $1`, [contactA])).rows[0];
+      return { stale, unchanged, row, rows: (await auditRows(tx, 'mcp_set_contact_status')).map((r) => r.details) };
+    });
+    expect(out.stale).toEqual({ outcome: 'stale', current_status: 'new_lead' });
+    expect(out.unchanged).toEqual({ outcome: 'unchanged', status: 'new_lead' });
+    expect(out.row).toEqual({ status: 'new_lead' });
+    expect(out.rows).toEqual([
+      { source: 'mcp', contact_id: contactA, outcome: 'stale' },
+      { source: 'mcp', contact_id: contactA, outcome: 'unchanged' },
+    ]);
+  });
+
+  it('never moves a contact into the system status, nor out of it', async () => {
+    const out = await asServerTx(async (tx) => {
+      const into = await attempt(tx, () => move(tx, contactA, 'esign_signer', 'new_lead'));
+      await asSetup(tx, `UPDATE public.contacts SET status = 'esign_signer' WHERE id = $1`, [contactB]);
+      const outOf = await move(tx, contactB, 'client', 'esign_signer');
+      const row = (await tx.query(`SELECT status FROM public.contacts WHERE id = $1`, [contactB])).rows[0];
+      return { into, outOf, row };
+    });
+    expect(out.into).toMatch(/invalid_status/);
+    expect(out.outOf).toEqual({ outcome: 'system_status', current_status: 'esign_signer' });
+    expect(out.row).toEqual({ status: 'esign_signer' });
+  });
+
+  it('refuses an archived contact, and is not_found (unaudited) for a missing one', async () => {
+    const out = await asServerTx(async (tx) => {
+      await asSetup(tx, `UPDATE public.contacts SET archived_at = now() WHERE id = $1`, [contactB]);
+      const archived = await move(tx, contactB, 'client', 'new_lead');
+      const missing = await move(tx, randomUUID(), 'client', 'new_lead');
+      return { archived, missing, row: (await tx.query(`SELECT status FROM public.contacts WHERE id = $1`, [contactB])).rows[0], rows: (await auditRows(tx, 'mcp_set_contact_status')).map((r) => r.details) };
+    });
+    expect(out.archived).toEqual({ outcome: 'archived' });
+    expect(out.missing).toEqual({ outcome: 'not_found' });
+    expect(out.row).toEqual({ status: 'new_lead' });
+    expect(out.rows).toEqual([{ source: 'mcp', contact_id: contactB, outcome: 'archived' }]);
+  });
+});
+
+describe('the board functions', () => {
+  /** A card, seeded as the superuser: a lane, a place in it and an archive stamp as given. */
+  async function card(tx: Tx, fields: Record<string, unknown> = {}): Promise<string> {
+    const row = { title: 'Call back', stage: 'todo', ...fields };
+    const cols = Object.keys(row);
+    const rows = await asSetup(tx, `INSERT INTO public.work_items (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING id`, Object.values(row));
+    return rows[0].id as string;
+  }
+  const events = async (tx: Tx, id: string) =>
+    (await tx.query<{ event_type: string; from_value: string | null; to_value: string | null; actor_user_id: string; detail: Record<string, unknown> | null }>(
+      `SELECT event_type, from_value, to_value, actor_user_id, detail FROM public.work_item_events WHERE work_item_id = $1 ORDER BY created_at`, [id])).rows;
+
+  it('lists unarchived cards lane by lane in board order, with the lanes and their labels, and says when it is cut short', async () => {
+    const out = await asServerTx(async (tx) => {
+      const placed = await card(tx, { title: 'Placed', lane_position: 0, created_at: new Date(Date.now() - 60_000).toISOString() });
+      const fresh = await card(tx, { title: 'Fresh', contact_id: contactA });
+      const doing = await card(tx, { title: 'Doing', stage: 'doing' });
+      await card(tx, { title: 'Archived', archived_at: new Date().toISOString() });
+      const list = (stage: string | null, contact: string | null, limit = 200) =>
+        call<{ lanes: Array<{ key: string; label: string }>; cards: Array<{ id: string; lane: string; contact_name: string | null }>; truncated: boolean }>(
+          tx, 'mcp_list_board', { p_stage: stage, p_contact_id: contact, p_limit: limit, ...audit });
+      return {
+        ids: { placed, fresh, doing },
+        all: await list(null, null),
+        lane: await list('doing', null),
+        mine: await list(null, contactA),
+        cut: await list(null, null, 1),
+        unknown: await attempt(tx, () => list('made_up', null)),
+        rows: (await auditRows(tx, 'mcp_list_board')).map((r) => r.details),
+      };
+    });
+    // An unplaced card sorts above a placed one in its lane; lanes run in their order.
+    expect(out.all.cards.map((c) => c.id)).toEqual([out.ids.fresh, out.ids.placed, out.ids.doing]);
+    expect(out.all.cards[2].lane).toBe('In progress');
+    expect(out.all.lanes.map((l) => l.key)).toEqual(['todo', 'waiting', 'doing', 'done']);
+    expect(out.all.truncated).toBe(false);
+    expect(out.all.cards[0].contact_name).toBe('Ada Lovelace');
+    expect(out.lane.cards.map((c) => c.id)).toEqual([out.ids.doing]);
+    expect(out.mine.cards.map((c) => c.id)).toEqual([out.ids.fresh]);
+    expect(out.cut).toMatchObject({ truncated: true });
+    expect(out.cut.cards).toHaveLength(1);
+    expect(out.unknown).toMatch(/unknown_stage/);
+    expect(out.rows[0]).toEqual({ source: 'mcp', stage: null, contact_id: null, returned: 3, truncated: false });
+  });
+
+  it('creates a card with the column defaults and a created event by the actor, audited', async () => {
+    const out = await asServerTx(async (tx) => {
+      const created = await call<Record<string, unknown>>(tx, 'mcp_create_work_item', {
+        p_title: '  Send the proposal ', p_contact_id: contactA, p_work_item_type: null, p_stage: null, p_priority: null, p_due_date: '2027-04-15', ...audit,
+      });
+      return { created, ev: await events(tx, created.id as string), rows: (await auditRows(tx, 'mcp_create_work_item')).map((r) => r.details) };
+    });
+    expect(out.created).toMatchObject({ title: 'Send the proposal', contact_id: contactA, work_item_type: 'task', stage: 'todo', priority: 'normal', due_date: '2027-04-15' });
+    expect(out.ev).toEqual([{ event_type: 'created', from_value: null, to_value: 'todo', actor_user_id: OWNER_ID, detail: { source: 'mcp' } }]);
+    expect(out.rows).toEqual([{ source: 'mcp', work_item_id: out.created.id, contact_id: contactA, stage: 'todo' }]);
+  });
+
+  it.each([
+    ['a missing contact', async () => ({ p_contact_id: randomUUID() }), /contact_not_found/],
+    ['an archived contact', async (tx: Tx) => {
+      await asSetup(tx, `UPDATE public.contacts SET archived_at = now() WHERE id = $1`, [contactB]);
+      return { p_contact_id: contactB };
+    }, /contact_archived/],
+    ['a retired card type', async (tx: Tx) => {
+      await asSetup(tx, `UPDATE public.work_item_types SET is_active = false WHERE key = 'call'`);
+      return { p_work_item_type: 'call' };
+    }, /inactive_type/],
+  ])('refuses to create a card for %s, writing nothing', async (_label, setup, error) => {
+    const out = await asServerTx(async (tx) => {
+      const over = await setup(tx);
+      const err = await attempt(tx, () => call(tx, 'mcp_create_work_item', {
+        p_title: 'T', p_contact_id: null, p_work_item_type: null, p_stage: null, p_priority: null, p_due_date: null, ...audit, ...over,
+      }));
+      return { err, n: (await tx.query<{ n: number }>(`SELECT count(*)::int AS n FROM public.work_items`)).rows[0].n };
+    });
+    expect(out.err).toMatch(error);
+    expect(out.n).toBe(0);
+  });
+
+  it('edits only the keys present: null clears the contact and the date, an absent key is kept; not_found for a missing card', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await card(tx, { contact_id: contactA, due_date: '2027-01-01', priority: 'urgent' });
+      const edited = await call<Record<string, unknown>>(tx, 'mcp_update_work_item', { p_id: id, p_patch: { contact_id: null, due_date: null, title: ' Renamed ' }, ...audit });
+      const missing = await call(tx, 'mcp_update_work_item', { p_id: randomUUID(), p_patch: { title: 'x' }, ...audit });
+      await asSetup(tx, `UPDATE public.contacts SET archived_at = now() WHERE id = $1`, [contactB]);
+      const toArchived = await attempt(tx, () => call(tx, 'mcp_update_work_item', { p_id: id, p_patch: { contact_id: contactB }, ...audit }));
+      return { edited, missing, toArchived, rows: (await auditRows(tx, 'mcp_update_work_item')).map((r) => r.details) };
+    });
+    expect(out.edited).toMatchObject({ outcome: 'updated', card: { title: 'Renamed', contact_id: null, due_date: null, priority: 'urgent', stage: 'todo' } });
+    expect(out.missing).toEqual({ outcome: 'not_found' });
+    expect(out.toArchived).toMatch(/contact_archived/);
+    expect(out.rows).toEqual([{ source: 'mcp', work_item_id: expect.any(String), fields: ['contact_id', 'due_date', 'title'] }]);
+  });
+
+  it('moves a card on a matching read, clearing its place in the lane and recording the reason by the actor', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await card(tx, { lane_position: 3 });
+      const moved = await call(tx, 'mcp_move_work_item', { p_id: id, p_stage: 'doing', p_expected_stage: 'todo', p_note: ' Started ', ...audit });
+      const row = (await tx.query(`SELECT stage, lane_position FROM public.work_items WHERE id = $1`, [id])).rows[0];
+      return { moved, row, ev: await events(tx, id), rows: (await auditRows(tx, 'mcp_move_work_item')).map((r) => r.details) };
+    });
+    expect(out.moved).toEqual({ outcome: 'moved', from: 'todo', stage: 'doing' });
+    expect(out.row).toEqual({ stage: 'doing', lane_position: null });
+    expect(out.ev).toEqual([{ event_type: 'stage_changed', from_value: 'todo', to_value: 'doing', actor_user_id: OWNER_ID, detail: { note: 'Started', source: 'mcp' } }]);
+    expect(out.rows).toEqual([{ source: 'mcp', work_item_id: expect.any(String), from: 'todo', to: 'doing' }]);
+  });
+
+  it('refuses a stale read, an unchanged move and an archived card, moving nothing and writing no history', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await card(tx, { stage: 'waiting' });
+      const archived = await card(tx, { archived_at: new Date().toISOString() });
+      const mv = (cardId: string, stage: string, expected: string) =>
+        call(tx, 'mcp_move_work_item', { p_id: cardId, p_stage: stage, p_expected_stage: expected, p_note: 'r', ...audit });
+      return {
+        stale: await mv(id, 'doing', 'todo'),
+        unchanged: await mv(id, 'waiting', 'waiting'),
+        off: await mv(archived, 'doing', 'todo'),
+        missing: await mv(randomUUID(), 'doing', 'todo'),
+        noNote: await attempt(tx, () => call(tx, 'mcp_move_work_item', { p_id: id, p_stage: 'doing', p_expected_stage: 'waiting', p_note: '  ', ...audit })),
+        stages: (await tx.query(`SELECT stage FROM public.work_items ORDER BY stage`)).rows,
+        ev: (await tx.query<{ n: number }>(`SELECT count(*)::int AS n FROM public.work_item_events`)).rows[0].n,
+      };
+    });
+    expect(out.stale).toEqual({ outcome: 'stale', current_stage: 'waiting' });
+    expect(out.unchanged).toEqual({ outcome: 'unchanged', stage: 'waiting' });
+    expect(out.off).toEqual({ outcome: 'not_on_board' });
+    expect(out.missing).toEqual({ outcome: 'not_found' });
+    expect(out.noNote).toMatch(/note_required/);
+    expect(out.stages).toEqual([{ stage: 'todo' }, { stage: 'waiting' }]);
+    expect(out.ev).toBe(0);
+  });
+
+  it('notes a card without moving it; not_found for a missing card; a blank note is refused', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await card(tx);
+      const note = (cardId: string, text: string) => call(tx, 'mcp_add_work_item_note', { p_id: cardId, p_note: text, ...audit });
+      return {
+        ok: await note(id, ' Left a message '),
+        missing: await note(randomUUID(), 'x'),
+        blank: await attempt(tx, () => note(id, ' ')),
+        ev: await events(tx, id),
+        rows: (await auditRows(tx, 'mcp_add_work_item_note')).map((r) => r.details),
+      };
+    });
+    expect(out.ok).toEqual({ outcome: 'noted' });
+    expect(out.missing).toEqual({ outcome: 'not_found' });
+    expect(out.blank).toMatch(/note_required/);
+    expect(out.ev).toEqual([{ event_type: 'note_added', from_value: null, to_value: null, actor_user_id: OWNER_ID, detail: { note: 'Left a message', source: 'mcp' } }]);
+    expect(out.rows).toEqual([{ source: 'mcp', work_item_id: expect.any(String) }]);
+  });
+});
+
+describe('the request follow-up functions', () => {
+  /** A request in a given status with items in given statuses, seeded as the superuser. */
+  async function request(tx: Tx, status: string, items: Array<{ kind?: string; status: string }> = [], contact = contactA, title = 'Onboarding'): Promise<string> {
+    const [{ id }] = await asSetup(tx, `INSERT INTO public.needs_lists (contact_id, title, status) VALUES ($1, $2, $3) RETURNING id`, [contact, title, status]);
+    for (const [i, it] of items.entries()) {
+      await asSetup(tx, `INSERT INTO public.needs_items (list_id, kind, label, status, sort_order) VALUES ($1, $2, $3, $4, $5)`,
+        [id, it.kind ?? 'todo', `Item ${i + 1}`, it.status, i]);
+    }
+    return id as string;
+  }
+  const close = (tx: Tx, list: string, contact = contactA) =>
+    call<Record<string, unknown>>(tx, 'mcp_close_request', { p_list_id: list, p_contact_id: contact, ...audit });
+  const accept = (tx: Tx, list: string, contact = contactA) =>
+    call<Record<string, unknown> | null>(tx, 'mcp_accept_request', { p_list_id: list, p_contact_id: contact, ...audit });
+
+  it('closes a sent or a submitted request, stamping closed_at, audited with where it came from', async () => {
+    const out = await asServerTx(async (tx) => {
+      const sent = await request(tx, 'sent');
+      const submitted = await request(tx, 'submitted');
+      return {
+        sent: await close(tx, sent),
+        submitted: await close(tx, submitted),
+        rows: await tx.query(`SELECT status, closed_at IS NOT NULL AS stamped FROM public.needs_lists WHERE id = ANY($1)`, [[sent, submitted]]),
+        audit: (await auditRows(tx, 'mcp_close_request')).map((r) => r.details.from_status),
+      };
+    });
+    expect(out.sent).toEqual({ applied: true, from_status: 'sent' });
+    expect(out.submitted).toEqual({ applied: true, from_status: 'submitted' });
+    expect(out.rows.rows).toEqual([{ status: 'closed', stamped: true }, { status: 'closed', stamped: true }]);
+    expect(out.audit).toEqual(['sent', 'submitted']);
+  });
+
+  it('never closes a draft; closing again changes nothing; another contact’s request is not_found and unaudited', async () => {
+    const out = await asServerTx(async (tx) => {
+      const draft = await request(tx, 'draft');
+      const closed = await request(tx, 'closed');
+      const other = await request(tx, 'sent', [], contactB);
+      return {
+        draft: await close(tx, draft),
+        again: await close(tx, closed),
+        other: await close(tx, other, contactA),
+        statuses: (await tx.query<{ status: string }>(`SELECT status FROM public.needs_lists WHERE id = ANY($1)`, [[draft, other]])).rows,
+        audit: (await auditRows(tx, 'mcp_close_request')).map((r) => r.details.outcome),
+      };
+    });
+    expect(out.draft).toEqual({ applied: false, reason: 'draft' });
+    expect(out.again).toEqual({ applied: false, reason: 'already_closed' });
+    expect(out.other).toEqual({ applied: false, reason: 'not_found' });
+    expect(out.statuses.map((r) => r.status).sort()).toEqual(['draft', 'sent']);
+    expect(out.audit).toEqual(['draft', 'already_closed']);
+  });
+
+  it('reports the status as stored after the items move: a trigger that closes a fully accepted request is reported as closed', async () => {
+    const out = await asServerTx(async (tx) => {
+      // Stands in for the requests domain's trigger (0014): once no item is left to accept
+      // or answer, the request closes itself.
+      await asSetup(tx, `
+        CREATE FUNCTION public.mut_close_when_accepted() RETURNS trigger LANGUAGE plpgsql SET search_path = '' AS $f$
+        BEGIN
+          UPDATE public.needs_lists l SET status = 'closed', closed_at = now()
+           WHERE l.id IN (SELECT DISTINCT n.list_id FROM new_items n) AND l.status IN ('sent', 'submitted')
+             AND NOT EXISTS (SELECT 1 FROM public.needs_items i WHERE i.list_id = l.id AND i.kind <> 'info' AND i.status <> 'reviewed');
+          RETURN NULL;
+        END $f$`);
+      await asSetup(tx, `CREATE TRIGGER mut_close_when_accepted AFTER UPDATE ON public.needs_items
+          REFERENCING NEW TABLE AS new_items FOR EACH STATEMENT EXECUTE FUNCTION public.mut_close_when_accepted();`);
+      const id = await request(tx, 'submitted', [{ status: 'fulfilled' }, { status: 'reviewed' }]);
+      return { result: await accept(tx, id), stored: (await tx.query(`SELECT status FROM public.needs_lists WHERE id = $1`, [id])).rows[0] };
+    });
+    expect(out.stored).toEqual({ status: 'closed' });
+    expect(out.result).toEqual({ accepted: 1, still_open: 0, list_status: 'closed' });
+  });
+
+  it('accepts only the answered items, counts what is still open (not the read-only ones), and leaves the request open', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await request(tx, 'sent', [{ status: 'fulfilled' }, { status: 'fulfilled' }, { status: 'pending' }, { status: 'reviewed' }, { kind: 'info', status: 'pending' }]);
+      const version = await versionOf(tx, id);
+      const result = await accept(tx, id);
+      return {
+        result,
+        items: (await tx.query<{ status: string }>(`SELECT status FROM public.needs_items WHERE list_id = $1 ORDER BY sort_order`, [id])).rows.map((r) => r.status),
+        list: (await tx.query(`SELECT status FROM public.needs_lists WHERE id = $1`, [id])).rows[0],
+        versionMoved: (await versionOf(tx, id)) !== version,
+        again: await accept(tx, id),
+        audit: (await auditRows(tx, 'mcp_accept_request')).map((r) => r.details.accepted),
+      };
+    });
+    expect(out.result).toEqual({ accepted: 2, still_open: 1, list_status: 'sent' });
+    expect(out.items).toEqual(['reviewed', 'reviewed', 'pending', 'reviewed', 'pending']);
+    expect(out.list).toEqual({ status: 'sent' });
+    expect(out.versionMoved).toBe(false);
+    expect(out.again).toEqual({ accepted: 0, still_open: 1, list_status: 'sent' });
+    expect(out.audit).toEqual([2, 0]);
+  });
+
+  it('accept is NULL for another contact’s request, accepting nothing', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await request(tx, 'sent', [{ status: 'fulfilled' }], contactB);
+      return { result: await accept(tx, id, contactA), items: (await tx.query(`SELECT status FROM public.needs_items WHERE list_id = $1`, [id])).rows };
+    });
+    expect(out.result).toBeNull();
+    expect(out.items).toEqual([{ status: 'fulfilled' }]);
+  });
+
+  it('pauses and resumes reminders on the named contact’s request only, leaving the content version alone', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await request(tx, 'sent', [{ status: 'pending' }]);
+      const version = await versionOf(tx, id);
+      const set = (paused: boolean, contact = contactA) =>
+        call(tx, 'mcp_set_request_reminders', { p_list_id: id, p_contact_id: contact, p_paused: paused, ...audit });
+      const paused = await set(true);
+      const wrong = await set(false, contactB);
+      const stored = (await tx.query(`SELECT reminders_paused FROM public.needs_lists WHERE id = $1`, [id])).rows[0];
+      return { paused, wrong, stored, sameVersion: (await versionOf(tx, id)) === version, nullPaused: await attempt(tx, () => call(tx, 'mcp_set_request_reminders', { p_list_id: id, p_contact_id: contactA, p_paused: null, ...audit })), audit: (await auditRows(tx, 'mcp_set_request_reminders')).map((r) => r.details.paused) };
+    });
+    expect(out.paused).toEqual({ id: expect.any(String), title: 'Onboarding', status: 'sent', reminders_paused: true });
+    expect(out.wrong).toBeNull();
+    expect(out.stored).toEqual({ reminders_paused: true });
+    expect(out.sameVersion).toBe(true);
+    expect(out.nullPaused).toMatch(/paused_required/);
+    expect(out.audit).toEqual([true]);
+  });
+
+  it('the roster reads every open request by whose move it is, clients A to Z, never a closed one or an answer', async () => {
+    const out = await asServerTx(async (tx) => {
+      const submitted = await request(tx, 'submitted', [], contactB, 'Year end');
+      const toAccept = await request(tx, 'sent', [{ status: 'fulfilled' }, { status: 'pending' }], contactA, 'Kickoff');
+      const waiting = await request(tx, 'sent', [{ status: 'pending' }], contactA, 'Follow up');
+      const draft = await request(tx, 'draft', [], contactA, 'Next');
+      await request(tx, 'closed', [], contactA, 'Old');
+      const read = (limit = 500) => call<{ rows: Array<Record<string, unknown>>; truncated: boolean }>(tx, 'mcp_list_open_requests', { p_limit: limit, ...audit });
+      return { ids: { submitted, toAccept, waiting, draft }, all: await read(), cut: await read(1), audit: (await auditRows(tx, 'mcp_list_open_requests')).map((r) => r.details) };
+    });
+    const rows = out.all.rows;
+    expect(rows.map((r) => [r.section, r.list_id])).toEqual([
+      ['waiting_on_you', out.ids.toAccept],
+      ['waiting_on_you', out.ids.submitted],
+      ['waiting_on_client', out.ids.waiting],
+      ['drafts', out.ids.draft],
+    ]);
+    expect(rows[0]).toMatchObject({ client: 'Ada Lovelace', title: 'Kickoff', items: 2, answers_to_accept: 1, status: 'sent' });
+    for (const r of rows) {
+      expect(Object.keys(r).sort()).toEqual([
+        'answers_to_accept', 'client', 'contact_id', 'items', 'list_id', 'reminder_count', 'reminders_paused', 'section', 'sent_at', 'status', 'submitted_at', 'title',
+      ]);
+    }
+    expect(out.all.truncated).toBe(false);
+    expect(out.cut.rows).toHaveLength(1);
+    expect(out.cut.truncated).toBe(true);
+    expect(out.audit).toEqual([{ source: 'mcp', returned: 4, truncated: false }, { source: 'mcp', returned: 1, truncated: true }]);
+  });
+
+  it('a request write whose audit row cannot be written does not happen, and says so with the fixed sentinel', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await request(tx, 'sent', [{ status: 'fulfilled' }]);
+      const noActor = { p_actor: null, p_ip: null, p_user_agent: null };
+      return {
+        close: await attempt(tx, () => call(tx, 'mcp_close_request', { p_list_id: id, p_contact_id: contactA, ...noActor })),
+        accept: await attempt(tx, () => call(tx, 'mcp_accept_request', { p_list_id: id, p_contact_id: contactA, ...noActor })),
+        pause: await attempt(tx, () => call(tx, 'mcp_set_request_reminders', { p_list_id: id, p_contact_id: contactA, p_paused: true, ...noActor })),
+        list: (await tx.query(`SELECT status, reminders_paused FROM public.needs_lists WHERE id = $1`, [id])).rows[0],
+        items: (await tx.query(`SELECT status FROM public.needs_items WHERE list_id = $1`, [id])).rows,
+      };
+    });
+    for (const err of [out.close, out.accept, out.pause]) expect(err).toBe('mcp_request_audit: failed');
+    expect(out.list).toEqual({ status: 'sent', reminders_paused: false });
+    expect(out.items).toEqual([{ status: 'fulfilled' }]);
+  });
+});
+
+describe('archived cards are off the board for every board write', () => {
+  it('an archived card is neither edited nor noted: not_on_board, nothing written, the refusal audited', async () => {
+    const out = await asServerTx(async (tx) => {
+      const [{ id }] = await asSetup(tx, `INSERT INTO public.work_items (title, archived_at) VALUES ('Old', now()) RETURNING id`);
+      const edit = await call(tx, 'mcp_update_work_item', { p_id: id, p_patch: { title: 'New' }, ...audit });
+      const note = await call(tx, 'mcp_add_work_item_note', { p_id: id, p_note: 'x', ...audit });
+      return {
+        edit, note,
+        row: (await tx.query(`SELECT title FROM public.work_items WHERE id = $1`, [id])).rows[0],
+        events: (await tx.query<{ n: number }>(`SELECT count(*)::int AS n FROM public.work_item_events WHERE work_item_id = $1`, [id])).rows[0].n,
+        rows: [...await auditRows(tx, 'mcp_update_work_item'), ...await auditRows(tx, 'mcp_add_work_item_note')].map((r) => r.details.outcome),
+      };
+    });
+    expect(out.edit).toEqual({ outcome: 'not_on_board' });
+    expect(out.note).toEqual({ outcome: 'not_on_board' });
+    expect(out.row).toEqual({ title: 'Old' });
+    expect(out.events).toBe(0);
+    expect(out.rows).toEqual(['not_on_board', 'not_on_board']);
+  });
+});
+
+describe('the consent version', () => {
+  const rotate = (tx: Tx, old: string, next: string) =>
+    call<{ status: string }>(tx, 'mcp_oauth_rotate_refresh', {
+      p_old_hash: old, p_client_id: CLIENT_ID, p_access_hash: `a-${next}`, p_access_expires: later(600_000), p_refresh_hash: next,
+      p_refresh_idle_expires: later(7 * 86_400_000), p_ip: null, p_user_agent: null,
+    });
+
+  it('a new grant carries the current version; one approved on older wording authenticates, refreshes and lists as nothing', async () => {
+    const out = await asServerTx(async (tx) => {
+      const current = await call<number>(tx, 'mcp_consent_version');
+      const fresh = await seedGrant(tx, { access: 'new-access', refresh: 'new-refresh' });
+      const old = await seedGrant(tx, { access: 'old-access', refresh: 'old-refresh' });
+      await asSetup(tx, `UPDATE public.mcp_oauth_grants SET consent_version = consent_version - 1 WHERE id = $1`, [old]);
+      const versions = (await tx.query<{ id: string; v: number }>(`SELECT id, consent_version AS v FROM public.mcp_oauth_grants`)).rows;
+      const result = {
+        current,
+        freshVersion: versions.find((r) => r.id === fresh)!.v,
+        freshAuth: await call(tx, 'mcp_oauth_authenticate', { p_access_hash: 'new-access' }),
+        oldAuth: await call(tx, 'mcp_oauth_authenticate', { p_access_hash: 'old-access' }),
+        oldRefresh: await rotate(tx, 'old-refresh', 'old-next'),
+        freshRefresh: await rotate(tx, 'new-refresh', 'new-next'),
+      };
+      await become(tx, asOwner);
+      const listed = await call<Array<{ id: string }>>(tx, 'mcp_list_grants');
+      return { ...result, listed: listed.map((g) => g.id), fresh, old };
+    });
+    expect(out.current).toBe(2);
+    expect(out.freshVersion).toBe(out.current);
+    expect(out.freshAuth).toMatchObject({ grant_id: out.fresh });
+    expect(out.oldAuth).toBeNull();
+    expect(out.oldRefresh).toEqual({ status: 'invalid' });
+    expect(out.freshRefresh).toMatchObject({ status: 'ok' });
+    expect(out.listed).toContain(out.fresh);
+    expect(out.listed).not.toContain(out.old);
+  });
+
+  it('a grant that existed before this migration is version 1, so its approver must consent again', async () => {
+    const { rows } = await db.query<{ d: string }>(
+      `SELECT pg_get_expr(d.adbin, d.adrelid) AS d FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+        WHERE d.adrelid = 'public.mcp_oauth_grants'::regclass AND a.attname = 'consent_version'`);
+    // The column was added with DEFAULT 1 (filling the rows already there), then the default
+    // moved to the current version; the source says so in that order.
+    expect(rows[0].d).toBe('mcp_consent_version()');
+    const sql = (await import('node:fs')).readFileSync('supabase/migrations/0015_mcp.sql', 'utf8');
+    const add = sql.indexOf('ADD COLUMN consent_version integer NOT NULL DEFAULT 1;');
+    const move = sql.indexOf('ALTER COLUMN consent_version SET DEFAULT public.mcp_consent_version();');
+    expect(add).toBeGreaterThan(0);
+    expect(move).toBeGreaterThan(add);
   });
 });

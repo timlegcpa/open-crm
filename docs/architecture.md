@@ -139,6 +139,7 @@ test harness:
 | `0010_email` | Group email campaigns, recipients, suppressions and unsubscribe tokens. |
 | `0011_control_center` | The lead-intake key and deliveries, and the public logo bucket. |
 | `0012_portal` | The server side of invitations, sign-in records, and the View as client credential lock. |
+| `0015_mcp` | The AI connector's pipeline, work board and request follow-up tools, and a consent version that makes older connector approvals re-consent. |
 
 Every migration states the schema's rules in its header, and
 `src/__tests__/db/invariants.test.ts` checks the migrated catalog against them (row-level

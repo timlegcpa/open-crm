@@ -26,10 +26,14 @@
 //     client chose, so accepting any https callback would let anyone register "Claude" with
 //     their own callback, park a request, and send the owner a first-party consent link: one
 //     click would hand over a 30-day grant. Matching the host alone let a code reach any
-//     path on those hosts while the screen showed only the host. Adding a callback is a
-//     deliberate code change: it is the list of parties who may receive a code. The list is
+//     path on those hosts while the screen showed only the host. The built-in list is the
+//     assistants this project ships for; an adopter adds another assistant's callback with
+//     MCP_EXTRA_REDIRECT_URIS (exact https addresses, comma-separated), a deliberate act of
+//     configuration: it is the list of parties who may receive a code. The list is
 //     re-checked at /authorize, not only at registration, so tightening it applies to
-//     clients registered before.
+//     clients registered before. A refused registration is logged with the scheme, host and
+//     path of each refused callback (never a query, credentials or fragment), so the adopter
+//     can allowlist a new assistant's exact callback from the log.
 //   * /authorize never redirects an error to the client's redirect_uri. Open registration
 //     plus an error redirect is an open redirect on a trusted domain: register
 //     https://attacker/cb, then bounce a victim there with a malformed request. Every
@@ -78,8 +82,8 @@ export const GRANT_ABSOLUTE_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_BODY_BYTES = 10_000;
 
 /**
- * The parties allowed to receive a code over https, exactly (origin and path). See the
- * header: adding one is a decision, not a configuration value.
+ * The parties allowed to receive a code over https, exactly (origin and path), before any
+ * the adopter adds with MCP_EXTRA_REDIRECT_URIS. See the header.
  */
 export const ALLOWED_REDIRECT_URIS: ReadonlySet<string> = new Set([
   'https://claude.ai/api/mcp/auth_callback',
@@ -90,8 +94,15 @@ export const ALLOWED_REDIRECT_URIS: ReadonlySet<string> = new Set([
 /** Loopback, for native apps (RFC 8252), which have no registrable host. */
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
-/** An allowlisted https callback with no query, or plain-http loopback. No fragment, no credentials. */
-export function validRedirectUri(raw: unknown): raw is string {
+const NO_EXTRA: ReadonlySet<string> = new Set();
+
+/**
+ * An allowlisted https callback, or plain-http loopback; for either, no query, no fragment
+ * and no credentials. `extra` is the adopter's own list (parseExtraRedirectUris). The fragment and
+ * query are judged on the raw string, not on the parsed URL: a bare trailing '#' or '?'
+ * parses to an empty hash or search and would slip past a truthiness check.
+ */
+export function validRedirectUri(raw: unknown, extra: ReadonlySet<string> = NO_EXTRA): raw is string {
   if (typeof raw !== 'string' || raw.length === 0 || raw.length > 500) return false;
   let u: URL;
   try {
@@ -99,9 +110,57 @@ export function validRedirectUri(raw: unknown): raw is string {
   } catch {
     return false;
   }
-  if (u.hash || u.username || u.password) return false;
-  if (u.protocol === 'https:') return !u.search && ALLOWED_REDIRECT_URIS.has(`${u.origin}${u.pathname}`);
+  // Every scheme, loopback included: a callback carries no query and no fragment.
+  if (raw.includes('#') || raw.includes('?') || u.username || u.password) return false;
+  if (u.protocol === 'https:') {
+    const target = `${u.origin}${u.pathname}`;
+    return ALLOWED_REDIRECT_URIS.has(target) || extra.has(target);
+  }
   return u.protocol === 'http:' && LOOPBACK_HOSTS.has(u.hostname);
+}
+
+/**
+ * MCP_EXTRA_REDIRECT_URIS: comma-separated exact https callbacks the adopter allows beyond
+ * the built-in list, each stored as origin and path. An entry that is not a plain https
+ * address (a query, a fragment, credentials, another scheme, or not a URL at all) is
+ * refused and returned in `rejected`, so the function can log it; it never widens the list.
+ */
+export function parseExtraRedirectUris(raw: string | undefined): { uris: string[]; rejected: string[] } {
+  const uris: string[] = [];
+  const rejected: string[] = [];
+  for (const entry of (raw ?? '').split(',').map((e) => e.trim()).filter(Boolean)) {
+    let u: URL | null = null;
+    try {
+      u = new URL(entry);
+    } catch {
+      u = null;
+    }
+    if (!u || u.protocol !== 'https:' || entry.includes('?') || entry.includes('#') || u.username || u.password || entry.length > 500) {
+      rejected.push(u ? `${u.protocol}//${u.host}${u.pathname}`.slice(0, 200) : '<unparseable>');
+      continue;
+    }
+    uris.push(`${u.origin}${u.pathname}`);
+  }
+  return { uris, rejected };
+}
+
+/**
+ * The refused callbacks of a registration, as a log may carry them: only the refused
+ * entries, at most five, and only the scheme, host and path of each. A query, credentials
+ * or a fragment can carry personal data or a secret; a value that is not a string is named
+ * by its type.
+ */
+export function rejectedCallbacks(value: unknown, extra: ReadonlySet<string> = NO_EXTRA): string[] {
+  const list = Array.isArray(value) ? value : [value];
+  return list.slice(0, 5).filter((u) => !validRedirectUri(u, extra)).map((u) => {
+    if (typeof u !== 'string') return `<${u === null ? 'null' : typeof u}>`;
+    try {
+      const p = new URL(u);
+      return `${p.protocol}//${p.host}${p.pathname}`.slice(0, 200);
+    } catch {
+      return '<unparseable>';
+    }
+  });
 }
 
 /**
@@ -157,6 +216,8 @@ export interface McpOauthDeps {
   limit?: (action: string, ctx: RequestContext, limits: { perIp: Limit; global: Limit }) => Promise<RateLimitOutcome>;
   logSink?: LogSink;
   now?: () => number;
+  /** The adopter's extra https callbacks (parseExtraRedirectUris over MCP_EXTRA_REDIRECT_URIS). */
+  extraRedirectUris?: readonly string[];
 }
 
 const LIMITS = {
@@ -191,6 +252,7 @@ const str = (v: unknown): string => (typeof v === 'string' ? v : '');
 /** Each endpoint's handler, exported so the tests can hold each to the edge contract. */
 export function createMcpOauthEndpoints(deps: McpOauthDeps) {
   const now = deps.now ?? (() => Date.now());
+  const extra: ReadonlySet<string> = new Set(deps.extraRedirectUris ?? []);
   const resource = mcpResourceUrl(deps.supabaseUrl);
   const limiter = (action: keyof typeof LIMITS) => (ctx: RequestContext) =>
     deps.limit
@@ -271,7 +333,7 @@ export function createMcpOauthEndpoints(deps: McpOauthDeps) {
       const client = await rpc<{ redirect_uris: string[] } | null>('mcp_oauth_client', { p_client_id: clientId });
       // An unknown client or an unregistered redirect is refused on the spot: these two
       // decide where a code would land, and are never redirected to.
-      if (!client || !client.redirect_uris.includes(redirectUri) || !validRedirectUri(redirectUri)) return refusalPage();
+      if (!client || !client.redirect_uris.includes(redirectUri) || !validRedirectUri(redirectUri, extra)) return refusalPage();
 
       const state = q.get('state') ?? '';
       const challenge = q.get('code_challenge') ?? '';
@@ -315,7 +377,15 @@ export function createMcpOauthEndpoints(deps: McpOauthDeps) {
     async handle({ body, json, log }) {
       const b = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
       const uris = Array.isArray(b.redirect_uris) ? b.redirect_uris : [];
-      if (uris.length < 1 || uris.length > 5 || !uris.every(validRedirectUri)) {
+      if (uris.length < 1 || uris.length > 5 || !uris.every((u) => validRedirectUri(u, extra))) {
+        // Names the exact callback a new assistant would need allowlisted. JSON.stringify
+        // escapes control characters, so a caller's value cannot forge a log line. The
+        // client name is not logged: it is free text the caller chose, and could carry a
+        // code or a credential.
+        log.warn(
+          `register refused redirect_uris=${JSON.stringify(rejectedCallbacks(b.redirect_uris, extra))}`,
+          { count: Array.isArray(b.redirect_uris) ? b.redirect_uris.length : 0 },
+        );
         return oauthError(400, 'invalid_redirect_uri', 'redirect_uris must be 1 to 5 recognized callback addresses');
       }
       if (b.token_endpoint_auth_method !== undefined && b.token_endpoint_auth_method !== 'none') {

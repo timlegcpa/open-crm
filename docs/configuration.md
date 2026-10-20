@@ -61,6 +61,7 @@ never changes an existing value. Do not edit them, and do not copy them between 
 | `TWILIO_ACCOUNT_SID` | For real text messages | Twilio account SID. All three Twilio values turn on real texts (e-sign codes). | Outside production, codes go to the dev outbox. In production, High verification is not offered (turn SMS off in Settings, E-sign). |
 | `TWILIO_AUTH_TOKEN` | With the SID | Twilio auth token. | As above. |
 | `TWILIO_FROM` | With the SID | The sending number in E.164 (`+1...`) or a Messaging Service SID. In the United States a long-code number needs a registered A2P 10DLC campaign. | As above. |
+| `MCP_EXTRA_REDIRECT_URIS` | No | Exact OAuth callback addresses of AI assistants beyond Claude and ChatGPT, comma-separated, each `https` with no query or fragment (e.g. `https://assistant.example.com/oauth/callback`). Read by `mcp-oauth`; an entry that is not a plain `https` address is ignored and logged. | Only Claude, ChatGPT and local (loopback) assistants can connect. |
 | `RESEND_WEBHOOK_SECRET` | No | The signing secret of a Resend webhook pointed at `https://<ref>.supabase.co/functions/v1/esign-resend-webhook`. | The webhook answers 503 and e-sign emails show no delivered or opened time. |
 
 ## Script inputs

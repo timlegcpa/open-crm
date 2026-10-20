@@ -51,6 +51,18 @@ function consentAnswers(decision: { data: unknown; error: unknown } = { data: { 
 }
 
 describe('ConnectPage', () => {
+  it('names every power the connector holds before Approve, including the board and request follow-up', async () => {
+    consentAnswers();
+    renderAt('/connect?request=req-1', <ConnectPage />);
+    await screen.findByRole('heading', { level: 1, name: 'Connect an assistant' });
+    for (const power of [
+      'Move a contact to another pipeline stage',
+      'Read, add, edit, move and note cards on your work board',
+      'Draft requests, and send, remind, accept the answers on or close a request you confirm',
+      'See every open request, and pause or resume its reminders',
+    ]) expect(screen.getByText(power)).toBeInTheDocument();
+  });
+
   it('says so when the link has no request, calling nothing', async () => {
     renderAt('/connect', <ConnectPage />);
     expect(await screen.findByText('No connection request')).toBeInTheDocument();

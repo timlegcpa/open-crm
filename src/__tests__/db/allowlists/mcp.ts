@@ -1,6 +1,6 @@
 import type { DomainAllowlist } from './types';
 
-/** 0007_mcp. */
+/** 0007_mcp and 0015_mcp. */
 export const allowlist: DomainAllowlist = {
   // The owner's view of connected assistants, in Settings. Each refuses anyone but the owner.
   authenticatedCallable: ['mcp_list_grants()', 'mcp_revoke_grant(uuid)'],
@@ -35,6 +35,19 @@ export const allowlist: DomainAllowlist = {
     'mcp_delete_request(uuid,uuid,integer,uuid,text,text)',
     'mcp_claim_reminder(uuid,uuid)',
     'mcp_release_reminder(uuid,timestamp with time zone,timestamp with time zone)',
+    // 0015_mcp: the pipeline, the work board and the request follow-up.
+    'mcp_consent_version()',
+    'mcp_set_contact_status(uuid,text,text,uuid,text,text)',
+    'mcp_list_board(text,uuid,integer,uuid,text,text)',
+    'mcp_work_item_contact_ok(uuid,text)',
+    'mcp_create_work_item(text,uuid,text,text,text,date,uuid,text,text)',
+    'mcp_update_work_item(uuid,jsonb,uuid,text,text)',
+    'mcp_move_work_item(uuid,text,text,text,uuid,text,text)',
+    'mcp_add_work_item_note(uuid,text,uuid,text,text)',
+    'mcp_close_request(uuid,uuid,uuid,text,text)',
+    'mcp_accept_request(uuid,uuid,uuid,text,text)',
+    'mcp_set_request_reminders(uuid,uuid,boolean,uuid,text,text)',
+    'mcp_list_open_requests(integer,uuid,text,text)',
   ],
   definerWriteExempt: {
     'mcp_revoke_grant(uuid)':

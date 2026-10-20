@@ -249,6 +249,34 @@ add. It needs:
 - The host that serves the app to send `Content-Security-Policy: frame-ancestors 'none'` (or
   `X-Frame-Options: DENY`), so the approval screen can never be framed by another site.
 
+Claude and ChatGPT can connect out of the box. To connect another assistant, set
+`MCP_EXTRA_REDIRECT_URIS` (with `npx supabase secrets set`) to its exact OAuth callback address,
+or several separated by commas: `https` only, no query and no fragment. A refused registration
+is logged by the `mcp-oauth` function with the callback it asked for (scheme, host and path), so
+you can copy it from the log. Only add an assistant you trust: the callback is where a sign-in
+code is sent.
+
+The tools an assistant gets. The ones marked with a go-ahead need your explicit approval in the
+conversation before they act; every call is recorded in the audit log.
+
+| Tool | What it does |
+| --- | --- |
+| `search_contacts`, `get_contact` | Find a contact by name, email, phone or business (archived contacts are left out) and read one. |
+| `create_contact` | A new contact from an email or a phone number, with an optional stage and lead source. |
+| `update_contact` | Names, phone and business name. |
+| `correct_contact_email` | Fixes an address, refusing any contact with a portal account. Go-ahead. |
+| `set_contact_status` | Moves a contact along the pipeline, only from the stage it read. |
+| `add_business`, `log_call_note` | A business on the contact; a note appended to it. |
+| `upsert_quote`, `delete_quote` | A proposed quote; deleting one is a go-ahead. Accepted quotes are yours alone. |
+| `create_request`, `update_request`, `list_requests` | Draft and read back requests. |
+| `send_request`, `remind_request` | Email the client. Go-ahead, one email per call. |
+| `delete_request` | Deletes a draft. Go-ahead. |
+| `list_open_requests` | Every open request, by whose move it is. |
+| `accept_request`, `close_request` | Accept all answers; close a sent request. Go-ahead. |
+| `set_request_reminders` | Pauses or resumes one request's reminders. |
+| `list_board` | The board's cards, with each lane's name. |
+| `create_work_item`, `update_work_item`, `move_work_item`, `add_work_item_note` | Board cards: add, edit, move with a reason, note. |
+
 ### Content-Security-Policy reports
 
 To see what your Content-Security-Policy blocks, have the host that serves the app send these

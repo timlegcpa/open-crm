@@ -218,6 +218,9 @@ function liveDeps(over: Partial<McpCrmDeps> = {}, store: NeedsSendStore = pglite
 
 beforeAll(async () => {
   db = await createDb();
+  // The contacts archive column arrives with the contacts domain's own migration (0013);
+  // added here only when this tree does not carry it yet.
+  await db.query('ALTER TABLE public.contacts ADD COLUMN IF NOT EXISTS archived_at timestamptz');
   await seedCore(db);
   contactId = await seedContact(db, { first_name: 'Ada', last_name: 'Lovelace', email: 'ada@example.com', business_name: 'Acme LLC' });
   await seedGrant(TOKEN);
@@ -230,6 +233,11 @@ function post(body: unknown, headers: Record<string, string> = BEARER, h = handl
 
 const rpc = async (method: string, params: unknown = {}, id: unknown = 1) => (await (await post({ jsonrpc: '2.0', id, method, params })).json()) as {
   id: unknown; result?: Record<string, unknown>; error?: { code: number; message: string };
+};
+/** What a tool answered, parsed. */
+const toolJson = async (name: string, args: Record<string, unknown>) => {
+  const out = await tool(name, args);
+  return { ...out, json: () => JSON.parse(out.text) as Record<string, any> };
 };
 const tool = async (name: string, args: Record<string, unknown>) => {
   const res = await rpc('tools/call', { name, arguments: args });
@@ -260,6 +268,15 @@ describe('authentication', () => {
     const other = 'mcpat_' + 's'.repeat(43);
     await seedGrant(other, SYSTEM_ID);
     expect((await post(initialize, { Authorization: `Bearer ${other}` })).status).toBe(401);
+  });
+
+  it('a grant approved on an older consent screen is a 401 that sends the assistant to re-authorize', async () => {
+    const old = 'mcpat_' + 'v'.repeat(43);
+    const id = await seedGrant(old);
+    await db.query(`UPDATE public.mcp_oauth_grants SET consent_version = public.mcp_consent_version() - 1 WHERE id = $1`, [id]);
+    const res = await post(initialize, { Authorization: `Bearer ${old}` });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('WWW-Authenticate')).toBe(`Bearer resource_metadata="${protectedResourceMetadataUrl(SUPABASE_URL)}"`);
   });
 
   it('refuses to serve when SITE_URL is unset', async () => {
@@ -395,7 +412,7 @@ describe('the protected-resource metadata', () => {
 
 describe('the tools', () => {
   it('tools/list fills the pick lists from the database; delete_quote takes any service', async () => {
-    const tools = (await rpc('tools/list')).result!.tools as Array<{ name: string; inputSchema: { properties: Record<string, { enum?: string[] }> } }>;
+    const tools = (await rpc('tools/list')).result!.tools as Array<{ name: string; description: string; inputSchema: { properties: Record<string, { enum?: string[] }> } }>;
     const prop = (name: string, p: string) => tools.find((t) => t.name === name)!.inputSchema.properties[p];
     const statuses = (await db.query<{ key: string }>(`SELECT key FROM public.contact_statuses ORDER BY sort_order`)).rows.map((r) => r.key);
     expect(prop('search_contacts', 'status').enum).toEqual(statuses);
@@ -412,7 +429,14 @@ describe('the tools', () => {
     expect(tools.map((t) => t.name)).toEqual([
       'search_contacts', 'get_contact', 'create_contact', 'update_contact', 'correct_contact_email', 'add_business', 'log_call_note',
       'upsert_quote', 'delete_quote', 'create_request', 'update_request', 'list_requests', 'send_request', 'remind_request', 'delete_request',
+      'list_open_requests', 'close_request', 'accept_request', 'set_request_reminders', 'set_contact_status',
+      'list_board', 'create_work_item', 'update_work_item', 'move_work_item', 'add_work_item_note',
     ]);
+    // The pipeline and the board are offered from the database, labels with the keys.
+    expect(prop('set_contact_status', 'status').enum).toEqual(statuses.filter((s) => s !== 'esign_signer'));
+    expect(prop('set_contact_status', 'expected_status').enum).toEqual(statuses);
+    expect(prop('move_work_item', 'to_stage').enum).toEqual(['todo', 'waiting', 'doing', 'done']);
+    expect(tools.find((t) => t.name === 'move_work_item')!.description).toContain('doing = In progress');
   });
 
   it('search and get return the contact, audited as the owner who approved', async () => {
@@ -1060,5 +1084,146 @@ describe('the request tools', () => {
     expect(await outward.remind({ ...input, version: row.v - 1 }, log)).toEqual({ status: 'changed' });
     expect(mail.sent).toEqual([]);
     expect(await outward.remind({ ...input, version: row.v }, log)).toMatchObject({ status: 'reminded' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The pipeline, the board and the request follow-up, end to end (0015_mcp)
+// ---------------------------------------------------------------------------
+
+describe('the pipeline tools', () => {
+  let seq = 0;
+  const fresh = async (fields: Record<string, unknown> = {}) => {
+    seq += 1;
+    return seedContact(db, { first_name: 'Grace', last_name: `Pipeline ${seq}`, ...fields });
+  };
+
+  it('creates a lead who phoned in, with the stage and source given, and finds them by phone', async () => {
+    const created = await toolJson('create_contact', { first_name: 'Grace', last_name: 'Caller', email: '', phone: ' 555 010 7788 ', status: 'client', source: 'referral' });
+    expect(created.isError, created.text).toBe(false);
+    expect(created.json().created).toMatchObject({ email: null, phone: '555 010 7788', status: 'client', source: 'referral' });
+    const found = await toolJson('search_contacts', { query: '7788' });
+    expect(found.json().contacts.map((c: { id: string }) => c.id)).toEqual([created.json().created.id]);
+  });
+
+  it('refuses a stage or a source outside the vocabulary before any write', async () => {
+    for (const args of [{ phone: '1', status: 'esign_signer' }, { phone: '1', source: 'lead_intake' }, { email: '', phone: '  ' }]) {
+      expect((await tool('create_contact', args)).isError).toBe(true);
+    }
+  });
+
+  it('moves a stage on a matching read, refuses a stale one naming the stored stage, and never touches a system or archived contact', async () => {
+    const id = await fresh();
+    const moved = await toolJson('set_contact_status', { contact_id: id, status: 'client', expected_status: 'new_lead' });
+    expect(moved.json().updated).toMatchObject({ id, from: 'new_lead', status: 'client' });
+    const stale = await tool('set_contact_status', { contact_id: id, status: 'lost', expected_status: 'new_lead' });
+    expect(stale).toEqual({ isError: true, text: expect.stringContaining('now client, not new_lead') });
+
+    const signer = await fresh({ status: 'esign_signer' });
+    expect((await tool('set_contact_status', { contact_id: signer, status: 'client', expected_status: 'esign_signer' })).text).toMatch(/created only to sign/);
+    const archived = await fresh();
+    await db.query(`UPDATE public.contacts SET archived_at = now() WHERE id = $1`, [archived]);
+    expect((await tool('set_contact_status', { contact_id: archived, status: 'client', expected_status: 'new_lead' })).text).toMatch(/archived/);
+    expect((await tool('search_contacts', { query: 'Pipeline' })).text).not.toContain(archived);
+    const rows = await db.query<{ status: string }>(`SELECT status FROM public.contacts WHERE id = ANY($1) ORDER BY status`, [[signer, archived]]);
+    expect(rows.rows).toEqual([{ status: 'esign_signer' }, { status: 'new_lead' }]);
+  });
+});
+
+describe('the board tools', () => {
+  it('creates, edits, moves and notes a card, then lists it with its lane label', async () => {
+    const created = await toolJson('create_work_item', { title: 'Send the proposal', contact_id: contactId, due_date: '2027-04-15', priority: 'urgent' });
+    expect(created.isError, created.text).toBe(false);
+    const id = created.json().created.id as string;
+    expect((await toolJson('update_work_item', { work_item_id: id, due_date: null, title: 'Send the revised proposal' })).json().updated)
+      .toMatchObject({ title: 'Send the revised proposal', due_date: null, priority: 'urgent', contact_id: contactId });
+    const moved = await toolJson('move_work_item', { work_item_id: id, to_stage: 'doing', expected_stage: 'todo', reason: 'Drafting it now' });
+    expect(moved.json().moved).toEqual({ work_item_id: id, from: 'To do (todo)', to: 'In progress (doing)' });
+    expect((await tool('add_work_item_note', { work_item_id: id, note: 'Waiting on figures' })).isError).toBe(false);
+    const board = (await toolJson('list_board', { contact_id: contactId })).json();
+    expect(board.cards).toEqual([expect.objectContaining({ id, stage: 'doing', lane: 'In progress', contact_name: 'Ada Lovelace' })]);
+    expect(board.truncated).toBe(false);
+    const history = await db.query(`SELECT event_type, to_value, detail FROM public.work_item_events WHERE work_item_id = $1 ORDER BY created_at`, [id]);
+    expect(history.rows).toEqual([
+      { event_type: 'created', to_value: 'todo', detail: { source: 'mcp' } },
+      { event_type: 'stage_changed', to_value: 'doing', detail: { note: 'Drafting it now', source: 'mcp' } },
+      { event_type: 'note_added', to_value: null, detail: { note: 'Waiting on figures', source: 'mcp' } },
+    ]);
+  });
+
+  it('refuses a stale move with the card\u2019s current lane, and an archived card, changing nothing', async () => {
+    const id = (await toolJson('create_work_item', { title: 'Call back', stage: 'waiting' })).json().created.id as string;
+    const stale = await tool('move_work_item', { work_item_id: id, to_stage: 'done', expected_stage: 'todo', reason: 'Done' });
+    expect(stale).toEqual({ isError: true, text: expect.stringContaining('now in Waiting (waiting), not To do (todo)') });
+    await db.query(`UPDATE public.work_items SET archived_at = now() WHERE id = $1`, [id]);
+    expect((await tool('move_work_item', { work_item_id: id, to_stage: 'done', expected_stage: 'waiting', reason: 'Done' })).text).toMatch(/archived/);
+    expect(await tool('update_work_item', { work_item_id: id, title: 'Renamed' })).toEqual({ isError: true, text: expect.stringMatching(/^That card is archived.*Nothing was edited/) });
+    expect(await tool('add_work_item_note', { work_item_id: id, note: 'n' })).toEqual({ isError: true, text: expect.stringMatching(/^That card is archived.*Nothing was noted/) });
+    expect((await db.query(`SELECT title FROM public.work_items WHERE id = $1`, [id])).rows).toEqual([{ title: 'Call back' }]);
+    expect((await db.query(`SELECT stage FROM public.work_items WHERE id = $1`, [id])).rows).toEqual([{ stage: 'waiting' }]);
+  });
+
+  it('ties no new card to an archived contact', async () => {
+    const archived = await seedContact(db, { first_name: 'Grace', last_name: 'Archived' });
+    await db.query(`UPDATE public.contacts SET archived_at = now() WHERE id = $1`, [archived]);
+    const res = await tool('create_work_item', { title: 'Follow up', contact_id: archived });
+    expect(res).toEqual({ isError: true, text: expect.stringMatching(/^That contact is archived/) });
+    expect((await db.query(`SELECT 1 FROM public.work_items WHERE contact_id = $1`, [archived])).rows).toHaveLength(0);
+  });
+});
+
+describe('the request follow-up tools', () => {
+  /** A request seeded straight into the tables, as the database superuser. */
+  async function seeded(status: string, items: string[] = [], title = 'Project documents'): Promise<{ contact: string; list: string }> {
+    const contact = await seedContact(db, { first_name: 'Grace', last_name: 'Follow' });
+    const { rows } = await db.query<{ id: string }>(`INSERT INTO public.needs_lists (contact_id, title, status) VALUES ($1, $2, $3) RETURNING id`, [contact, title, status]);
+    for (const [i, st] of items.entries()) {
+      await db.query(`INSERT INTO public.needs_items (list_id, kind, label, status, sort_order) VALUES ($1, 'todo', $2, $3, $4)`, [rows[0].id, `Item ${i + 1}`, st, i]);
+    }
+    return { contact, list: rows[0].id };
+  }
+
+  it('closes a sent request only on the go-ahead, and refuses a draft', async () => {
+    const sent = await seeded('sent');
+    expect((await tool('close_request', { list_id: sent.list, contact_id: sent.contact })).isError).toBe(true);
+    expect((await db.query(`SELECT status FROM public.needs_lists WHERE id = $1`, [sent.list])).rows).toEqual([{ status: 'sent' }]);
+    const closed = await toolJson('close_request', { list_id: sent.list, contact_id: sent.contact, confirmed_with_user: true });
+    expect(closed.json().closed).toEqual({ list_id: sent.list, previous_status: 'sent' });
+    expect((await toolJson('close_request', { list_id: sent.list, contact_id: sent.contact, confirmed_with_user: true })).json().note).toMatch(/already closed/);
+    const draft = await seeded('draft');
+    expect((await tool('close_request', { list_id: draft.list, contact_id: draft.contact, confirmed_with_user: true })).text).toMatch(/still a draft/);
+    expect((await tool('close_request', { list_id: sent.list, contact_id: draft.contact, confirmed_with_user: true })).text).toMatch(/^No request with that id/);
+  });
+
+  it('accepts the answered items only, on the go-ahead, and reports what is still open', async () => {
+    const r = await seeded('sent', ['fulfilled', 'pending']);
+    expect((await tool('accept_request', { list_id: r.list, contact_id: r.contact, confirmed_with_user: false })).isError).toBe(true);
+    const out = await toolJson('accept_request', { list_id: r.list, contact_id: r.contact, confirmed_with_user: true });
+    expect(out.json()).toMatchObject({ accepted: 1, still_unanswered: 1, request_status: 'sent' });
+    expect(out.json().note).toMatch(/1 still has no answer/);
+    expect((await db.query(`SELECT status FROM public.needs_items WHERE list_id = $1 ORDER BY sort_order`, [r.list])).rows)
+      .toEqual([{ status: 'reviewed' }, { status: 'pending' }]);
+  });
+
+  it('pauses reminders on one request, sending nothing', async () => {
+    const r = await seeded('sent', ['pending']);
+    mail.sent = [];
+    const out = await toolJson('set_request_reminders', { list_id: r.list, contact_id: r.contact, paused: true });
+    expect(out.json().request).toMatchObject({ id: r.list, reminders_paused: true });
+    expect(mail.sent).toEqual([]);
+  });
+
+  it('lists every open request by section, with no answer or token, audited as the owner', async () => {
+    const waiting = await seeded('sent', ['pending'], 'Roster waiting');
+    const yours = await seeded('submitted', [], 'Roster submitted');
+    const out = (await toolJson('list_open_requests', {})).json();
+    const section = (key: string) => out.sections.find((s: { section: string }) => s.section === key);
+    expect(section('waiting_on_you').rows.map((r: { list_id: string }) => r.list_id)).toContain(yours.list);
+    expect(section('waiting_on_client').rows.map((r: { list_id: string }) => r.list_id)).toContain(waiting.list);
+    expect(JSON.stringify(out)).not.toMatch(/review_token|answer_text/);
+    expect(out.total).toBe(out.sections.reduce((n: number, s: { count: number }) => n + s.count, 0));
+    const audit = await db.query(`SELECT user_id FROM public.audit_logs WHERE action = 'mcp_list_open_requests'`);
+    expect(audit.rows.length).toBeGreaterThan(0);
+    expect(audit.rows.every((r) => (r as { user_id: string }).user_id === DB_OWNER_ID)).toBe(true);
   });
 });
