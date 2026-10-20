@@ -2,7 +2,7 @@ import { formatDateTime } from '@/lib/format';
 
 export type AnnotationKind = 'ink' | 'highlight' | 'text' | 'stamp' | 'review_stamp';
 export type StampKey = 'check' | 'cross' | 'question';
-export type ReviewStampKey = 'reviewed' | 'approved';
+export type ReviewStampKey = 'reviewed' | 'approved' | 'not_needed';
 
 // All coordinates: UNROTATED PDF space, points, bottom-left origin (pdf-lib native).
 /**
@@ -68,9 +68,11 @@ export const REVIEW_STAMP_META: Record<ReviewStampKey, { label: string; color: s
   // t.colors.success (#10B981) fails that, same reasoning as WorkstationRail.
   reviewed: { label: 'REVIEWED', color: '#15803D' },
   approved: { label: 'APPROVED', color: '#1D4ED8' },
+  // A mark only, like APPROVED: only REVIEWED sets the document's reviewed state.
+  not_needed: { label: 'NOT NEEDED', color: '#4B5563' },
 };
 
-/** Review-stamp box, in PDF points. Sized to fit "REVIEWED" plus a date line. */
+/** Review-stamp box, in PDF points. Sized to fit "NOT NEEDED" (the longest label) plus a date line. */
 export const REVIEW_STAMP_SIZE = { width: 168, height: 46 };
 /** Gap from the page's right and bottom edges. */
 export const REVIEW_STAMP_MARGIN = 24;

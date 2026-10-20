@@ -38,6 +38,15 @@ Deno.serve(
       return (data as string[] | null) ?? [];
     },
 
+    async expireStartLinks(contactId) {
+      const { error } = await server
+        .from('pending_signup_requests')
+        .update({ status: 'expired' })
+        .eq('contact_id', contactId)
+        .eq('status', 'pending');
+      if (error) throw error;
+    },
+
     async release(contactId, prior, claim, destroyed) {
       const { error } = await server.rpc('admin_contact_delete_release', {
         p_contact_id: contactId,

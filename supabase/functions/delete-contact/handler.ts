@@ -6,6 +6,7 @@
 //   destroy deletes those Auth users (an already-missing user counts as destroyed)
 //   finish  deletes the accounts and the contact under the claim
 //   release on any failure after begin, restores what is left and clears the claim
+//           (after expiring the contact's pending start links, once any sign-in was destroyed)
 //
 // The door (origin, method, owner check, body cap, headers, generic errors) is
 // createHandler's. Everything outside this file is injected, so the tests run this exact
@@ -32,6 +33,8 @@ export interface DeleteContactDeps {
   /** 'missing' when the user was already gone. Throws on any other failure. */
   deleteAuthUser(userId: string): Promise<'deleted' | 'missing'>;
   finish(contactId: string, claim: string): Promise<string[]>;
+  /** Marks every pending start link of the contact expired. */
+  expireStartLinks(contactId: string): Promise<void>;
   release(contactId: string, prior: Record<string, string>, claim: string, destroyed: string[]): Promise<void>;
   /** `orphanedUserIds`: sign-ins that outlived their deleted rows, for the owner to remove. */
   audit(ownerId: string, contactId: string, portalUsersRemoved: number, orphanedUserIds: string[]): Promise<void>;
@@ -66,6 +69,22 @@ export function createDeleteContactHandler(deps: DeleteContactDeps): (req: Reque
       const destroyed: string[] = [];
       const undo = async (stage: string, err: unknown): Promise<Response> => {
         log.error(`${stage} failed`, err);
+        // Once a sign-in is destroyed its address is free, and lifting the claim lets an
+        // account attach to this contact again, so a start link sent earlier to that address
+        // could recreate the sign-in while another account keeps the contact alive. Expire
+        // the contact's pending start links BEFORE the claim lifts: until then the claim
+        // refuses any account write, and afterwards a redemption finds its link expired.
+        // Only once something was destroyed, so a refusal before that changes nothing.
+        // Logged, not fatal: the release must still run, and the redemption check
+        // (start_link_access_revoked) refuses these links on its own; this makes them read
+        // as expired. Every revoke path does the same (revoke-portal-access too).
+        if (destroyed.length > 0) {
+          try {
+            await deps.expireStartLinks(id);
+          } catch (linksErr) {
+            log.error('start link expiry failed', linksErr);
+          }
+        }
         try {
           await deps.release(id, begun.prior, claim, destroyed);
         } catch (releaseErr) {

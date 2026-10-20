@@ -56,6 +56,9 @@ function deps(over: Partial<DeleteContactDeps> = {}): DeleteContactDeps & { logs
       const [row] = await asServer<{ ids: string[] }>(`SELECT public.admin_delete_contact($1, $2) AS ids`, [contactId, claim]);
       return row.ids;
     },
+    async expireStartLinks(contactId) {
+      await asServer(`UPDATE public.pending_signup_requests SET status = 'expired' WHERE contact_id = $1 AND status = 'pending'`, [contactId]);
+    },
     async release(contactId, prior, claim, destroyed) {
       await asServer(`SELECT public.admin_contact_delete_release($1, $2, $3, $4)`, [contactId, JSON.stringify(prior), claim, destroyed]);
     },
@@ -277,5 +280,93 @@ describe('delete-contact: the claim protocol', () => {
       `SELECT details FROM public.audit_logs WHERE action = 'contact_deleted'`,
     );
     expect(audit.details.orphaned_sign_ins).toEqual([USER_B]);
+  });
+});
+
+describe('delete-contact: pending start links', () => {
+  let linkId: string;
+  let listId: string;
+
+  beforeEach(async () => {
+    [{ id: listId }] = await rows<{ id: string }>(
+      `INSERT INTO public.needs_lists (contact_id, title, status, sent_at) VALUES ($1, 'Docs', 'sent', now()) RETURNING id`,
+      [CONTACT],
+    );
+    [{ id: linkId }] = await rows<{ id: string }>(
+      `INSERT INTO public.pending_signup_requests (email, contact_id, needs_list_id, token_hash, expires_at)
+       VALUES ('a@example.test', $1, $2, $3, now() + interval '14 days') RETURNING id`,
+      [CONTACT, listId, 'a'.repeat(64)],
+    );
+  });
+
+  const linkStatus = async () =>
+    (await rows<{ status: string }>(`SELECT status FROM public.pending_signup_requests WHERE id = $1`, [linkId]))[0].status;
+
+  /** Fails the second sign-in delete, so one is destroyed and one survives. */
+  function failSecondDelete(over: Partial<DeleteContactDeps> = {}) {
+    const destroyed: string[] = [];
+    return deps({
+      async deleteAuthUser(userId) {
+        if (destroyed.length === 1) throw new Error('auth 500');
+        await db.query(`DELETE FROM auth.users WHERE id = $1`, [userId]);
+        destroyed.push(userId);
+        return 'deleted';
+      },
+      ...over,
+    });
+  }
+
+  it('a partial delete expires the links, and does so before the claim lifts', async () => {
+    const order: string[] = [];
+    const base = deps();
+    const d = failSecondDelete({
+      async expireStartLinks(contactId) {
+        await base.expireStartLinks(contactId);
+        // Pushed after the write lands: a release that did not wait for it comes first.
+        order.push('expire');
+      },
+      async release(contactId, prior, claim, destroyed) {
+        order.push('release');
+        const [{ delete_claim }] = await rows<{ delete_claim: string | null }>(
+          `SELECT delete_claim FROM public.contacts WHERE id = $1`, [contactId]);
+        expect(delete_claim).not.toBeNull();
+        await base.release(contactId, prior, claim, destroyed);
+      },
+    });
+    expect((await call(d, request({ contact_id: CONTACT }))).status).toBe(500);
+    expect(order).toEqual(['expire', 'release']);
+    expect(await linkStatus()).toBe('expired');
+  });
+
+  it('a final delete that fails after every sign-in went expires the links', async () => {
+    const d = deps({ finish: async () => { throw new Error('db down'); } });
+    expect((await call(d, request({ contact_id: CONTACT }))).status).toBe(500);
+    expect(await linkStatus()).toBe('expired');
+  });
+
+  it('a failure before any sign-in is destroyed leaves the links alone', async () => {
+    const expireStartLinks = vi.fn(deps().expireStartLinks);
+    const d = deps({ deleteAuthUser: async () => { throw new Error('auth 500'); }, expireStartLinks });
+    expect((await call(d, request({ contact_id: CONTACT }))).status).toBe(500);
+    expect(expireStartLinks).not.toHaveBeenCalled();
+    expect(await linkStatus()).toBe('pending');
+  });
+
+  it('a failed expiry is logged and the claim is still released', async () => {
+    const d = failSecondDelete({ expireStartLinks: async () => { throw new Error('links down'); } });
+    expect((await call(d, request({ contact_id: CONTACT }))).status).toBe(500);
+    expect(d.logs).toContainEqual(expect.stringMatching(/^\[delete-contact\] rid=\S+ start link expiry failed: links down$/));
+    expect(await rows(`SELECT delete_claim FROM public.contacts WHERE id = $1`, [CONTACT])).toEqual([{ delete_claim: null }]);
+    // The redemption check refuses the link on its own; the expiry makes it read as such.
+    const [{ revoked }] = await rows<{ revoked: boolean }>(
+      `SELECT public.start_link_access_revoked($1, 'a@example.test', $2) AS revoked`, [CONTACT, listId]);
+    expect(revoked).toBe(true);
+  });
+
+  it('a completed delete leaves no link pointing at the contact', async () => {
+    expect((await call(deps(), request({ contact_id: CONTACT }))).status).toBe(200);
+    const [{ contact_id }] = await rows<{ contact_id: string | null }>(
+      `SELECT contact_id FROM public.pending_signup_requests WHERE id = $1`, [linkId]);
+    expect(contact_id).toBeNull();
   });
 });

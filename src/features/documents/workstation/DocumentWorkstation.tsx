@@ -247,8 +247,8 @@ export default function DocumentWorkstation({
   /**
    * A REVIEWED stamp is the same fact as the reviewed flag, expressed on the
    * page: so placing one marks the document reviewed (rail tick, next-unreviewed,
-   * cache invalidation all come free via writeReview). APPROVED is a separate
-   * sign-off step and deliberately does NOT mirror: this branch is the single
+   * cache invalidation all come free via writeReview). APPROVED and NOT NEEDED
+   * are marks only and deliberately do NOT mirror: this branch is the single
    * home of that policy (PdfSurface passes the stamp key through untouched).
    * Also deliberately one-way: deleting the stamp does NOT un-review, because
    * an undo must not silently rewind workflow state. Un-reviewing stays the

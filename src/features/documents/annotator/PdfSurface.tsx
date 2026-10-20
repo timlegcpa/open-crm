@@ -12,11 +12,7 @@ import AnnotatorPage from './AnnotatorPage';
 import { useAnnotatorDoc } from './useAnnotatorDoc';
 import { useAnnotations } from './useAnnotations';
 import type { AnnotatorDoc } from './types';
-
-// px between/around pages in the scroll body (py-4 top offset + mb-4 per page).
-const PAGE_GAP = 16;
-// Horizontal breathing room inside the scroll body when computing fit-width.
-const FIT_GUTTER = 40;
+import { PAGE_GAP, computeFitScale } from './fitScale';
 
 const EMPTY_ANNOTATIONS: DocumentAnnotation[] = [];
 
@@ -138,22 +134,7 @@ export default function PdfSurface({
 
   const maxPageWidthPt = pageMetas.length > 0 ? Math.max(...pageMetas.map((m) => m.widthPt)) : 612;
   const maxPageHeightPt = pageMetas.length > 0 ? Math.max(...pageMetas.map((m) => m.heightPt)) : 792;
-  // Fit-PAGE base: at zoomFactor 1 the whole tallest page is visible. Never
-  // exceeds fit-width, so narrow containers (mobile) still fill their width , 
-  // there fit-page and fit-width coincide.
-  const fitScale =
-    containerWidth > 0 && containerHeight > 0
-      ? Math.min(
-          3,
-          Math.max(
-            0.1,
-            Math.min(
-              (containerWidth - FIT_GUTTER) / maxPageWidthPt,
-              (containerHeight - PAGE_GAP * 2) / maxPageHeightPt,
-            ),
-          ),
-        )
-      : 1;
+  const fitScale = computeFitScale(containerWidth, containerHeight, maxPageWidthPt, maxPageHeightPt);
   const cssScale = fitScale * zoomFactor;
 
   // ── Page counter from scroll position ──

@@ -27,6 +27,15 @@ Deno.serve(
       return typeof data === 'string' ? data : null;
     },
 
+    async expireStartLinks(contactId) {
+      const { error } = await server
+        .from('pending_signup_requests')
+        .update({ status: 'expired' })
+        .eq('contact_id', contactId)
+        .eq('status', 'pending');
+      if (error) throw error;
+    },
+
     async banUser(userId) {
       const { error } = await server.auth.admin.updateUserById(userId, { ban_duration: PORTAL_USER_BAN_DURATION });
       // A user already gone cannot sign in either.
