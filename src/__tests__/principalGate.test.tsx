@@ -177,7 +177,8 @@ describe('the signed-in gate', () => {
 
   it("never wipes a principal's first queries with the clear meant for the one before", async () => {
     fake.state.session = OWNER;
-    renderAt('/contacts');
+    // The All tab: the default Clients tab does not list a lead.
+    renderAt('/contacts?tab=all');
     expect(await screen.findByText('Ada Example')).toBeInTheDocument();
 
     await authEvent('SIGNED_OUT', null);

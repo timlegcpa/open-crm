@@ -5,7 +5,7 @@ test.beforeEach(async ({ page, mock }) => {
 });
 
 test('the contacts list shows every contact, grouped, and opens a record', async ({ page }) => {
-  await page.goto('/contacts');
+  await page.goto('/contacts?tab=all');
   await expect(page.getByText('2 contacts')).toBeVisible();
   const ada = page.getByRole('link', { name: /Lovelace, Ada/ }).first();
   await expect(ada).toBeVisible();
@@ -14,6 +14,42 @@ test('the contacts list shows every contact, grouped, and opens a record', async
   await ada.click();
   await expect(page).toHaveURL(new RegExp(`/contacts/${ID.ada}$`));
   await expect(page.getByRole('heading', { level: 1, name: 'Ada Lovelace' })).toBeVisible();
+});
+
+test('the page opens on Clients; the tabs are links, and Tiers ranks the active clients', async ({ page }) => {
+  await page.goto('/contacts');
+  const tabs = page.getByRole('tablist', { name: 'Contact lists' });
+  await expect(tabs.getByRole('tab', { name: 'Clients' })).toHaveAttribute('aria-selected', 'true');
+  const index = page.getByRole('region', { name: 'Clients' });
+  await expect(index.getByRole('link', { name: 'Lovelace, Ada' })).toBeVisible();
+  // A lead is not a client: Grace is on the board, not in the Clients list.
+  await expect(index.getByRole('link', { name: /Grace/ })).toHaveCount(0);
+
+  await tabs.getByRole('tab', { name: 'Tiers' }).click();
+  await expect(page).toHaveURL(/\/contacts\?tab=tiers$/);
+  await expect(page.getByRole('region', { name: 'S tier' }).getByRole('button', { name: 'Open Lovelace, Ada' })).toBeVisible();
+  // Remembered: a bare /contacts comes back to Tiers.
+  await page.goto('/contacts');
+  await expect(tabs.getByRole('tab', { name: 'Tiers' })).toHaveAttribute('aria-selected', 'true');
+});
+
+test('a contact is archived from the list, leaves every list, and comes back from Archived', async ({ page, mock }) => {
+  await page.goto('/contacts?tab=all');
+  await expect(page.getByRole('link', { name: /Grace Hopper/ }).first()).toBeVisible();
+  await page.getByRole('button', { name: 'Archive Grace Hopper' }).first().click();
+  await expect(page.getByText('Grace Hopper archived. The record is kept.')).toBeVisible();
+  await expect(page.getByRole('link', { name: /Grace Hopper/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Show Grace Hopper' })).toHaveCount(0);
+  const archive = mock.callsTo('rest', 'contacts').find((c) => c.method === 'PATCH');
+  expect(Object.keys(archive?.json as object)).toEqual(['archived_at']);
+
+  await page.getByRole('button', { name: 'Archived (1)' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Archived people' });
+  await expect(dialog.getByText('Restores to Hot')).toBeVisible();
+  await dialog.getByRole('button', { name: 'Restore Grace Hopper' }).click();
+  await expect(page.getByText('Grace Hopper restored.')).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('link', { name: /Grace Hopper/ }).first()).toBeVisible();
 });
 
 test('a contact record: tabs, counts and header actions', async ({ page }) => {

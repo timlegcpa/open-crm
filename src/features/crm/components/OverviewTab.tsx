@@ -1,25 +1,41 @@
+import { lazy, Suspense } from 'react';
+import { Link } from 'react-router-dom';
+import { useIsMutating } from '@tanstack/react-query';
 import type { Contact } from '@/api/contacts';
 import { ContactEmailsManager } from '@/components/contacts/ContactEmailsManager';
 import { ContactNotesCard } from '@/components/contacts/ContactNotesCard';
 import { HouseholdPanel } from '@/components/contacts/HouseholdPanel';
 import { Panel } from '@/components/layout/page';
 import { useContactStatuses, useLeadSources } from '@/hooks/usePickLists';
+import { links } from '@/features/links';
 import { isSystemStatus } from '@/lib/contactStatus';
 import { formatDate } from '@/lib/format';
-import { useContactFieldSave } from '../hooks';
+import { contactFieldMutationKey, useContactFieldSave } from '../hooks';
+import { quoteOpMutationKey } from '../lib/quotes';
 import { addedAt } from '../lib/sections';
+import { TIER_OPTIONS, tierValue, UNRANKED } from '../lib/tiers';
 import { EditableField } from './EditableField';
 import { FieldRow, STATIC_VALUE } from './FieldRow';
 
+// Loaded with the first record that shows it, so the record shell never carries the editor.
+const CompactQuoteEditor = lazy(() => import('./quotes/CompactQuoteEditor').then((m) => ({ default: m.CompactQuoteEditor })));
+
 /**
- * Overview is the contact: Details, Spouse and Household side by side, Notes under them.
- * Every value is edited in place and saved on Enter, Tab or blur. No amounts here: money
- * lives on Billing and in the right bar. The cards size to the PANE (auto-fit, 300px
- * minimum), never to a viewport breakpoint, because the record sits beside the index.
- * The Spouse rows are always open, never behind a disclosure.
+ * Overview is the contact: Details, Billing, Spouse and Household side by side, Notes under
+ * them. Every value is edited in place and saved on Enter, Tab or blur. Billing is the
+ * compact services editor, the same quote writes as the Billing tab, so a price is entered
+ * right here; the upsells and organization editing stay on Billing. The cards size to the
+ * PANE (auto-fit, 300px minimum), never to a viewport breakpoint, because the record sits
+ * beside the index. The Spouse rows are always open, never behind a disclosure.
+ *
+ * A quote save re-derives the status from the one it read, so the status and the quotes
+ * each wait for the other: the Status field holds while a quote saves, and the services
+ * editor holds while a field save runs.
  */
 export function OverviewTab({ contact }: { contact: Contact }) {
   const save = useContactFieldSave(contact);
+  const quoteSaving = useIsMutating({ mutationKey: quoteOpMutationKey(contact.id) }) > 0;
+  const fieldSaving = useIsMutating({ mutationKey: contactFieldMutationKey(contact.id) }) > 0;
   const statuses = useContactStatuses();
   const sources = useLeadSources();
 
@@ -55,8 +71,17 @@ export function OverviewTab({ contact }: { contact: Contact }) {
             {isSystemStatus(contact.status) ? (
               <span className={STATIC_VALUE}>{statuses.data?.find((s) => s.key === contact.status)?.label ?? contact.status}</span>
             ) : (
-              <EditableField type="select" label="Status" value={contact.status} options={statusOptions} onSave={save('status')} />
+              <EditableField type="select" label="Status" value={contact.status} options={statusOptions} disabled={quoteSaving} onSave={save('status')} />
             )}
+          </FieldRow>
+          <FieldRow label="Tier">
+            <EditableField
+              type="select"
+              label="Tier"
+              value={contact.tier ?? UNRANKED}
+              options={TIER_OPTIONS}
+              onSave={(v) => save('tier')(tierValue(v))}
+            />
           </FieldRow>
           <FieldRow label="Source">
             <EditableField type="select" label="Source" value={contact.source} options={sourceOptions} onSave={save('source')} />
@@ -83,6 +108,20 @@ export function OverviewTab({ contact }: { contact: Contact }) {
               </div>
             </div>
           </FieldRow>
+        </Panel>
+
+        <Panel
+          title="Billing"
+          action={
+            <Link to={links.contactTab(contact.id, 'billing')} className="text-[12px] normal-case tracking-normal text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">
+              Open billing
+            </Link>
+          }
+          bodyClassName="px-3.5 py-2.5"
+        >
+          <Suspense fallback={<p className="text-[13px] text-muted-foreground">Loading services...</p>}>
+            <CompactQuoteEditor contact={contact} disabled={fieldSaving} />
+          </Suspense>
         </Panel>
 
         <Panel title={spouseName ? `Spouse: ${spouseName}` : 'Spouse'} bodyClassName="py-1.5">

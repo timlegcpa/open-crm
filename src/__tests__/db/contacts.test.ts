@@ -1,11 +1,14 @@
 // @vitest-environment node
 import type { PGlite } from '@electric-sql/pglite';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { CONTACT_PATCH_COLUMNS } from '@/api/contacts';
+import { CLIENT_TIERS } from '@/features/crm/lib/tiers';
 // Every function a signed-in session (or anon) may call directly, across all migrations,
 // one file per domain. Any other function in public is the server's alone (or a trigger's).
 import { ANON_CALLABLE, AUTHENTICATED_CALLABLE, SERVER_RPCS } from './allowlists';
-import { anon, as, count as countRows, createDb, errorOf, service, session, tryIn, user } from './harness';
+import { anon, as, become, becomeSuperuser, count as countRows, createDb, errorOf, service, session, tryIn, user } from './harness';
 
 const OWNER = '00000000-0000-4000-8000-000000000001';
 const SYSTEM = '00000000-0000-4000-8000-000000000002';
@@ -719,5 +722,126 @@ describe('contact delete claim', () => {
       return tryIn(tx, 'SELECT public.admin_delete_contact($1, $2)', [CONTACT_B, b.claim]);
     });
     expect(expired).toMatch(/contact_delete_claim_expired/);
+  });
+});
+
+describe('tiers and archiving (0013)', () => {
+  const MIGRATION = readFileSync(path.resolve(__dirname, '..', '..', '..', 'supabase', 'migrations', '0013_crm.sql'), 'utf8');
+  const MINTED = '40000000-0000-4000-8000-0000000000aa';
+
+  it('the tier CHECK holds exactly the app’s tiers, and nothing else', async () => {
+    const listed = /tier IN \(([^)]*)\)/.exec(MIGRATION)?.[1].split(',').map((t) => t.trim().replace(/'/g, ''));
+    expect(listed).toEqual([...CLIENT_TIERS]);
+    for (const t of CLIENT_TIERS) {
+      expect(await errorOf(db, owner, `UPDATE public.contacts SET tier = '${t}' WHERE id = '${CONTACT_A}'`), t).toBeNull();
+    }
+    for (const bad of ['F', 's', '']) {
+      expect(await errorOf(db, owner, `UPDATE public.contacts SET tier = '${bad}' WHERE id = '${CONTACT_A}'`), bad).toMatch(/contacts_tier_check/);
+    }
+    expect(await errorOf(db, owner, `UPDATE public.contacts SET tier = NULL WHERE id = '${CONTACT_A}'`)).toBeNull();
+  });
+
+  it('the owner and the server update both columns; anon, either client and a View-as-client session cannot', async () => {
+    const write = `UPDATE public.contacts SET tier = 'S', archived_at = now() WHERE id = '${CONTACT_A}' RETURNING tier`;
+    expect(await as(db, owner, write)).toEqual([{ tier: 'S' }]);
+    expect(await as(db, service, write)).toEqual([{ tier: 'S' }]);
+    expect(await errorOf(db, anon, write)).toMatch(/permission denied/);
+    // Own contact and another's alike: contacts is owner-only, so the rows are not there.
+    for (const who of [clientA, clientB]) {
+      expect(await as(db, who, write)).toEqual([]);
+      expect(await as(db, who, 'SELECT tier, archived_at FROM public.contacts')).toEqual([]);
+    }
+    const viewing = await session(db, service, async (tx) => {
+      await tx.query(
+        `INSERT INTO public.impersonation_sessions (owner_user_id, target_contact_id, target_user_id, target_email, session_id)
+         VALUES ($1, $2, $3, 'a@example.test', $4)`, [OWNER, CONTACT_A, USER_A, MINTED]);
+      await become(tx, user(USER_A, { sessionId: MINTED }));
+      return (await tx.query(write)).rows;
+    });
+    expect(viewing).toEqual([]);
+  });
+
+  it('a client never sees either column through get_my_contact', async () => {
+    const rows = await as<Record<string, unknown>>(db, clientA, 'SELECT * FROM public.get_my_contact()');
+    expect(rows).toHaveLength(1);
+    expect(Object.keys(rows[0])).not.toContain('tier');
+    expect(Object.keys(rows[0])).not.toContain('archived_at');
+  });
+
+  it('a signed-in insert can set neither column (the intake never seeds a tier or an archive)', async () => {
+    expect(await errorOf(db, owner, `INSERT INTO public.contacts (first_name, tier) VALUES ('x', 'S')`)).toMatch(/permission denied/);
+    expect(await errorOf(db, owner, `INSERT INTO public.contacts (first_name, archived_at) VALUES ('x', now())`)).toMatch(/permission denied/);
+  });
+
+  it('the database stamps the archive time: never backdated, never moved by a repeat, cleared by restore', async () => {
+    const out = await session(db, owner, async (tx) => {
+      const first = (await tx.query<{ ok: boolean }>(
+        `UPDATE public.contacts SET archived_at = '2000-01-01' WHERE id = '${CONTACT_A}' RETURNING archived_at = now() AS ok`)).rows[0].ok;
+      // Put a known earlier time in place with the trigger off, then archive again.
+      await becomeSuperuser(tx);
+      await tx.exec(`SET LOCAL session_replication_role = replica;
+                     UPDATE public.contacts SET archived_at = '2001-02-03T00:00:00Z' WHERE id = '${CONTACT_A}';
+                     SET LOCAL session_replication_role = origin;`);
+      await become(tx, owner);
+      const repeat = (await tx.query<{ at: string }>(
+        `UPDATE public.contacts SET archived_at = now() WHERE id = '${CONTACT_A}'
+         RETURNING to_char(archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS at`)).rows[0].at;
+      const restored = (await tx.query<{ archived_at: string | null }>(
+        `UPDATE public.contacts SET archived_at = NULL WHERE id = '${CONTACT_A}' RETURNING archived_at`)).rows[0].archived_at;
+      return { first, repeat, restored };
+    });
+    expect(out).toEqual({ first: true, repeat: '2001-02-03', restored: null });
+  });
+
+  it('archive and restore leave the status and its history alone, so restore returns the very stage', async () => {
+    const out = await session(db, owner, async (tx) => {
+      const read = async () => (await tx.query<{ status: string; n: number }>(
+        `SELECT status, jsonb_array_length(status_history) AS n FROM public.contacts WHERE id = '${CONTACT_B}'`)).rows[0];
+      const before = await read();
+      await tx.exec(`UPDATE public.contacts SET archived_at = now() WHERE id = '${CONTACT_B}'`);
+      const archived = await read();
+      await tx.exec(`UPDATE public.contacts SET archived_at = NULL WHERE id = '${CONTACT_B}'`);
+      return { before, archived, after: await read() };
+    });
+    expect(out.archived).toEqual(out.before);
+    expect(out.after).toEqual(out.before);
+  });
+
+  it('a contact the e-signature flow created keeps its system status through an archive', async () => {
+    const status = await session(db, service, async (tx) => {
+      const id = (await tx.query<{ id: string }>(
+        `INSERT INTO public.contacts (first_name, email, status) VALUES ('Sig', 'sig@example.test', 'esign_signer') RETURNING id`)).rows[0].id;
+      await become(tx, owner);
+      const statusOf = async () => (await tx.query<{ status: string }>('SELECT status FROM public.contacts WHERE id = $1', [id])).rows[0].status;
+      await tx.query('UPDATE public.contacts SET archived_at = now() WHERE id = $1', [id]);
+      const archived = await statusOf();
+      await tx.query('UPDATE public.contacts SET archived_at = NULL WHERE id = $1', [id]);
+      return [archived, await statusOf()];
+    });
+    expect(status).toEqual(['esign_signer', 'esign_signer']);
+  });
+
+  it('a group email claim skips a contact archived after the campaign was queued', async () => {
+    const out = await session(db, service, async (tx) => {
+      const campaign = (await tx.query<{ id: string }>(
+        `INSERT INTO public.crm_email_campaigns (subject, body, from_identity) VALUES ('S', 'B', 'Example Co') RETURNING id`)).rows[0].id;
+      await tx.query(
+        `INSERT INTO public.crm_email_recipients (campaign_id, contact_id, address, status) VALUES
+           ($1, $2, 'a@example.test', 'queued'), ($1, $3, 'b@example.test', 'queued')`, [campaign, CONTACT_A, CONTACT_B]);
+      await tx.query('UPDATE public.contacts SET archived_at = now() WHERE id = $1', [CONTACT_A]);
+      const claim = async (address: string) =>
+        (await tx.query<{ r: string }>(`SELECT public.group_email_claim($1, $2, ARRAY['client']) AS r`, [campaign, address])).rows[0].r;
+      const archived = await claim('a@example.test');
+      const live = await claim('b@example.test');
+      const rows = (await tx.query<{ address: string; status: string; error: string | null }>(
+        'SELECT address, status, error FROM public.crm_email_recipients WHERE campaign_id = $1 ORDER BY address', [campaign])).rows;
+      return { archived, live, rows };
+    });
+    expect(out.archived).toBe('ineligible');
+    expect(out.live).toBe('claimed');
+    expect(out.rows).toEqual([
+      { address: 'a@example.test', status: 'skipped', error: 'archived' },
+      { address: 'b@example.test', status: 'sending', error: null },
+    ]);
   });
 });

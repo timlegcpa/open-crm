@@ -43,7 +43,7 @@ Deno.serve(
 
     // At most 250 ids, so one read inside PostgREST's 1,000-row cap.
     async readContacts(ids) {
-      const { data, error } = await server.from('contacts').select('id, first_name, email, status').in('id', ids);
+      const { data, error } = await server.from('contacts').select('id, first_name, email, status, archived_at').in('id', ids);
       if (error) throw error;
       return (data ?? []) as ContactRow[];
     },

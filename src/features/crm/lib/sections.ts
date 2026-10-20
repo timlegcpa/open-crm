@@ -1,4 +1,4 @@
-import { isClientLike, PIPELINE_STATUSES, STORED_STATUSES, type ContactStatusKey } from '@/lib/contactStatus';
+import { CLIENT_LIKE_STATUSES, isClientLike, PIPELINE_STATUSES, STORED_STATUSES, type ContactStatusKey } from '@/lib/contactStatus';
 
 /**
  * The contact index's sections: ONE definition, read by every index that lists contacts.
@@ -33,25 +33,59 @@ export const CRM_SECTIONS: readonly CrmSection[] = [
 ];
 
 /**
- * The index's list switch. Clients holds paying contacts only; Leads holds every open stage
- * plus Cold. Former clients, signers and lost contacts show under All.
+ * The index's lists. Clients holds paying contacts (recurring and one-time), Active
+ * clients the recurring ones only (the Tiers tab ranks those), Leads every open stage plus
+ * Cold. Former clients, signers and lost contacts show under All.
  */
 export const CRM_LISTS = [
   { key: 'all', label: 'All', statuses: null },
-  { key: 'clients', label: 'Clients', statuses: ['client', 'one_time'] },
+  { key: 'clients', label: 'Clients', statuses: [...CLIENT_LIKE_STATUSES] },
+  { key: 'active', label: 'Active clients', statuses: ['client'] },
   { key: 'leads', label: 'Leads', statuses: [...PIPELINE_STATUSES] },
 ] as const satisfies ReadonlyArray<{ key: string; label: string; statuses: readonly string[] | null }>;
 
 export type CrmListKey = (typeof CRM_LISTS)[number]['key'];
 
-export function isCrmListKey(value: unknown): value is CrmListKey {
-  return CRM_LISTS.some((l) => l.key === value);
-}
-
 /** Whether a status shows under a list. */
 export function statusInList(status: string, list: CrmListKey): boolean {
   const statuses = CRM_LISTS.find((l) => l.key === list)?.statuses ?? null;
   return statuses === null || (statuses as readonly string[]).includes(status);
+}
+
+/**
+ * The contacts page's tabs, across the top. Each names the list the index shows and what
+ * the wide pane holds with no record open: the pipeline board, the tier rows, or the
+ * table. Clients is the default. The tab lives in `?tab=` (a tab is a link) and the last
+ * one chosen is remembered per browser for a bare /contacts.
+ *
+ * A search on any tab but Tiers looks through everyone; Tiers ranks active clients only,
+ * so its list holds during a search and a board filter.
+ */
+export const CRM_TABS = [
+  { key: 'clients', label: 'Clients', list: 'clients', pane: 'board' },
+  { key: 'pipeline', label: 'Pipeline', list: 'leads', pane: 'board' },
+  { key: 'tiers', label: 'Tiers', list: 'active', pane: 'tiers' },
+  { key: 'all', label: 'All', list: 'all', pane: 'board' },
+  { key: 'table', label: 'Table', list: 'all', pane: 'table' },
+] as const satisfies ReadonlyArray<{ key: string; label: string; list: CrmListKey; pane: 'board' | 'tiers' | 'table' }>;
+
+export type CrmTabKey = (typeof CRM_TABS)[number]['key'];
+export type CrmTab = (typeof CRM_TABS)[number];
+
+export const DEFAULT_CRM_TAB: CrmTabKey = 'clients';
+
+export function isCrmTabKey(value: unknown): value is CrmTabKey {
+  return CRM_TABS.some((t) => t.key === value);
+}
+
+export function crmTab(key: CrmTabKey): CrmTab {
+  return CRM_TABS.find((t) => t.key === key)!;
+}
+
+/** The tab to show: an explicit `?tab=` when it names one, else the remembered one, else Clients. */
+export function resolveCrmTab(param: string | null, stored: unknown): CrmTabKey {
+  if (isCrmTabKey(param)) return param;
+  return isCrmTabKey(stored) ? stored : DEFAULT_CRM_TAB;
 }
 
 /**
@@ -107,6 +141,24 @@ export function bucketBySection<
     );
     return { ...s, rows };
   });
+}
+
+/**
+ * The Clients list as ONE section: every client, recurring or one-time, A to Z by last
+ * name, then first name, the id breaking a tie. Titled with the client status's own
+ * label. Merged during a search too: on the Clients tab a client is a client. Every other
+ * section passes through untouched, so the partition statusesWithoutSection guards holds.
+ */
+export function mergeClientSections<T extends { id: string; first_name: string; last_name: string }>(
+  sections: Array<CrmSection & { rows: T[] }>,
+): Array<CrmSection & { rows: T[] }> {
+  const parts = sections.filter((s) => isClientLike(s.status));
+  if (parts.length < 2) return sections;
+  const rows = parts
+    .flatMap((s) => s.rows)
+    .sort((a, b) => a.last_name.localeCompare(b.last_name) || a.first_name.localeCompare(b.first_name) || a.id.localeCompare(b.id));
+  const merged = { ...parts[0], collapsible: false, rows };
+  return sections.flatMap((s) => (s === parts[0] ? [merged] : isClientLike(s.status) ? [] : [s]));
 }
 
 /** Statuses no section holds. Empty by construction; sections.test.ts keeps it so. */

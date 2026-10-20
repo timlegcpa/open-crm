@@ -10,7 +10,8 @@ Supabase. One owner runs it; clients get a secure portal.
 
 ## What it is for
 
-- **Contacts and pipeline**: contacts, businesses they own, notes, service quotes and upsells.
+- **Contacts and pipeline**: contacts, businesses they own, notes, service quotes and upsells,
+  client tiers and reversible archiving.
 - **Client portal**: invitations, a client home, profile.
 - **Documents**: upload, preview, annotate and share, encrypted at rest.
 - **Secure messages**: secure messages between the owner and each client: a client's message is

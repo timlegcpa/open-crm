@@ -3,16 +3,10 @@ import { toISODate } from '@/lib/format';
 import { addedAt } from './sections';
 
 /**
- * The contacts Table view: one sortable roster beside the sectioned list, with Sort,
+ * The contacts Table tab: one sortable roster beside the sectioned list, with Sort,
  * Status and Added menus, a "N of M contacts in view" footer and the MRR total. Only
  * columns the CRM really holds.
  */
-
-export type CrmLayout = 'list' | 'table';
-
-export function isCrmLayout(value: unknown): value is CrmLayout {
-  return value === 'list' || value === 'table';
-}
 
 export type CrmTableSort = 'newest' | 'name' | 'mrr';
 export type CrmTableAdded = 'any' | '30' | '90' | '12m';

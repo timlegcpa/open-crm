@@ -24,7 +24,19 @@ import { intakeQuotes } from '../lib/intake';
 import { isTypingContext, moveForDrop } from '../lib/interaction';
 import { allowedOrganizationStatusTargets, findOrganizationNameClash } from '../lib/organizations';
 import { contactPatchForQuoteChange, parseCurrencyInput, statusChangePatch } from '../lib/quotes';
-import { addedAt, bucketBySection, contactRowName, CRM_LISTS, CRM_SECTIONS, statusesWithoutSection, statusInList } from '../lib/sections';
+import {
+  addedAt,
+  bucketBySection,
+  contactRowName,
+  CRM_LISTS,
+  CRM_SECTIONS,
+  CRM_TABS,
+  isCrmTabKey,
+  mergeClientSections,
+  resolveCrmTab,
+  statusesWithoutSection,
+  statusInList,
+} from '../lib/sections';
 import { addedCutoff, crmTableMrrTotal, crmTableRows, DEFAULT_CRM_TABLE_FILTERS } from '../lib/table';
 
 let seq = 0;
@@ -68,6 +80,8 @@ function contact(id: string, extra: Partial<Contact> = {}): Contact {
     mailing_state: null,
     mailing_zip: null,
     client_since: null,
+    tier: null,
+    archived_at: null,
     contact_services: [],
     ...extra,
   };
@@ -89,6 +103,10 @@ describe('sections', () => {
     expect(statusInList('former_client', 'clients')).toBe(false);
     expect(statusInList('lost', 'all')).toBe(true);
     expect(statusInList('lost', 'leads')).toBe(false);
+    // Active clients (the Tiers tab) are the recurring ones: no one-time clients.
+    expect(statusInList('client', 'active')).toBe(true);
+    expect(statusInList('one_time', 'active')).toBe(false);
+    expect(statusInList('one_time', 'clients')).toBe(true);
   });
 
   it('sorts client sections A-Z by last name, every other section newest added first', () => {
@@ -396,4 +414,50 @@ describe('the CSV export', () => {
 
 it('the status keys offered never include a system status', () => {
   expect(SELECTABLE_STATUSES).not.toContain('esign_signer');
+});
+
+describe('tabs', () => {
+  it('run Clients, Pipeline, Tiers, All, Table, each naming a real list', () => {
+    expect(CRM_TABS.map((t) => t.key)).toEqual(['clients', 'pipeline', 'tiers', 'all', 'table']);
+    const lists = new Set<string>(CRM_LISTS.map((l) => l.key));
+    for (const t of CRM_TABS) expect(lists.has(t.list), t.key).toBe(true);
+  });
+
+  it('Tiers lists the active clients and draws the tier rows; Table draws the table', () => {
+    expect(CRM_TABS.find((t) => t.key === 'tiers')).toMatchObject({ list: 'active', pane: 'tiers' });
+    expect(CRM_TABS.find((t) => t.key === 'table')).toMatchObject({ list: 'all', pane: 'table' });
+  });
+
+  it('an explicit ?tab= wins, then the remembered tab, then Clients; anything else is refused', () => {
+    expect(resolveCrmTab('tiers', 'table')).toBe('tiers');
+    expect(resolveCrmTab(null, 'table')).toBe('table');
+    expect(resolveCrmTab('nonsense', 'pipeline')).toBe('pipeline');
+    expect(resolveCrmTab(null, null)).toBe('clients');
+    expect(resolveCrmTab(null, 3)).toBe('clients');
+    expect(isCrmTabKey('leads')).toBe(false);
+  });
+});
+
+describe('the merged Clients list', () => {
+  const rows = [
+    contact('1', { status: 'client', first_name: 'Al', last_name: 'Young' }),
+    contact('2', { status: 'one_time', first_name: 'Jo', last_name: 'Adams' }),
+    contact('3', { status: 'client', first_name: 'Kim', last_name: 'Brown' }),
+    contact('4', { status: 'one_time', first_name: 'Abe', last_name: 'Brown' }),
+    contact('5', { status: 'new_lead', first_name: 'Lee', last_name: 'Zed' }),
+  ];
+
+  it('folds one-time clients into one list, A-Z by last name then first', () => {
+    const merged = mergeClientSections(bucketBySection(rows));
+    const clients = merged.find((s) => s.status === 'client')!;
+    expect(clients.rows.map((r) => r.id)).toEqual(['2', '4', '3', '1']);
+    expect(clients.collapsible).toBe(false);
+    expect(merged.some((s) => s.status === 'one_time')).toBe(false);
+  });
+
+  it('leaves every other section alone', () => {
+    const merged = mergeClientSections(bucketBySection(rows));
+    expect(merged.find((s) => s.status === 'new_lead')!.rows.map((r) => r.id)).toEqual(['5']);
+    expect(merged).toHaveLength(CRM_SECTIONS.length - 1);
+  });
 });

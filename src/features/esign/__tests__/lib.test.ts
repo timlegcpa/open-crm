@@ -259,6 +259,11 @@ describe('the signer picker', () => {
     expect(buildSignerPickerOptions([base({ email: null, spouse_email: null })], new Set(), new Set(['c1']))).toEqual([]);
     expect(buildSignerPickerOptions([base({ status: 'lost' })], new Set(), new Set())).toEqual([]);
   });
+
+  it('never offers an archived contact, nor its spouse', () => {
+    expect(buildSignerPickerOptions([base({ archived_at: '2026-03-05T10:00:00Z' })], new Set(), new Set())).toEqual([]);
+    expect(buildSignerPickerOptions([base({ archived_at: null })], new Set(), new Set())).toHaveLength(2);
+  });
 });
 
 describe('the page reorder after a drag', () => {

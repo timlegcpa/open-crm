@@ -1,8 +1,8 @@
 import { Suspense, useState } from 'react';
 import { Link, Navigate, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, MoreHorizontal } from 'lucide-react';
-import { contactDisplayName, deleteContact, isUuid, type Contact } from '@/api/contacts';
+import { ArchiveRestore, ArrowLeft, MoreHorizontal } from 'lucide-react';
+import { contactDisplayName, deleteContact, isArchived, isUuid, type Contact } from '@/api/contacts';
 import { queryKeys } from '@/api/queryKeys';
 import { StatusBadge, StatusMonogram } from '@/components/contacts/StatusBadge';
 import { SIDE_BAR_W } from '@/components/layout/page';
@@ -26,9 +26,11 @@ import { toast } from '@/components/ui/sonner';
 import { useByKey, useContactStatuses } from '@/hooks/usePickLists';
 import { links } from '@/features/links';
 import { contactHeaderActions, contactTabs } from '@/features/registry';
-import { useContact } from '@/features/crm/hooks';
+import { useContact, useSetArchived } from '@/features/crm/hooks';
 import { OverviewTab } from '@/features/crm/components/OverviewTab';
 import { RecordRightBar } from '@/features/crm/components/RecordRightBar';
+import { TierMark } from '@/features/crm/components/TierMark';
+import { StatusPill } from '@/components/ui/status-pill';
 import { getErrorMessage } from '@/lib/errors';
 import { formatPhoneNumber } from '@/lib/format';
 
@@ -109,6 +111,10 @@ function Record({ contact, tab }: { contact: Contact; tab: string | null }) {
   const status = useByKey(statuses.data).get(contact.status);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const name = contactDisplayName(contact);
+  const archived = isArchived(contact);
+  const setArchived = useSetArchived();
+  // An archived record stays whole and editable; it is only off the working lists.
+  const toggleArchived = () => void setArchived.run([contact.id], !archived, name);
 
   const remove = useMutation({
     mutationFn: () => deleteContact(contact.id),
@@ -135,7 +141,9 @@ function Record({ contact, tab }: { contact: Contact; tab: string | null }) {
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 flex-wrap items-center gap-2.5">
                 <h1 className="truncate text-[18px] font-semibold leading-6">{name}</h1>
+                <TierMark tier={contact.tier} />
                 <StatusBadge statusKey={contact.status} status={status} />
+                {archived && <StatusPill>Archived</StatusPill>}
               </div>
               {(contact.business_name || contact.email || contact.phone) && (
                 <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-3.5 gap-y-0.5 text-[12.5px] text-muted-foreground xl:hidden">
@@ -146,6 +154,12 @@ function Record({ contact, tab }: { contact: Contact; tab: string | null }) {
               )}
             </div>
             <div className="ml-auto flex flex-wrap items-center gap-2">
+              {archived && (
+                <Button type="button" size="sm" variant="outline" disabled={setArchived.pending} onClick={toggleArchived}>
+                  <ArchiveRestore aria-hidden="true" />
+                  Restore
+                </Button>
+              )}
               {contactHeaderActions.map(({ key, Component }) => (
                 <Suspense key={key} fallback={null}>
                   <Component contactId={contact.id} />
@@ -158,6 +172,9 @@ function Record({ contact, tab }: { contact: Contact; tab: string | null }) {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
+                  <DropdownMenuItem disabled={setArchived.pending} onSelect={toggleArchived}>
+                    {archived ? 'Restore contact' : 'Archive contact'}
+                  </DropdownMenuItem>
                   <DropdownMenuItem
                     className="text-destructive focus:text-destructive"
                     disabled={remove.isPending}
@@ -182,7 +199,8 @@ function Record({ contact, tab }: { contact: Contact; tab: string | null }) {
       <aside aria-label="Contact summary" className={`hidden shrink-0 border-l border-border xl:block ${SIDE_BAR_W}`}>
         <ScrollArea className="h-full" fitWidth>
           <div className="p-3">
-            <RecordRightBar contact={contact} />
+            {/* Overview and Billing hold the services editor in their body already. */}
+            <RecordRightBar contact={contact} showServices={tab !== null && tab !== 'billing'} />
           </div>
         </ScrollArea>
       </aside>

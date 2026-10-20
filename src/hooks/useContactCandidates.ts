@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { contactDisplayName, listContacts, type ContactListRow } from '@/api/contacts';
+import { contactDisplayName, isArchived, listContacts, type ContactListRow } from '@/api/contacts';
 import { queryKeys } from '@/api/queryKeys';
 import { matchesContactSearch } from '@/lib/contactSearch';
 import { isClientLike } from '@/lib/contactStatus';
@@ -37,14 +37,15 @@ function byClientThenName(a: ContactCandidate, b: ContactCandidate): number {
  * Every contact matching `query` (the contacts list's own search rule), as picker rows. It
  * reads the contacts list's query, so the list and every picker share one cache entry, and
  * it fetches only while `enabled` (a popover that is open): a screen that never shows a
- * picker pays nothing for it. Every contact is offered, a brand-new lead included.
+ * picker pays nothing for it. Every contact is offered, a brand-new lead included, except an
+ * archived one: archiving takes a contact off every working list (isArchived).
  */
 export function useContactCandidates(query: string, enabled: boolean) {
   const contacts = useQuery({ queryKey: queryKeys.contacts.list(), queryFn: listContacts, enabled });
   const candidates = useMemo(
     () =>
       (contacts.data ?? [])
-        .filter((c) => matchesContactSearch(c, query))
+        .filter((c) => !isArchived(c) && matchesContactSearch(c, query))
         .map(toCandidate)
         .sort(byClientThenName),
     [contacts.data, query],
