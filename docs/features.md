@@ -8,11 +8,12 @@ named in its section.
 
 **Owner.** Contacts is the home page: a list and a pipeline board of every contact by stage
 (new, active, hot, warm, cold, client, one-time client, former client, lost), in each stage's
-colour. Tabs across the top switch the list: Clients (the default: every client, one-time
-clients included, in one A to Z list), Pipeline (the open stages), Tiers, All and Table. The
-tab is part of the address, and the last one chosen is remembered in the browser. A search
-looks through everyone, whatever the tab, except on Tiers. Add a contact by hand, or let one
-arrive through lead intake.
+colour. The workspace's tab strip holds Pipeline (the default), Tiers and Table beside the
+board, requests, messages, e-sign and marketing; the client panel on the left lists everyone
+(All) or every client, one-time clients included, in one A to Z list (Clients), and remembers
+the choice in the browser. The tab is part of the address, and the last one chosen is
+remembered. A search in the panel looks through everyone and also narrows the board, the
+tiers and the table. Add a contact by hand, or let one arrive through lead intake.
 
 **Tiers.** The owner ranks clients by hand, S at the top, then A, B, C, D and E; a contact
 starts not ranked. The Tiers tab shows one row per tier, in tier-list colours, with the active

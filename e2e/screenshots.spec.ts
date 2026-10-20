@@ -29,8 +29,8 @@ test.describe('README screenshots', { tag: '@screenshots' }, () => {
   test('owner dashboard', async ({ page, mock }) => {
     await signIn(page, mock, 'owner');
     await page.goto('/');
-    await expect(page).toHaveURL('/contacts');
-    await expect(page.getByText('2 contacts')).toBeVisible();
+    await expect(page).toHaveURL('/contacts?tab=pipeline');
+    await expect(page.getByRole('complementary', { name: 'Contact list' }).getByText('2 contacts')).toBeVisible();
     await shoot(page, 'owner-dashboard');
   });
 

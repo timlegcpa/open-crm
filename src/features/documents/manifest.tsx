@@ -9,15 +9,23 @@ const DocumentsTab = lazyNamed(() => import('./pages'), 'DocumentsTab');
 const DocumentsCard = lazyNamed(() => import('./pages'), 'DocumentsCard');
 const UnreviewedNavBadge = lazyNamed(() => import('./badges'), 'UnreviewedNavBadge');
 const UnreviewedContactBadge = lazyNamed(() => import('./badges'), 'UnreviewedContactBadge');
+const UnreviewedCount = lazyNamed(() => import('./badges'), 'UnreviewedCount');
 
 export const manifest: FeatureManifest = {
   id: 'documents',
   ownerNav: [{ label: 'Documents', icon: FileText, path: '/documents', order: 30, section: 'workflow', badge: UnreviewedNavBadge }],
-  ownerRoutes: [
-    // The explorer and the workstation lay out their own scrolling panes.
-    { path: 'documents', element: <DocumentsPage />, handle: BOUNDED_PAGE },
-    { path: 'documents/:id', element: <DocumentPage />, handle: BOUNDED_PAGE },
+  workspaceRoutes: [
+    // The explorer lays out its own scrolling panes. The client panel picks whose files
+    // show (`?contact=`), and on a phone it is the screen until someone is picked.
+    {
+      path: 'documents',
+      element: <DocumentsPage />,
+      handle: { ...BOUNDED_PAGE, pickParam: 'contact', panelFirst: (search: URLSearchParams) => !search.get('contact') },
+    },
   ],
+  // The workstation lays out its own scrolling panes.
+  ownerRoutes: [{ path: 'documents/:id', element: <DocumentPage />, handle: BOUNDED_PAGE }],
+  shellCounts: [{ key: 'to-review', label: 'To review', path: '/documents', order: 20, kind: 'waiting', Count: UnreviewedCount }],
   portalTabs: [{ label: 'Documents', icon: FileText, path: '/portal/documents', order: 20 }],
   portalRoutes: [{ path: 'documents', element: <PortalDocumentsPage /> }],
   portalHomeCards: [{ key: 'documents', order: 20, Component: DocumentsCard }],

@@ -417,8 +417,8 @@ it('the status keys offered never include a system status', () => {
 });
 
 describe('tabs', () => {
-  it('run Clients, Pipeline, Tiers, All, Table, each naming a real list', () => {
-    expect(CRM_TABS.map((t) => t.key)).toEqual(['clients', 'pipeline', 'tiers', 'all', 'table']);
+  it('run Pipeline, Tiers, Table, each naming a real list (Clients and All are the panel switch)', () => {
+    expect(CRM_TABS.map((t) => t.key)).toEqual(['pipeline', 'tiers', 'table']);
     const lists = new Set<string>(CRM_LISTS.map((l) => l.key));
     for (const t of CRM_TABS) expect(lists.has(t.list), t.key).toBe(true);
   });
@@ -428,12 +428,15 @@ describe('tabs', () => {
     expect(CRM_TABS.find((t) => t.key === 'table')).toMatchObject({ list: 'all', pane: 'table' });
   });
 
-  it('an explicit ?tab= wins, then the remembered tab, then Clients; anything else is refused', () => {
+  it('an explicit ?tab= wins, then the remembered tab, then Pipeline; anything else is refused', () => {
     expect(resolveCrmTab('tiers', 'table')).toBe('tiers');
     expect(resolveCrmTab(null, 'table')).toBe('table');
-    expect(resolveCrmTab('nonsense', 'pipeline')).toBe('pipeline');
-    expect(resolveCrmTab(null, null)).toBe('clients');
-    expect(resolveCrmTab(null, 3)).toBe('clients');
+    expect(resolveCrmTab('nonsense', 'tiers')).toBe('tiers');
+    expect(resolveCrmTab(null, null)).toBe('pipeline');
+    expect(resolveCrmTab(null, 3)).toBe('pipeline');
+    // The old list tabs, linked or remembered, are not tabs any more.
+    expect(resolveCrmTab('clients', null)).toBe('pipeline');
+    expect(resolveCrmTab(null, 'all')).toBe('pipeline');
     expect(isCrmTabKey('leads')).toBe(false);
   });
 });

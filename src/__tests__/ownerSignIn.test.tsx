@@ -131,8 +131,11 @@ describe('owner sign-in', () => {
     fake.state.signInResult = OWNER;
     render(<App />);
     await screen.findByText('Signed in as owner@example.com.');
+    // Sign out sits in the rail's account menu.
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Signed in as owner@example.com.' }), { key: 'Enter' });
+    const signOut = await screen.findByRole('menuitem', { name: 'Sign out' });
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+      fireEvent.click(signOut);
     });
     await screen.findByLabelText('Email');
     // The database has not answered yet: the old "owner" answer must not stand in for it.
@@ -211,8 +214,11 @@ describe('owner sign-in', () => {
     render(<App />);
     await screen.findByText('Signed in as owner@example.com.');
     expect(fake.state.audit).toEqual([]);
+    // Sign out sits in the rail's account menu.
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Signed in as owner@example.com.' }), { key: 'Enter' });
+    const signOut = await screen.findByRole('menuitem', { name: 'Sign out' });
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+      fireEvent.click(signOut);
     });
     expect(fake.state.audit.map((a) => a.action)).toEqual(['owner_logout']);
     expect(await screen.findByLabelText('Email')).toBeInTheDocument();

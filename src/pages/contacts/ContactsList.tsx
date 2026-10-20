@@ -1,59 +1,45 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Outlet, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Archive, Download, Plus, Search, X } from 'lucide-react';
-import { bulkUpdateStatus, contactDisplayName, deleteContacts, isArchived, type Contact } from '@/api/contacts';
-import { queryKeys } from '@/api/queryKeys';
-import { EmptyState, PageHeader } from '@/components/layout/page';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { Archive, Download, Plus, Search } from 'lucide-react';
+import { isArchived, type Contact } from '@/api/contacts';
+import { PageHeader } from '@/components/layout/page';
 import { Button } from '@/components/ui/button';
-import { ClickRegion } from '@/components/ui/click-region';
 import { Input } from '@/components/ui/input';
-import { PageTabsList, PageTabsTrigger } from '@/components/ui/page-tabs';
-import { ScrollArea } from '@/components/ui/scroll-area';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from '@/components/ui/sonner';
-import { Tabs } from '@/components/ui/tabs';
 import { Toggle } from '@/components/ui/toggle';
-import { useCollapsedSections } from '@/hooks/useCollapsedSections';
 import { useByKey, useContactStatuses, useServiceTypes } from '@/hooks/usePickLists';
 import { links } from '@/features/links';
 import { ArchivedPeopleDialog } from '@/features/crm/components/ArchivedPeopleDialog';
 import { CrmBoard } from '@/features/crm/components/board/CrmBoard';
-import { ContactIndexGroup, ContactIndexRow } from '@/features/crm/components/ContactIndex';
 import { CrmTable, tableMrrOf } from '@/features/crm/components/CrmTable';
 import { TierBoard } from '@/features/crm/components/TierBoard';
-import { useContacts, useOrganizationRoster, useOrganizationsByContact, useSetArchived, useUpdateContact } from '@/features/crm/hooks';
+import { useContacts, useOrganizationRoster, useOrganizationsByContact, useUpdateContact } from '@/features/crm/hooks';
 import { contactIdsForView, cadenceText, matchesCrmSearch, pipelineFigures, unsignedWork } from '@/features/crm/lib/board';
 import { contactCsvRows } from '@/features/crm/lib/csv';
 import { quoteOpMutationKey, statusChangePatch } from '@/features/crm/lib/quotes';
-import { bucketBySection, CRM_TABS, crmTab, isCrmTabKey, mergeClientSections, resolveCrmTab, statusInList, type CrmTabKey } from '@/features/crm/lib/sections';
+import { crmTab, isCrmTabKey, resolveCrmTab, type CrmTabKey } from '@/features/crm/lib/sections';
 import { crmTableRows, DEFAULT_CRM_TABLE_FILTERS, type CrmTableFilters } from '@/features/crm/lib/table';
-import { CRM_COLLAPSED_KEY, rememberCrmTab, storedCrmTab } from '@/features/crm/prefs';
+import { rememberCrmTab, storedCrmTab } from '@/features/crm/prefs';
 import { useWide } from '@/features/crm/useWide';
-import { isClientLike, isSystemStatus } from '@/lib/contactStatus';
+import { ViewFilterChip } from '@/features/workspace/ClientPanel';
+import { useWorkspaceSearch } from '@/features/workspace/search';
+import { useArchiveOne } from '@/features/workspace/useArchiveOne';
 import { csvBlob } from '@/lib/csv';
 import { downloadBlob } from '@/lib/download';
 import { getErrorMessage } from '@/lib/errors';
 import { todayISODate } from '@/lib/format';
-import { cn } from '@/lib/utils';
 
 /**
- * The contacts page: tabs across the top (Clients, Pipeline, Tiers, All, Table), a fixed
- * 300px index of sections beside the record (nested with <Outlet key={id}>), or, with no
- * record open, the tab's pane: the pipeline board, the tier rows or the table.
+ * The contacts page, a workspace screen: the record (nested with <Outlet key={id}>), or,
+ * with no record open, the tab's pane: the pipeline board, the tier rows or the table. The
+ * tabs are the workspace strip's (Pipeline, Tiers, Table, each `?tab=`), and the index of
+ * contacts is the workspace's client panel; its search narrows the board, the tiers and
+ * the table here too. A bare /contacts opens the remembered tab, by a redirect, so the URL
+ * always names the tab the strip marks.
  *
- * Archived contacts are off every list here (the index, the board, the table, the tiers
- * and a search); the Archived dialog lists them, and their record still opens by link.
+ * Archived contacts are off every list here (the board, the table, the tiers and a search);
+ * the Archived dialog lists them, and their record still opens by link.
  */
 export function ContactsList() {
   const { id } = useParams();
@@ -61,7 +47,7 @@ export function ContactsList() {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const view = searchParams.get('view');
-  const [search, setSearch] = useState('');
+  const { query: search, setQuery: setSearch } = useWorkspaceSearch();
 
   const contacts = useContacts();
   const roster = useOrganizationRoster();
@@ -80,20 +66,22 @@ export function ContactsList() {
   // the back link) reads the remembered one, on every render.
   const tabParam = searchParams.get('tab');
   const tab: CrmTabKey = resolveCrmTab(tabParam, storedCrmTab());
-  const { list, pane } = crmTab(tab);
+  const { pane } = crmTab(tab);
+  const recordOpen = id !== undefined;
   useEffect(() => {
     if (isCrmTabKey(tabParam)) rememberCrmTab(tabParam);
   }, [tabParam]);
-  const { collapsed, toggle } = useCollapsedSections(CRM_COLLAPSED_KEY);
+  // With no record open, the URL names the tab: the strip marks it and the phone's one-pane
+  // rule reads it. Replaced, so Back never lands on the bare address again.
+  useEffect(() => {
+    if (recordOpen || tabParam === tab) return;
+    const next = new URLSearchParams(searchParams);
+    next.set('tab', tab);
+    setSearchParams(next, { replace: true });
+  }, [recordOpen, tabParam, tab, searchParams, setSearchParams]);
   const [tableFilters, setTableFilters] = useState<CrmTableFilters>(DEFAULT_CRM_TABLE_FILTERS);
-  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  const [bulkBusy, setBulkBusy] = useState(false);
-  const [bulkStatus, setBulkStatus] = useState('');
-  const [confirmDelete, setConfirmDelete] = useState(false);
   const [archivedOpen, setArchivedOpen] = useState(false);
-  const [archivingIds, setArchivingIds] = useState<ReadonlySet<string>>(new Set());
-  const setArchived = useSetArchived();
-  const selecting = selected.size > 0;
+  const { archiveOne, pending: archivingIds } = useArchiveOne();
 
   const statusLabel = useCallback((key: string) => statusByKey.get(key)?.label ?? key, [statusByKey]);
   /** An organization's name first, else the free-text business on the contact. */
@@ -103,32 +91,12 @@ export function ContactsList() {
   const matches = useCallback((c: Contact) => matchesCrmSearch(c, orgsByContact.get(c.id) ?? [], search), [orgsByContact, search]);
   const viewIds = useMemo(() => contactIdsForView(view, all, { serviceLabels, organizations }), [view, all, serviceLabels, organizations]);
   const inView = useMemo(() => all.filter((c) => (!viewIds || viewIds.has(c.id)) && matches(c)), [all, viewIds, matches]);
-  // The tab's list applies only with no view and no search, except on Tiers, which ranks
-  // active clients only and so holds its list during both.
-  const listApplies = pane === 'tiers' || (!view && search.trim() === '');
-  const indexRows = useMemo(() => (listApplies ? inView.filter((c) => statusInList(c.status, list)) : inView), [inView, listApplies, list]);
-  const sections = useMemo(() => {
-    const bucketed = bucketBySection(indexRows, statusByKey);
-    // Clients is ONE A-Z list, one-time clients included, during a search too.
-    return (list === 'clients' ? mergeClientSections(bucketed) : bucketed).filter((s) => s.rows.length > 0);
-  }, [indexRows, statusByKey, list]);
   const figures = useMemo(() => pipelineFigures(unsignedWork(all, { serviceLabels, organizations })), [all, serviceLabels, organizations]);
 
   const indexSearch = view ? `?view=${encodeURIComponent(view)}` : '';
-  const recordOpen = id !== undefined;
+  // The tier rows are the Tiers tab's whole point, so they show on a phone too (the
+  // workspace's one-pane rule); the board and the table live on wide screens only.
   const wide = useWide();
-  // The tier rows are the Tiers tab's whole point, so they show on a phone too, where only
-  // one pane fits; the board and the table live on wide screens only.
-  const paneFirst = recordOpen || pane === 'tiers';
-
-  /** A tab is a link: it closes any open record and shows that tab's pane. */
-  const goToTab = (next: CrmTabKey) => {
-    rememberCrmTab(next);
-    setSelected(new Set());
-    const params = new URLSearchParams({ tab: next });
-    if (view) params.set('view', view);
-    navigate(`${links.contacts()}?${params}`);
-  };
 
   const setView = (next: string | null) => {
     const params = new URLSearchParams(searchParams);
@@ -136,14 +104,6 @@ export function ContactsList() {
     else params.delete('view');
     setSearchParams(params, { replace: true });
   };
-
-  const toggleSelect = (contactId: string) =>
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(contactId)) next.delete(contactId);
-      else next.add(contactId);
-      return next;
-    });
 
   // ── Stage moves ─────────────────────────────────────────────────
   const update = useUpdateContact();
@@ -176,79 +136,6 @@ export function ContactsList() {
     }
   };
 
-  // ── Archive ─────────────────────────────────────────────────────
-  /** Archive or restore one contact from a row, a card or the archived dialog. */
-  const setOneArchived = async (contact: Contact, archive: boolean) => {
-    if (archivingIds.has(contact.id)) return;
-    setArchivingIds((prev) => new Set(prev).add(contact.id));
-    try {
-      await setArchived.run([contact.id], archive, contactDisplayName(contact));
-    } finally {
-      setArchivingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(contact.id);
-        return next;
-      });
-    }
-  };
-
-  // ── Bulk ────────────────────────────────────────────────────────
-  const selectedContacts = all.filter((c) => selected.has(c.id));
-
-  const applyStatus = async () => {
-    if (!bulkStatus || bulkBusy) return;
-    setBulkBusy(true);
-    try {
-      const result = await bulkUpdateStatus([...selected], bulkStatus);
-      if (result.error) {
-        toast.error(`Status changed on ${result.updated} of ${result.requested} contacts. ${result.error}`);
-        // Failures stay selected, so they can be tried again.
-        setSelected(new Set(result.failedIds));
-      } else {
-        toast.success(`Status changed on ${result.updated} of ${result.requested} contacts.`);
-        setSelected(new Set());
-        setBulkStatus('');
-      }
-    } finally {
-      setBulkBusy(false);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.contacts.all });
-    }
-  };
-
-  const archiveSelected = async () => {
-    if (bulkBusy) return;
-    setBulkBusy(true);
-    try {
-      const result = await setArchived.run([...selected], true);
-      // Failures stay selected, so they can be tried again.
-      setSelected(new Set(result.failedIds));
-    } finally {
-      setBulkBusy(false);
-    }
-  };
-
-  const deleteSelected = async () => {
-    setConfirmDelete(false);
-    setBulkBusy(true);
-    try {
-      const outcomes = await deleteContacts([...selected]);
-      const failed = outcomes.filter((o) => !o.ok);
-      const done = outcomes.length - failed.length;
-      const names = new Map(all.map((c) => [c.id, c.full_name || c.business_name || 'Unnamed contact']));
-      if (failed.length === 0) toast.success(`Deleted ${done} of ${outcomes.length} contacts.`);
-      else {
-        toast.error(`Deleted ${done} of ${outcomes.length} contacts.`, {
-          description: failed.map((f) => `${names.get(f.id)}: ${'error' in f ? f.error : ''}`).join(' '),
-        });
-      }
-      // Failures stay selected, so they can be tried again.
-      setSelected(new Set(failed.map((f) => f.id)));
-    } finally {
-      setBulkBusy(false);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.contacts.all });
-    }
-  };
-
   const exportCsv = (rows: readonly Contact[], name: string) => {
     downloadBlob(csvBlob(contactCsvRows(rows, { businessOf, statusLabel })), `${name}-${todayISODate()}.csv`);
   };
@@ -259,8 +146,8 @@ export function ContactsList() {
   // The tier rows read the board filter and the search, like the index beside them.
   const tierMatches = useCallback((c: Contact) => (!viewIds || viewIds.has(c.id)) && matches(c), [viewIds, matches]);
 
-  // The search and the board filter live atop the index. On a narrow Tiers tab the index is
-  // hidden, yet both still narrow the tier rows, so there they move atop the rows instead.
+  // The search and the board filter live atop the client panel. On a narrow Tiers tab the
+  // panel is hidden, yet both still narrow the tier rows, so there they sit atop the rows.
   const filtersOnTiers = pane === 'tiers' && !recordOpen && !wide;
   const filterBar = (
     <div className="flex flex-col gap-2 border-b border-border p-3">
@@ -268,14 +155,7 @@ export function ContactsList() {
         <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
         <Input aria-label="Search contacts" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search" className="h-8 pl-8 text-[13px]" />
       </div>
-      {view && (
-        <div className="flex items-center gap-1 text-[12px] text-muted-foreground">
-          Filtered by the board
-          <ClickRegion onClick={() => setView(null)} aria-label="Clear list filter" className="inline-flex rounded-sm p-0.5 hover:bg-muted">
-            <X className="h-3 w-3" aria-hidden="true" />
-          </ClickRegion>
-        </div>
-      )}
+      {view && <ViewFilterChip />}
     </div>
   );
 
@@ -317,149 +197,55 @@ export function ContactsList() {
     </>
   );
 
-  let indexBody: ReactNode;
-  if (contacts.isPending) indexBody = <p className="px-3 py-4 text-[13px] text-muted-foreground">Loading contacts...</p>;
-  else if (contacts.isError) {
-    indexBody = (
-      <div role="alert" className="px-3 py-4 text-[13px]">
-        <p className="font-medium">Could not load contacts.</p>
-        <p className="text-muted-foreground">{getErrorMessage(contacts.error)}</p>
-      </div>
-    );
-  } else if (all.length === 0) {
-    indexBody = <EmptyState title="No contacts yet." description="Add the first one to start the pipeline." action={<Button asChild size="sm"><Link to={links.newContact()}>Add contact</Link></Button>} />;
-  } else if (sections.length === 0) indexBody = <p className="px-3 py-4 text-[13px] text-muted-foreground">No contacts match.</p>;
-  else {
-    const filtering = !listApplies;
-    indexBody = sections.map((s) => (
-      <ContactIndexGroup
-        key={s.status}
-        section={s}
-        label={list === 'clients' && isClientLike(s.status) ? 'Clients' : statusLabel(s.status)}
-        count={s.rows.length}
-        collapsed={!filtering && !!s.collapsible && (collapsed[s.status] ?? true)}
-        onToggle={() => toggle(s.status)}
-      >
-        {s.rows.map((c) => (
-          <ContactIndexRow
-            key={c.id}
-            contact={c}
-            status={statusByKey.get(c.status)}
-            selected={selected.has(c.id)}
-            selecting={selecting}
-            onToggleSelect={toggleSelect}
-            search={indexSearch}
-            onArchive={(contact) => void setOneArchived(contact, true)}
-            archiving={archivingIds.has(c.id)}
-          />
-        ))}
-      </ContactIndexGroup>
-    ));
-  }
-
-  const selectableStatuses = (statuses.data ?? []).filter((s) => !isSystemStatus(s.key));
-
   return (
     <>
       <PageHeader title="Contacts" subtitle={contacts.data ? `${all.length} contacts` : undefined} actions={headerActions} />
-      <Tabs value={tab} onValueChange={(v) => isCrmTabKey(v) && goToTab(v)} className="shrink-0 px-3">
-        <PageTabsList aria-label="Contact lists">
-          {CRM_TABS.map((t) => (
-            <PageTabsTrigger key={t.key} value={t.key}>
-              {t.label}
-            </PageTabsTrigger>
-          ))}
-        </PageTabsList>
-      </Tabs>
-      <div className="flex h-full min-h-0 flex-1">
-        <div className={cn('relative flex min-h-0 shrink-0 flex-col border-r border-border', 'w-full lg:w-[300px]', paneFirst && 'max-lg:hidden')}>
-          {!filtersOnTiers && filterBar}
-          <ScrollArea className="min-h-0 flex-1" fitWidth>
-            <div className={cn('pb-3', selecting && 'pb-36')}>{indexBody}</div>
-          </ScrollArea>
-          {selecting && (
-            <div role="region" aria-label="Selected contacts" className="absolute inset-x-2 bottom-2 flex flex-col gap-2 rounded-lg border border-border bg-popover p-2.5 text-[13px] shadow-lg">
-              <div className="flex items-center justify-between">
-                <span className="font-medium">{selected.size} selected</span>
-                <Button type="button" size="xs" variant="ghost" onClick={() => setSelected(new Set())}>Clear</Button>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <Select value={bulkStatus} onValueChange={setBulkStatus}>
-                  <SelectTrigger aria-label="New status" className="h-7 min-w-0 flex-1 text-[12px]"><SelectValue placeholder="Change status" /></SelectTrigger>
-                  <SelectContent>
-                    {selectableStatuses.map((s) => <SelectItem key={s.key} value={s.key}>{s.label}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-                <Button type="button" size="xs" disabled={!bulkStatus || bulkBusy} onClick={() => void applyStatus()}>Apply status</Button>
-              </div>
-              <div className="flex items-center gap-1.5">
-                {bulkBusy ? (
-                  <Button type="button" size="xs" variant="outline" disabled>Email them</Button>
-                ) : (
-                  <Button asChild size="xs" variant="outline">
-                    <Link to={links.newGroupEmail([...selected])}>Email them</Link>
-                  </Button>
-                )}
-                <Button type="button" size="xs" variant="outline" disabled={bulkBusy} onClick={() => exportCsv(selectedContacts, 'contacts-selected')}>
-                  Export CSV
-                </Button>
-                <Button type="button" size="xs" variant="outline" disabled={bulkBusy} onClick={() => void archiveSelected()}>
-                  Archive
-                </Button>
-                <Button type="button" size="xs" variant="outline" className="text-destructive" disabled={bulkBusy} onClick={() => setConfirmDelete(true)}>
-                  Delete
-                </Button>
+      <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+        {recordOpen ? (
+          <Outlet key={id} />
+        ) : pane === 'tiers' ? (
+          contacts.isPending ? (
+            <p className="p-5 text-[13px] text-muted-foreground">Loading contacts...</p>
+          ) : (
+            <div className="flex h-full min-h-0 flex-col">
+              {filtersOnTiers && filterBar}
+              <div className="min-h-0 flex-1">
+                <TierBoard
+                  contacts={all}
+                  matches={tierMatches}
+                  onSaveTier={saveTier}
+                  onOpen={(contactId) => navigate(`${links.contact(contactId)}${indexSearch}`)}
+                />
               </div>
             </div>
-          )}
-        </div>
-        <div className={cn('min-h-0 min-w-0 flex-1', !paneFirst && 'max-lg:hidden')}>
-          {recordOpen ? (
-            <Outlet key={id} />
-          ) : pane === 'tiers' ? (
-            contacts.isPending ? (
-              <p className="p-5 text-[13px] text-muted-foreground">Loading contacts...</p>
-            ) : (
-              <div className="flex h-full min-h-0 flex-col">
-                {filtersOnTiers && filterBar}
-                <div className="min-h-0 flex-1">
-                  <TierBoard
-                    contacts={all}
-                    matches={tierMatches}
-                    onSaveTier={saveTier}
-                    onOpen={(contactId) => navigate(`${links.contact(contactId)}${indexSearch}`)}
-                  />
-                </div>
-              </div>
-            )
-          ) : !wide ? null : showTable ? (
-            <CrmTable
-              contacts={inView}
-              total={all.length}
-              filters={tableFilters}
-              onFilters={setTableFilters}
-              statuses={statuses.data ?? []}
-              businessOf={businessOf}
-              today={today}
-            />
-          ) : (
-            <CrmBoard
-              contacts={all}
-              organizations={organizations}
-              serviceLabels={serviceLabels}
-              statusByKey={statusByKey}
-              search={search}
-              onSearch={setSearch}
-              matches={matches}
-              view={view}
-              onView={setView}
-              loading={contacts.isPending}
-              onMoveStage={moveStage}
-              onArchive={(contact) => setOneArchived(contact, true)}
-              archivingIds={archivingIds}
-            />
-          )}
-        </div>
+          )
+        ) : !wide ? null : showTable ? (
+          <CrmTable
+            contacts={inView}
+            total={all.length}
+            filters={tableFilters}
+            onFilters={setTableFilters}
+            statuses={statuses.data ?? []}
+            businessOf={businessOf}
+            today={today}
+          />
+        ) : (
+          <CrmBoard
+            contacts={all}
+            organizations={organizations}
+            serviceLabels={serviceLabels}
+            statusByKey={statusByKey}
+            search={search}
+            onSearch={setSearch}
+            matches={matches}
+            view={view}
+            onView={setView}
+            loading={contacts.isPending}
+            onMoveStage={moveStage}
+            onArchive={(contact) => archiveOne(contact, true)}
+            archivingIds={archivingIds}
+          />
+        )}
       </div>
 
       <ArchivedPeopleDialog
@@ -468,26 +254,9 @@ export function ContactsList() {
         contacts={archived}
         organizationsOf={(contactId) => orgsByContact.get(contactId) ?? []}
         statusLabel={statusLabel}
-        onRestore={(contact) => void setOneArchived(contact, false)}
+        onRestore={(contact) => void archiveOne(contact, false)}
         restoringIds={archivingIds}
       />
-
-      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete {selected.size} contacts?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Each contact is deleted with everything recorded on it. This cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction className="bg-destructive text-destructive-foreground hover:bg-destructive/90" onClick={() => void deleteSelected()}>
-              Delete contacts
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </>
   );
 }

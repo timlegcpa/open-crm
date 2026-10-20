@@ -10,4 +10,6 @@ export const crmKeys = {
   organizations: (contactId: string) => [...queryKeys.contacts.all, 'organizations', contactId] as const,
   upsells: (contactId: string) => [...queryKeys.contacts.all, 'upsells', contactId] as const,
   activity: (contactId: string) => [...queryKeys.contacts.all, 'activity', contactId] as const,
+  /** A head-only count of working contacts in these statuses (the bottom bar's figures). */
+  count: (statuses: readonly string[]) => [...queryKeys.contacts.all, 'count', ...statuses] as const,
 };

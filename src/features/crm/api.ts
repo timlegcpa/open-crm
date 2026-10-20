@@ -357,3 +357,20 @@ export async function auditContactCreate(contactId: string): Promise<void> {
     console.warn('Audit row contact_create was not written', err);
   }
 }
+
+// ── Counts ──────────────────────────────────────────────────────
+
+/**
+ * How many working (not archived) contacts hold one of `statuses`: a head-only count, so no
+ * row leaves the database. The shell's bottom bar reads it on every owner page, where the
+ * whole contact list would be far too much to load for two numbers.
+ */
+export async function countContacts(statuses: readonly string[]): Promise<number> {
+  const { count, error } = await getSupabase()
+    .from('contacts')
+    .select('id', { count: 'exact', head: true })
+    .is('archived_at', null)
+    .in('status', [...statuses]);
+  if (error) throw error;
+  return count ?? 0;
+}

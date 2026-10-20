@@ -20,13 +20,17 @@ import {
   type FeatureManifest,
   type LazyComponent,
   type NavSectionKey,
+  type NewMenuItem,
   type OwnerNavItem,
   type OwnerRouteHandle,
   type PortalHomeCard,
   type PortalProfileSection,
   type PortalTab,
   type SettingsSection,
+  type ShellCount,
   type ShellProps,
+  type WorkspaceRouteHandle,
+  type WorkspaceTab,
 } from '@/features/types';
 
 /**
@@ -62,10 +66,30 @@ function collect<T>(pick: (feature: FeatureManifest) => readonly T[] | undefined
   return FEATURES.flatMap((feature) => pick(feature) ?? []);
 }
 
-/** Sidebar items, in order (group them with navGroups). */
+/** Rail items, in order (group them with navGroups). */
 export const ownerNav: OwnerNavItem[] = collect((f) => f.ownerNav).sort(byOrderThenLabel);
-/** Owner routes inside the shell. */
+/** Owner routes inside the shell, outside the workspace. */
 export const ownerRoutes: RouteObject[] = collect((f) => f.ownerRoutes);
+/** Owner routes inside the workspace (the client panel and the tab strip), inside the shell. */
+export const workspaceRoutes: RouteObject[] = collect((f) => f.workspaceRoutes);
+/**
+ * The workspace's layout route: a pathless parent of every workspace screen. OwnerApp gives
+ * it the layout's element; the helpers below match against it, so routing and the shell can
+ * never disagree about which screen is a workspace one.
+ */
+export const WORKSPACE_LAYOUT: RouteObject = { children: workspaceRoutes };
+/**
+ * Every owner route inside the shell, as the router sees them: the shell's own routes and
+ * the workspace's under its layout. Matched as ONE tree, so a literal path wins over a
+ * pattern across the two lists ('contacts/new' over the workspace's 'contacts/:id').
+ */
+export const ownerRouteTree: RouteObject[] = [...ownerRoutes, WORKSPACE_LAYOUT];
+/** The workspace's tab strip, in order. */
+export const workspaceTabs: WorkspaceTab[] = collect((f) => f.workspaceTabs).sort(byOrderThenLabel);
+/** The bottom bar's figures, in order (the bar draws `waiting` before `total`). */
+export const shellCounts: ShellCount[] = collect((f) => f.shellCounts).sort(byOrderThenLabel);
+/** The New menu's entries, in order. */
+export const newMenu: NewMenuItem[] = collect((f) => f.newMenu).sort(byOrderThenLabel);
 /** Owner routes without the shell. */
 export const ownerStandaloneRoutes: RouteObject[] = collect((f) => f.ownerStandaloneRoutes);
 /** Portal tabs, in order. */
@@ -98,7 +122,7 @@ export interface NavGroup {
   items: OwnerNavItem[];
 }
 
-/** The sidebar's groups in display order: unsectioned items first, then NAV_SECTIONS; empty groups left out. */
+/** The rail's groups in display order: unsectioned items first, then NAV_SECTIONS; empty groups left out. */
 export function navGroups(items: readonly OwnerNavItem[] = ownerNav): NavGroup[] {
   const groups: NavGroup[] = [
     { key: null, label: null, items: items.filter((item) => !item.section) },
@@ -108,6 +132,46 @@ export function navGroups(items: readonly OwnerNavItem[] = ownerNav): NavGroup[]
 }
 
 /** True when the owner route matching `pathname` opts into a bounded page (`handle: BOUNDED_PAGE`). */
-export function isBoundedPage(pathname: string, routes: RouteObject[] = ownerRoutes): boolean {
+export function isBoundedPage(pathname: string, routes: RouteObject[] = ownerRouteTree): boolean {
   return (matchRoutes(routes, pathname) ?? []).some((m) => (m.route.handle as OwnerRouteHandle | undefined)?.bounded === true);
+}
+
+/** True when `pathname` is a workspace screen (the client panel and the tab strip around it). */
+export function isWorkspacePage(pathname: string, routes: RouteObject[] = ownerRouteTree, layout: RouteObject = WORKSPACE_LAYOUT): boolean {
+  return (matchRoutes(routes, pathname) ?? []).some((m) => m.route === layout);
+}
+
+/** The handle of the deepest route matching `pathname` that sets one, or an empty one. */
+export function workspaceHandle(pathname: string, routes: RouteObject[] = ownerRouteTree): WorkspaceRouteHandle {
+  const matches = matchRoutes(routes, pathname) ?? [];
+  for (let i = matches.length - 1; i >= 0; i -= 1) {
+    const handle = matches[i].route.handle as WorkspaceRouteHandle | undefined;
+    if (handle) return handle;
+  }
+  return {};
+}
+
+function cleanPath(path: string): string {
+  return path.replace(/\/+$/, '').toLowerCase() || '/';
+}
+
+/**
+ * Whether a workspace tab is on: the URL is at or under the tab's path (matched without
+ * regard to case, as the router does, and to a trailing slash) and carries every query
+ * parameter the tab's path names, with the same value.
+ */
+export function isTabOn(tab: Pick<WorkspaceTab, 'path'>, pathname: string, search: URLSearchParams): boolean {
+  const [path, query = ''] = tab.path.split('?');
+  const want = cleanPath(path);
+  const here = cleanPath(pathname);
+  if (here !== want && !here.startsWith(`${want}/`)) return false;
+  for (const [key, value] of new URLSearchParams(query)) {
+    if (search.get(key) !== value) return false;
+  }
+  return true;
+}
+
+/** The strip's tab for a URL, or null when none is on (an open record, the documents page). */
+export function activeWorkspaceTab(pathname: string, search: URLSearchParams, tabs: readonly WorkspaceTab[] = workspaceTabs): WorkspaceTab | null {
+  return tabs.find((tab) => isTabOn(tab, pathname, search)) ?? null;
 }

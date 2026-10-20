@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { NavLink } from 'react-router-dom';
+import { Link, NavLink } from 'react-router-dom';
 import { Archive, ChevronRight } from 'lucide-react';
 import type { Contact } from '@/api/contacts';
 import type { ContactStatus } from '@/api/pickLists';
@@ -10,6 +10,8 @@ import { initialsOf } from '@/components/ui/monogram';
 import { links } from '@/features/links';
 import { cn } from '@/lib/utils';
 import { contactRowName, type CrmSection } from '../lib/sections';
+
+const NAME_LINK = 'min-w-0 flex-1 truncate rounded-sm text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring';
 
 /**
  * One 44px index row: the monogram tinted by status, swapped for a checkbox on hover (and
@@ -24,6 +26,8 @@ export function ContactIndexRow({
   selecting,
   onToggleSelect,
   search,
+  to,
+  current,
   onArchive,
   archiving = false,
 }: {
@@ -35,6 +39,10 @@ export function ContactIndexRow({
   onToggleSelect: (id: string) => void;
   /** Carried into the record link so the index keeps its query. */
   search: string;
+  /** Where the name links instead of the record (the documents page picks a contact in place). */
+  to?: string;
+  /** With `to`: this row is the contact on screen. */
+  current?: boolean;
   /** Archive this contact; absent hides the action. */
   onArchive?: (contact: Contact) => void;
   /** An archive for this contact is saving. */
@@ -54,14 +62,19 @@ export function ContactIndexRow({
           className={cn('relative', !(selecting || selected) && 'opacity-0 focus-visible:opacity-100 group-hover:opacity-100')}
         />
       </span>
-      <NavLink
-        to={`${links.contact(contact.id)}${search}`}
-        className={({ isActive }) =>
-          cn('min-w-0 flex-1 truncate rounded-sm text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring', isActive ? 'font-semibold' : 'text-foreground')
-        }
-      >
-        {name}
-      </NavLink>
+      {to ? (
+        <Link
+          to={to}
+          aria-current={current ? 'page' : undefined}
+          className={cn(NAME_LINK, current ? 'font-semibold' : 'text-foreground')}
+        >
+          {name}
+        </Link>
+      ) : (
+        <NavLink to={`${links.contact(contact.id)}${search}`} className={({ isActive }) => cn(NAME_LINK, isActive ? 'font-semibold' : 'text-foreground')}>
+          {name}
+        </NavLink>
+      )}
       {onArchive && (
         <ClickRegion
           aria-label={`Archive ${name}`}

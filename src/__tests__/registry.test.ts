@@ -21,13 +21,18 @@ vi.mock('pdfjs-dist', () => {
 import { PUBLIC_PATHS, links } from '@/features/links';
 import {
   FEATURES,
+  activeWorkspaceTab,
   contactActivityCards,
   contactHeaderActions,
   contactSidePanels,
   contactTabs,
   isBoundedPage,
+  isTabOn,
+  isWorkspacePage,
   navGroups,
+  newMenu,
   ownerNav,
+  ownerRouteTree,
   ownerRoutes,
   ownerStandaloneRoutes,
   portalHomeCards,
@@ -36,8 +41,12 @@ import {
   portalTabs,
   publicRoutes,
   settingsSections,
+  shellCounts,
+  workspaceHandle,
+  workspaceRoutes,
+  workspaceTabs,
 } from '@/features/registry';
-import { BOUNDED_PAGE, NAV_SECTIONS, type OwnerNavItem } from '@/features/types';
+import { BOUNDED_PAGE, NAV_SECTIONS, type OwnerNavItem, type WorkspaceRouteHandle } from '@/features/types';
 
 const FEATURES_DIR = path.resolve(__dirname, '..', 'features');
 const DOMAINS = ['board', 'crm', 'documents', 'email', 'esign', 'marketing', 'mcp', 'messages', 'ops', 'portal', 'requests', 'settings'];
@@ -60,6 +69,7 @@ const opens = (routes: RouteObject[], url: string) => matchRoutes(routes, url.sp
 
 const ROUTE_LISTS: Record<string, RouteObject[]> = {
   ownerRoutes,
+  workspaceRoutes,
   ownerStandaloneRoutes,
   portalRoutes,
   publicRoutes,
@@ -102,7 +112,7 @@ describe('feature registry', () => {
   it('every nav item and portal tab opens a registered screen', () => {
     for (const item of ownerNav) {
       expect(item.path.startsWith('/'), item.path).toBe(true);
-      expect(opens(ownerRoutes, item.path), `nav ${item.label} -> ${item.path}`).toBe(true);
+      expect(opens(ownerRouteTree, item.path), `nav ${item.label} -> ${item.path}`).toBe(true);
     }
     for (const tab of portalTabs) {
       expect(tab.path === '/portal' || tab.path.startsWith('/portal/'), tab.path).toBe(true);
@@ -121,7 +131,10 @@ describe('feature registry', () => {
     expect(dupes(settingsSections.map((s) => s.key))).toEqual([]);
     expect(dupes(portalHomeCards.map((c) => c.key))).toEqual([]);
     expect(dupes(portalProfileSections.map((s) => s.key))).toEqual([]);
-    expect(dupes([...flatten(ownerRoutes), ...flatten(ownerStandaloneRoutes)].map((r) => r.full))).toEqual([]);
+    expect(dupes(workspaceTabs.map((t) => t.key))).toEqual([]);
+    expect(dupes(shellCounts.map((c) => c.key))).toEqual([]);
+    expect(dupes(newMenu.map((n) => n.key))).toEqual([]);
+    expect(dupes([...flatten(ownerRoutes), ...flatten(workspaceRoutes), ...flatten(ownerStandaloneRoutes)].map((r) => r.full))).toEqual([]);
     expect(dupes(flatten(portalRoutes).map((r) => r.full))).toEqual([]);
     expect(dupes(flatten(publicRoutes).map((r) => r.full))).toEqual([]);
   });
@@ -173,7 +186,7 @@ describe('feature registry', () => {
     for (const [name, list] of Object.entries(cases)) {
       for (const { args, audience } of list) {
         const url = (links[name as keyof typeof links] as (...a: unknown[]) => string)(...args);
-        const tree = audience === 'owner' ? ownerRoutes : audience === 'portal' ? portalTree : publicRoutes;
+        const tree = audience === 'owner' ? ownerRouteTree : audience === 'portal' ? portalTree : publicRoutes;
         expect(opens(tree, url), `links.${name}(${args.map((a) => JSON.stringify(a)).join(', ')}) = ${url}`).toBe(true);
         if (audience !== 'public') expect(opens(publicRoutes, url), `${url} is shadowed by a public route`).toBe(false);
       }
@@ -199,6 +212,7 @@ describe('feature registry', () => {
   it('no public route shadows a signed-in screen', () => {
     const signedIn = [
       ...flatten(ownerRoutes).map((r) => r.full),
+      ...flatten(workspaceRoutes).map((r) => r.full),
       ...flatten(ownerStandaloneRoutes).map((r) => r.full),
       ...flatten(portalTree).map((r) => r.full),
     ];
@@ -218,6 +232,9 @@ describe('feature registry', () => {
     expect(sorted(settingsSections)).toBe(true);
     expect(sorted(portalHomeCards)).toBe(true);
     expect(sorted(portalProfileSections)).toBe(true);
+    expect(sorted(workspaceTabs)).toBe(true);
+    expect(sorted(shellCounts)).toBe(true);
+    expect(sorted(newMenu)).toBe(true);
   });
 
   it('a contact tab key never collides with the record route it sits under', () => {
@@ -239,6 +256,14 @@ describe('feature registry', () => {
     for (const { route, full } of flatten(ownerRoutes)) {
       if (route.handle !== undefined) expect(route.handle, full).toEqual(BOUNDED_PAGE);
     }
+    // A workspace route may add the workspace's two fields, and only those.
+    for (const { route, full } of flatten(workspaceRoutes)) {
+      if (route.handle === undefined) continue;
+      const { panelFirst, pickParam, ...rest } = route.handle as WorkspaceRouteHandle;
+      expect(rest, full).toEqual(BOUNDED_PAGE);
+      if (panelFirst !== undefined) expect(typeof panelFirst, full).toBe('function');
+      if (pickParam !== undefined) expect(pickParam, full).toMatch(/^[a-z]+$/);
+    }
   });
 
   it('groups the nav: unsectioned items first, then the sections in order, empty ones left out', () => {
@@ -254,5 +279,70 @@ describe('feature registry', () => {
       { key: null, label: null, items: [item('a')] },
       { key: 'system', label: 'System', items: [item('b', 'system')] },
     ]);
+  });
+
+  it('matches the shell and the workspace as ONE tree, so a literal path beats a workspace pattern', () => {
+    expect(isWorkspacePage('/contacts')).toBe(true);
+    expect(isWorkspacePage('/contacts/abc')).toBe(true);
+    expect(isWorkspacePage('/contacts/abc/requests')).toBe(true);
+    // The intake is the shell's own page, not the workspace's 'contacts/:id'.
+    expect(isWorkspacePage('/contacts/new')).toBe(false);
+    expect(isWorkspacePage('/documents')).toBe(true);
+    expect(isWorkspacePage('/documents/abc')).toBe(false);
+    expect(isWorkspacePage('/esign/new')).toBe(false);
+    expect(isWorkspacePage('/settings')).toBe(false);
+    // Every workspace screen is bounded by the workspace; the intake is not bounded at all.
+    expect(isBoundedPage('/contacts/new')).toBe(false);
+  });
+
+  it('reads the deepest handle: the documents pick and the phone rule', () => {
+    expect(workspaceHandle('/documents').pickParam).toBe('contact');
+    expect(workspaceHandle('/documents').panelFirst?.(new URLSearchParams())).toBe(true);
+    expect(workspaceHandle('/documents').panelFirst?.(new URLSearchParams('contact=c-1'))).toBe(false);
+    expect(workspaceHandle('/contacts').panelFirst?.(new URLSearchParams('tab=pipeline'))).toBe(true);
+    expect(workspaceHandle('/contacts').panelFirst?.(new URLSearchParams('tab=tiers'))).toBe(false);
+    // An open record is the screen: its own handle carries no phone rule.
+    expect(workspaceHandle('/contacts/abc').panelFirst).toBeUndefined();
+    expect(workspaceHandle('/requests')).toEqual({});
+  });
+
+  it('every workspace tab opens a workspace screen, and a tab is on under its path with its query', () => {
+    for (const tab of workspaceTabs) {
+      expect(tab.path.startsWith('/'), tab.path).toBe(true);
+      expect(isWorkspacePage(tab.path.split('?')[0]), `tab ${tab.label} -> ${tab.path}`).toBe(true);
+      expect(activeWorkspaceTab(tab.path.split('?')[0], new URLSearchParams(tab.path.split('?')[1] ?? ''))?.key, tab.path).toBe(tab.key);
+    }
+    const tiers = { path: '/contacts?tab=tiers' };
+    expect(isTabOn(tiers, '/contacts', new URLSearchParams('tab=tiers&view=x'))).toBe(true);
+    expect(isTabOn(tiers, '/Contacts/', new URLSearchParams('tab=tiers'))).toBe(true);
+    expect(isTabOn(tiers, '/contacts', new URLSearchParams('tab=pipeline'))).toBe(false);
+    expect(isTabOn(tiers, '/contacts', new URLSearchParams())).toBe(false);
+    expect(isTabOn({ path: '/board' }, '/board/b-1', new URLSearchParams())).toBe(true);
+    expect(isTabOn({ path: '/board' }, '/boardroom', new URLSearchParams())).toBe(false);
+    // An open record, and the documents page, light no tab.
+    expect(activeWorkspaceTab('/contacts/abc', new URLSearchParams())).toBeNull();
+    expect(activeWorkspaceTab('/documents', new URLSearchParams())).toBeNull();
+  });
+
+  it('the rail holds the doors, and the screens that are only workspace tabs left it', () => {
+    // Contacts is the workspace's door; Documents and E-sign keep a door because they have
+    // screens of their own outside the workspace (the workstation, the composer).
+    expect(ownerNav.filter((item) => item.workspace).map((i) => i.path)).toEqual(['/contacts']);
+    const tabOnly = ['/board', '/requests', '/messages', '/marketing'];
+    expect(tabOnly.every((path) => workspaceTabs.some((t) => t.path === path))).toBe(true);
+    expect(ownerNav.filter((item) => tabOnly.includes(item.path)).map((i) => i.path)).toEqual([]);
+  });
+
+  it('every bottom-bar figure and New-menu entry leads somewhere real', () => {
+    for (const count of shellCounts) {
+      expect(opens(ownerRouteTree, count.path), `count ${count.label} -> ${count.path}`).toBe(true);
+      expect(['waiting', 'total']).toContain(count.kind);
+    }
+    for (const item of newMenu) {
+      // Exactly one of a create screen and a dialog.
+      expect(Number(item.path !== undefined) + Number(item.Dialog !== undefined), item.key).toBe(1);
+      if (item.path) expect(opens(ownerRouteTree, item.path), `new ${item.label} -> ${item.path}`).toBe(true);
+    }
+    expect(newMenu.map((n) => n.label)).toEqual(['Contact', 'Work item', 'Request', 'E-sign envelope']);
   });
 });

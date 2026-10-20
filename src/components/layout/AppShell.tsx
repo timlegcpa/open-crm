@@ -1,36 +1,60 @@
-import { Suspense, useId, useState } from 'react';
-import { Link, NavLink, Outlet, matchPath, useLocation } from 'react-router-dom';
-import { ChevronDown, Menu, Moon, Sun } from 'lucide-react';
+import { Fragment, Suspense, useId, useState } from 'react';
+import { Link, Outlet, matchPath, useLocation } from 'react-router-dom';
+import { ChevronDown, LogOut, Menu, Moon, Settings, Sun } from 'lucide-react';
+import { BottomBar } from '@/components/layout/BottomBar';
+import { NewMenu } from '@/components/layout/NewMenu';
+import { PAGE } from '@/components/layout/page';
+import { RailSearch } from '@/components/layout/RailSearch';
+import { TOPBAR_SLOT_ID } from '@/components/layout/topbarSlot';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Monogram, initialsOf } from '@/components/ui/monogram';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
-import { PAGE } from '@/components/layout/page';
-import { TOPBAR_SLOT_ID } from '@/components/layout/topbarSlot';
-import { isBoundedPage, navGroups, type NavGroup } from '@/features/registry';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { links } from '@/features/links';
+import { isBoundedPage, isWorkspacePage, navGroups, ownerNav, type NavGroup } from '@/features/registry';
 import type { OwnerNavItem, ShellProps } from '@/features/types';
 import { ThemeContext, useTheme, type ThemeControls } from '@/hooks/useTheme';
 import { safeStorage, storageKey } from '@/lib/storage';
 import { cn } from '@/lib/utils';
 
 /**
- * The owner shell: a 208px rail (the organization at the top, the registry's nav grouped by
- * section, light/dark and the account at the foot) beside the content, which scrolls with
- * the document. Below `md` the rail becomes a drawer opened from the top bar.
+ * The owner shell, in four zones: a permanent icon rail on the left (the organization, New,
+ * search, the registry's nav with each count on its icon's corner, light/dark and the
+ * account at the foot), the top bar, the content, and a bottom bar pinned to the window's
+ * foot with the figures the features count. Below `md` the rail becomes a labelled drawer
+ * opened from the top bar, and the bottom bar is not drawn.
  *
  * The top bar is a SLOT, not a component pages call: PageHeader portals a page's title and
- * actions into it. On desktop the bar hides while the slot is empty (a page that draws its
- * own full-height layout); on a phone it always shows, because it carries the menu button.
- * Pin something under the bar with `top-[var(--topbar-h)]`.
+ * actions into it. On desktop the bar hides while the slot is empty; on a phone it always
+ * shows, because it carries the menu button. Pin something under the bar with
+ * `top-[var(--topbar-h)]`.
  *
- * A route with `handle: BOUNDED_PAGE` gets a bounded page instead: the content area is
- * exactly the window below the top bar and never scrolls itself, so the page (a board) can
- * give each of its areas its own ScrollArea. The page's root should be `h-full min-h-0`.
+ * A workspace screen (the registry's `workspaceRoutes`) draws its own top: the tab strip is
+ * the top row and the page's header sits under it, so there the shell draws no slot at all
+ * (one id, one element) and, on desktop, no bar (`--topbar-h` is 0).
+ *
+ * A route with `handle: BOUNDED_PAGE`, and every workspace screen, gets a bounded page
+ * instead: the content area is exactly the window between the bars and never scrolls
+ * itself, so the page can give each of its areas its own ScrollArea. Otherwise the page
+ * scrolls with the document and the bottom bar sticks to the window's foot.
  */
 
-/** One nav row: 32px, 13px label, 18px icon at a light stroke. */
+/** One drawer row: 32px, 13px label, 18px icon at a light stroke. */
 const NAV_ROW =
   'flex h-8 min-w-0 items-center gap-2.5 rounded-md px-2.5 text-[13px] [&>svg]:size-[18px] [&>svg]:shrink-0 [&>svg]:stroke-[1.75]';
+
+/** One rail button: a 36px square around an 18px icon. */
+const RAIL_BUTTON =
+  'relative flex size-9 items-center justify-center rounded-md text-sidebar-foreground/80 outline-none hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring [&>svg]:size-[18px] [&>svg]:stroke-[1.75]';
 
 const COLLAPSED_KEY = storageKey('nav', 'collapsed');
 
@@ -38,7 +62,7 @@ function isStringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string');
 }
 
-/** Which section headings the owner has folded, remembered in this browser. */
+/** Which section headings the owner has folded in the drawer, remembered in this browser. */
 function useCollapsedSections() {
   const [collapsed, setCollapsed] = useState<string[]>(() => safeStorage.getJson(COLLAPSED_KEY, isStringList) ?? []);
   const toggle = (key: string) => {
@@ -49,44 +73,59 @@ function useCollapsedSections() {
   return { collapsed, toggle };
 }
 
-function isOn(pathname: string, item: OwnerNavItem): boolean {
+function matches(pathname: string, item: OwnerNavItem): boolean {
   return matchPath({ path: item.path, end: item.end ?? false }, pathname) !== null;
 }
 
-function NavRow({ item, onNavigate }: { item: OwnerNavItem; onNavigate?: () => void }) {
-  const { label, icon: Icon, path, end, badge: Badge } = item;
+/**
+ * Whether a nav item is the page you are on: its own path, or, for the workspace's item,
+ * any workspace screen no other item claims (the board, requests, messages...).
+ */
+export function isNavItemOn(pathname: string, item: OwnerNavItem, items: readonly OwnerNavItem[] = ownerNav): boolean {
+  if (matches(pathname, item)) return true;
+  return !!item.workspace && isWorkspacePage(pathname) && !items.some((other) => other !== item && matches(pathname, other));
+}
+
+/** A nav item's live count. The count names itself (CountBadge's `title`). */
+function NavBadge({ item, className }: { item: OwnerNavItem; className: string }) {
+  const Badge = item.badge;
+  if (!Badge) return null;
+  return (
+    <span className={cn('pointer-events-none absolute flex', className)}>
+      <Suspense fallback={null}>
+        <Badge />
+      </Suspense>
+    </span>
+  );
+}
+
+function DrawerRow({ item, onNavigate }: { item: OwnerNavItem; onNavigate?: () => void }) {
+  const { pathname } = useLocation();
+  const on = isNavItemOn(pathname, item);
+  const { label, icon: Icon, path } = item;
   return (
     <li className="relative">
-      <NavLink
+      <Link
         to={path}
-        end={end}
         onClick={onNavigate}
-        className={({ isActive }) =>
-          cn(
-            NAV_ROW,
-            'text-sidebar-foreground hover:bg-sidebar-accent',
-            Badge && 'pr-9',
-            isActive && 'bg-sidebar-accent font-medium text-sidebar-accent-foreground',
-          )
-        }
+        aria-current={on ? 'page' : undefined}
+        className={cn(
+          NAV_ROW,
+          'text-sidebar-foreground hover:bg-sidebar-accent',
+          item.badge && 'pr-9',
+          on && 'bg-sidebar-accent font-medium text-sidebar-accent-foreground',
+        )}
       >
         <Icon aria-hidden="true" />
         <span className="truncate">{label}</span>
-      </NavLink>
-      {Badge && (
-        // Beside the link, not inside it, so the link's name stays its label. The count
-        // names itself (CountBadge's `title`).
-        <span className="pointer-events-none absolute right-2 top-1/2 flex -translate-y-1/2">
-          <Suspense fallback={null}>
-            <Badge />
-          </Suspense>
-        </span>
-      )}
+      </Link>
+      {/* Beside the link, not inside it, so the link's name stays its label. */}
+      <NavBadge item={item} className="right-2 top-1/2 -translate-y-1/2" />
     </li>
   );
 }
 
-function SidebarNav({ groups, onNavigate }: { groups: NavGroup[]; onNavigate?: () => void }) {
+function DrawerNav({ groups, onNavigate }: { groups: NavGroup[]; onNavigate?: () => void }) {
   const { pathname } = useLocation();
   const { collapsed, toggle } = useCollapsedSections();
   const idBase = useId();
@@ -96,7 +135,7 @@ function SidebarNav({ groups, onNavigate }: { groups: NavGroup[]; onNavigate?: (
       {groups.map((group) => {
         // A folded section that holds the page you are on would hide the highlighted row,
         // so it stays open; the stored preference is untouched.
-        const holdsActive = group.items.some((item) => isOn(pathname, item));
+        const holdsActive = group.items.some((item) => isNavItemOn(pathname, item));
         const folded = group.key !== null && !holdsActive && collapsed.includes(group.key);
         const listId = `${idBase}-${group.key ?? 'top'}`;
         return (
@@ -115,7 +154,7 @@ function SidebarNav({ groups, onNavigate }: { groups: NavGroup[]; onNavigate?: (
             )}
             <ul id={listId} hidden={folded} className="flex flex-col gap-0.5">
               {group.items.map((item) => (
-                <NavRow key={item.path} item={item} onNavigate={onNavigate} />
+                <DrawerRow key={item.path} item={item} onNavigate={onNavigate} />
               ))}
             </ul>
           </div>
@@ -125,25 +164,21 @@ function SidebarNav({ groups, onNavigate }: { groups: NavGroup[]; onNavigate?: (
   );
 }
 
-/** The rail's contents, shared by the desktop rail and the phone drawer. */
-function SidebarBody({
-  orgName,
-  email,
-  onSignOut,
-  theme,
-  drawer = false,
-  onNavigate,
-}: ShellProps & { theme: ThemeControls; drawer?: boolean; onNavigate?: () => void }) {
+/** The phone drawer's contents: the organization, New, the labelled nav, light/dark, the account. */
+function DrawerBody({ orgName, email, onSignOut, theme, onNavigate }: ShellProps & { theme: ThemeControls; onNavigate: () => void }) {
   const name = orgName ?? 'Open CRM';
   return (
     <div className="flex h-full min-h-0 flex-col bg-sidebar text-sidebar-foreground">
-      {/* In the drawer, room on the right for the drawer's close button. */}
-      <Link to="/" onClick={onNavigate} className={cn('flex h-14 shrink-0 items-center gap-2 px-3', drawer && 'pr-10')}>
+      {/* Room on the right for the drawer's close button. */}
+      <Link to="/" onClick={onNavigate} className="flex h-14 shrink-0 items-center gap-2 px-3 pr-10">
         <Monogram initials={initialsOf(name)} size="md" className="rounded-md" />
         <span className="min-w-0 truncate text-[13px] font-semibold">{name}</span>
       </Link>
+      <div className="shrink-0 px-2 pb-1">
+        <NewMenu />
+      </div>
       <ScrollArea fitWidth className="min-h-0 flex-1">
-        <SidebarNav groups={navGroups()} onNavigate={onNavigate} />
+        <DrawerNav groups={navGroups()} onNavigate={onNavigate} />
       </ScrollArea>
       <div className="flex shrink-0 flex-col gap-1 border-t border-sidebar-border p-2">
         {/* Labelled by what a click does. */}
@@ -157,9 +192,7 @@ function SidebarBody({
         </button>
         <div className="flex items-center gap-2 px-2 py-1">
           <Monogram initials={initialsOf(email)} size="sm" />
-          <span className="min-w-0 flex-1 text-[11px] leading-4 text-muted-foreground [overflow-wrap:anywhere]">
-            Signed in as {email}.
-          </span>
+          <span className="min-w-0 flex-1 text-[11px] leading-4 text-muted-foreground [overflow-wrap:anywhere]">Signed in as {email}.</span>
         </div>
         <Button variant="outline" size="xs" className="w-full" onClick={onSignOut}>
           Sign out
@@ -169,68 +202,158 @@ function SidebarBody({
   );
 }
 
+/** One rail icon: a link named by its label, the label as a tooltip, the count on the corner. */
+function RailItem({ item }: { item: OwnerNavItem }) {
+  const { pathname } = useLocation();
+  const on = isNavItemOn(pathname, item);
+  const { label, icon: Icon, path } = item;
+  return (
+    <li className="relative">
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Link to={path} aria-current={on ? 'page' : undefined} className={cn(RAIL_BUTTON, on && 'bg-sidebar-accent text-sidebar-accent-foreground')}>
+            <Icon aria-hidden="true" />
+            {/* Named by its text, not aria-label, so a form's "Email" field is the only thing labelled Email. */}
+            <span className="sr-only">{label}</span>
+          </Link>
+        </TooltipTrigger>
+        <TooltipContent side="right">{label}</TooltipContent>
+      </Tooltip>
+      {/* Drawn ONCE, on the icon's corner, smaller than a row's chip. */}
+      <NavBadge item={item} className="-right-1 -top-1 [&>span]:h-[15px] [&>span]:min-w-[15px] [&>span]:px-[3px] [&>span]:text-[9px]" />
+    </li>
+  );
+}
+
+/** The desktop rail: never folds, never labels; every group is a run of icons under a hairline. */
+function Rail({ orgName, email, onSignOut, theme }: ShellProps & { theme: ThemeControls }) {
+  const name = orgName ?? 'Open CRM';
+  return (
+    <div className="flex h-full min-h-0 flex-col items-center gap-1 bg-sidebar py-2 text-sidebar-foreground">
+      <Link to="/" aria-label={name} title={name} className="mb-1 flex size-9 items-center justify-center rounded-md hover:bg-sidebar-accent">
+        <Monogram initials={initialsOf(name)} size="md" className="rounded-md" />
+      </Link>
+      <NewMenu compact />
+      <RailSearch />
+      <ScrollArea className="min-h-0 w-full flex-1">
+        <nav aria-label="Main" className="flex flex-col items-center py-1">
+          {navGroups().map((group, i) => (
+            <Fragment key={group.key ?? 'top'}>
+              {i > 0 && <div aria-hidden="true" className="my-1.5 h-px w-6 bg-sidebar-border" />}
+              <ul aria-label={group.label ?? undefined} className="flex flex-col items-center gap-1">
+                {group.items.map((item) => (
+                  <RailItem key={item.path} item={item} />
+                ))}
+              </ul>
+            </Fragment>
+          ))}
+        </nav>
+      </ScrollArea>
+      <div className="flex shrink-0 flex-col items-center gap-1 border-t border-sidebar-border pt-2">
+        {/* Labelled by what a click does. */}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label={theme.isDark ? 'Light mode' : 'Dark mode'}
+          title={theme.isDark ? 'Light mode' : 'Dark mode'}
+          onClick={theme.toggle}
+          className="size-9 text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
+        >
+          {theme.isDark ? <Sun aria-hidden="true" /> : <Moon aria-hidden="true" />}
+        </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button type="button" title={email} className={RAIL_BUTTON}>
+              <Monogram initials={initialsOf(email)} size="sm" />
+              {/* The button's name: who is signed in, said once. */}
+              <span className="sr-only">Signed in as {email}.</span>
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="right" align="end" className="w-60">
+            <DropdownMenuLabel className="text-[12px] font-normal text-muted-foreground [overflow-wrap:anywhere]">{email}</DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem asChild className="cursor-pointer">
+              <Link to={links.settings()}>
+                <Settings className="mr-2 size-4" aria-hidden="true" />
+                Settings
+              </Link>
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={onSignOut} className="cursor-pointer">
+              <LogOut className="mr-2 size-4" aria-hidden="true" />
+              Sign out
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </div>
+  );
+}
+
 export function AppShell(props: ShellProps) {
   const { isDark, toggle } = useTheme();
   const theme: ThemeControls = { isDark, toggle };
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const bounded = isBoundedPage(useLocation().pathname);
+  const { pathname } = useLocation();
+  const workspace = isWorkspacePage(pathname);
+  const bounded = workspace || isBoundedPage(pathname);
 
   return (
     <ThemeContext.Provider value={theme}>
-      <div className="flex min-h-svh w-full bg-background text-foreground">
-        <aside className="sticky top-0 hidden h-svh w-[208px] shrink-0 border-r border-sidebar-border md:block">
-          <SidebarBody {...props} theme={theme} />
-        </aside>
+      <TooltipProvider delayDuration={300}>
+        <div className="flex min-h-svh w-full bg-background text-foreground">
+          <aside className="sticky top-0 hidden h-svh w-14 shrink-0 border-r border-sidebar-border md:block">
+            <Rail {...props} theme={theme} />
+          </aside>
 
-        {/* overflow-x-clip, not overflow-hidden: no sideways scroll, and no scroll container
-            that would stop the top bar from sticking to the viewport. */}
-        <main
-          data-bounded={bounded || undefined}
-          className={cn(
-            'min-w-0 flex-1 overflow-x-clip text-[14px] leading-[1.5] [--topbar-h:2.5rem] md:[--topbar-h:3rem]',
-            bounded && 'flex h-svh flex-col overflow-hidden',
-          )}
-        >
-          {/* The id in `has-[#app-topbar-slot:empty]` is TOPBAR_SLOT_ID written out: Tailwind
-              cannot read a variable. AppShell.test.tsx keeps the two in step. */}
-          <div className="sticky top-0 z-30 flex h-[var(--topbar-h)] shrink-0 items-center gap-3 border-b border-border bg-background px-3 md:px-5 md:has-[#app-topbar-slot:empty]:hidden">
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              className="-ml-1 md:hidden"
-              aria-label="Open menu"
-              onClick={() => setDrawerOpen(true)}
-            >
-              <Menu />
-            </Button>
-            <div id={TOPBAR_SLOT_ID} className="flex min-w-0 flex-1 items-center" />
-          </div>
-          <Suspense
-            fallback={
-              <div className={PAGE}>
-                <p className="text-[13px] text-muted-foreground">Loading...</p>
-              </div>
-            }
-          >
-            {bounded ? (
-              <div className="flex min-h-0 flex-1 flex-col">
-                <Outlet />
-              </div>
-            ) : (
-              <Outlet />
+          {/* overflow-x-clip, not overflow-hidden: no sideways scroll, and no scroll container
+              that would stop the top bar from sticking to the viewport. */}
+          <main
+            data-bounded={bounded || undefined}
+            data-workspace={workspace || undefined}
+            className={cn(
+              'flex min-w-0 flex-1 flex-col overflow-x-clip text-[14px] leading-[1.5] [--bottombar-h:0px] [--topbar-h:2.5rem] md:[--bottombar-h:1.75rem]',
+              workspace ? 'md:[--topbar-h:0px]' : 'md:[--topbar-h:3rem]',
+              bounded ? 'h-svh overflow-hidden' : 'min-h-svh',
             )}
-          </Suspense>
-        </main>
-      </div>
+          >
+            {/* The id in `has-[#app-topbar-slot:empty]` is TOPBAR_SLOT_ID written out: Tailwind
+                cannot read a variable. AppShell.test.tsx keeps the two in step. */}
+            <div
+              className={cn(
+                'sticky top-0 z-30 flex h-[var(--topbar-h)] shrink-0 items-center gap-3 border-b border-border bg-background px-3 md:px-5 md:has-[#app-topbar-slot:empty]:hidden',
+                workspace && 'md:hidden',
+              )}
+            >
+              <Button variant="ghost" size="icon-sm" className="-ml-1 md:hidden" aria-label="Open menu" onClick={() => setDrawerOpen(true)}>
+                <Menu />
+              </Button>
+              {!workspace && <div id={TOPBAR_SLOT_ID} className="flex min-w-0 flex-1 items-center" />}
+            </div>
+            <div className={cn('flex min-w-0 flex-1 flex-col', bounded && 'min-h-0')}>
+              <Suspense
+                fallback={
+                  <div className={PAGE}>
+                    <p className="text-[13px] text-muted-foreground">Loading...</p>
+                  </div>
+                }
+              >
+                <Outlet />
+              </Suspense>
+            </div>
+            <BottomBar />
+          </main>
+        </div>
 
-      {/* The phone drawer. Its contents mount only while it is open. */}
-      <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
-        <SheetContent side="left" className="w-[208px] max-w-[85vw] p-0 sm:max-w-[208px]">
-          <SheetTitle className="sr-only">Menu</SheetTitle>
-          <SheetDescription className="sr-only">Every section of the app, and your account.</SheetDescription>
-          <SidebarBody {...props} theme={theme} drawer onNavigate={() => setDrawerOpen(false)} />
-        </SheetContent>
-      </Sheet>
+        {/* The phone drawer. Its contents mount only while it is open. */}
+        <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
+          <SheetContent side="left" className="w-[208px] max-w-[85vw] p-0 sm:max-w-[208px]">
+            <SheetTitle className="sr-only">Menu</SheetTitle>
+            <SheetDescription className="sr-only">Every section of the app, and your account.</SheetDescription>
+            <DrawerBody {...props} theme={theme} onNavigate={() => setDrawerOpen(false)} />
+          </SheetContent>
+        </Sheet>
+      </TooltipProvider>
     </ThemeContext.Provider>
   );
 }

@@ -101,7 +101,12 @@ function setWide(wide: boolean) {
 // The pages are lazy routes: load them once up front, so the first test does not spend
 // its find timeout compiling a cold chunk while the rest of the suite runs alongside.
 beforeAll(async () => {
-  await Promise.all([import('@/pages/contacts/ContactsList'), import('@/pages/contacts/ContactWorkspace'), import('@/pages/contacts/ContactIntake')]);
+  await Promise.all([
+    import('@/features/workspace/WorkspaceLayout'),
+    import('@/pages/contacts/ContactsList'),
+    import('@/pages/contacts/ContactWorkspace'),
+    import('@/pages/contacts/ContactIntake'),
+  ]);
 }, 30_000);
 
 // Under a full parallel run these screens render slowly enough to miss the shared 3 s find
@@ -120,10 +125,10 @@ afterEach(() => setWide(false));
 describe('contacts index', () => {
   it('puts every contact under its status section, titled from the table, clients as "Last, First"', async () => {
     renderAt('/contacts?tab=all');
-    await screen.findByText('Ada Example');
-    expect(screen.getByRole('region', { name: 'New' })).toHaveTextContent('Ada Example');
+    expect(await screen.findByRole('region', { name: 'New' })).toHaveTextContent('Ada Example');
     expect(screen.getByRole('region', { name: 'Hot' })).toHaveTextContent('Cy Test');
-    expect(screen.getByRole('region', { name: 'Client' })).toHaveTextContent('Sample, Bo');
+    // The clients are one list, whatever their status's own label.
+    expect(screen.getByRole('region', { name: 'Clients' })).toHaveTextContent('Sample, Bo');
   });
 
   it('shows a renamed status label straight from the table', async () => {
@@ -149,14 +154,25 @@ describe('contacts index', () => {
     expect(screen.getByText('No contacts match.')).toBeInTheDocument();
   });
 
-  it('opens on Clients: every client, one-time clients included, in ONE A-Z list', async () => {
+  it("the panel's Clients switch: every client, one-time clients included, in ONE A-Z list, remembered", async () => {
     fake.state.tables.contacts.push(
       contact('10000000-0000-4000-8000-00000000000d', 'Di', 'Able', { status: 'one_time' }),
       contact('10000000-0000-4000-8000-00000000000e', 'Ed', 'Zed', { status: 'client' }),
     );
+    const first = renderAt('/contacts');
+    await screen.findByText('Sample, Bo');
+    // All is the default: the leads show, by stage.
+    expect(screen.getByRole('radio', { name: 'All' })).toHaveAttribute('aria-checked', 'true');
+    const head = () => screen.getByLabelText('Which contacts').parentElement as HTMLElement;
+    expect(head()).toHaveTextContent('5 contacts');
+    expect(indexNames()).toContain('Ada Example');
+    fireEvent.click(screen.getByRole('radio', { name: 'Clients' }));
+    expect(head()).toHaveTextContent('3 clients');
+    expect(localStorage.getItem('open-crm:workspace:panelScope')).toBe('"clients"');
+    first.unmount();
     renderAt('/contacts');
     await screen.findByText('Sample, Bo');
-    expect(screen.getByRole('tab', { name: 'Clients' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('radio', { name: 'Clients' })).toHaveAttribute('aria-checked', 'true');
     expect(indexNames()).toEqual(['Able, Di', 'Sample, Bo', 'Zed, Ed']);
     expect(screen.getByRole('region', { name: 'Clients' })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'One-time client' })).toBeNull();
@@ -167,29 +183,42 @@ describe('contacts index', () => {
     expect(indexNames()).toContain('Ada Example');
   });
 
-  it('tabs switch the list, are links, are remembered, and clear the selection', async () => {
-    renderAt('/contacts?tab=all');
-    await screen.findByText('Ada Example');
+  it('the workspace tabs are links, remembered, and leaving the contacts screen clears the selection', async () => {
+    // Wide, so the panel (and its selection) stays mounted across screens.
+    setWide(true);
+    renderAt('/contacts?tab=pipeline');
+    await screen.findByRole('checkbox', { name: 'Select Ada Example' });
+    const strip = screen.getByRole('tablist', { name: 'Workspace' });
+    expect(within(strip).getByRole('tab', { name: 'Pipeline' })).toHaveAttribute('aria-selected', 'true');
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
     expect(screen.getByRole('region', { name: 'Selected contacts' })).toHaveTextContent('1 selected');
-    fireEvent.mouseDown(screen.getByRole('tab', { name: 'Pipeline' }));
-    await waitFor(() => expect(window.location.search).toBe('?tab=pipeline'));
-    expect(indexNames()).toEqual(['Ada Example', 'Cy Test']);
-    expect(screen.queryByRole('region', { name: 'Selected contacts' })).toBeNull();
-    expect(localStorage.getItem('open-crm:contacts:tab')).toBe('"pipeline"');
+    fireEvent.mouseDown(within(strip).getByRole('tab', { name: 'Table' }));
+    await waitFor(() => expect(window.location.search).toBe('?tab=table'));
+    expect(localStorage.getItem('open-crm:contacts:tab')).toBe('"table"');
+    // A tab of the same screen keeps the selection; another screen clears it.
+    expect(screen.getByRole('region', { name: 'Selected contacts' })).toHaveTextContent('1 selected');
+    fireEvent.mouseDown(within(strip).getByRole('tab', { name: /^Requests/ }));
+    await waitFor(() => expect(window.location.pathname).toBe('/requests'));
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Selected contacts' })).toBeNull());
+    expect(screen.getByRole('checkbox', { name: 'Select Ada Example' })).not.toBeChecked();
   });
 
-  it('a bare /contacts opens the remembered tab, and a stored value of the wrong shape falls back to Clients', async () => {
-    localStorage.setItem('open-crm:contacts:tab', '"pipeline"');
+  it('a bare /contacts opens the remembered tab; a stale or misshapen one falls back to Pipeline', async () => {
+    localStorage.setItem('open-crm:contacts:tab', '"tiers"');
     const first = renderAt('/contacts');
-    await screen.findByText('Ada Example');
-    expect(screen.getByRole('tab', { name: 'Pipeline' })).toHaveAttribute('aria-selected', 'true');
+    await waitFor(() => expect(window.location.search).toBe('?tab=tiers'));
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Tiers' })).toHaveAttribute('aria-selected', 'true'));
     first.unmount();
     localStorage.setItem('open-crm:contacts:tab', 'null');
     localStorage.setItem('open-crm:contacts:collapsed', '3');
-    renderAt('/contacts');
+    const second = renderAt('/contacts');
     await screen.findByText('Sample, Bo');
-    expect(screen.getByRole('tab', { name: 'Clients' })).toHaveAttribute('aria-selected', 'true');
+    await waitFor(() => expect(window.location.search).toBe('?tab=pipeline'));
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Pipeline' })).toHaveAttribute('aria-selected', 'true'));
+    second.unmount();
+    // The old list tabs are the panel's switch now; their links land on the pipeline.
+    renderAt('/contacts?tab=all&view=leads_hot');
+    await waitFor(() => expect(window.location.search).toBe('?tab=pipeline&view=leads_hot'));
   });
 
   it('Tiers ranks active clients only, in their tier rows, and holds that during a search', async () => {
@@ -204,11 +233,11 @@ describe('contacts index', () => {
     expect(within(s).queryByRole('button', { name: /Able, Di/ })).toBeNull();
     expect(within(screen.getByRole('region', { name: 'Not ranked' })).getByRole('button', { name: 'Open Sample, Bo' })).toBeInTheDocument();
     expect(screen.getAllByRole('region', { name: /tier$|^Not ranked$/ })).toHaveLength(7);
-    // The index beside it holds the active clients, even while searching.
-    expect(indexNames()).toEqual(['Sample, Bo', 'Zed, Ed']);
+    // A search narrows the rows and never reaches past the active clients.
     fireEvent.change(screen.getByLabelText('Search contacts'), { target: { value: 'a' } });
-    expect(indexNames()).toEqual(['Sample, Bo']);
     expect(within(screen.getByRole('region', { name: 'Not ranked' })).getByRole('button', { name: 'Open Sample, Bo' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Open Ada Example/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Open Zed, Ed/ })).toBeNull();
   });
 
   // Below lg the Tiers tab hides the index, yet the search and the board filter still narrow
@@ -221,12 +250,15 @@ describe('contacts index', () => {
     expect(hidden(screen.getByRole('button', { name: 'Clear list filter' }))).toBe(false);
   });
 
-  it('on a wide Tiers tab the search stays atop the index', async () => {
+  it('on a wide Tiers tab the search stays atop the client panel, and narrows the rows from there', async () => {
     setWide(true);
     renderAt('/contacts?tab=tiers');
     await screen.findByRole('region', { name: 'Not ranked' });
     expect(screen.getAllByLabelText('Search contacts')).toHaveLength(1);
-    expect(within(screen.getByLabelText('Search contacts').closest('[class~="lg:w-[300px]"]') as HTMLElement).getByRole('checkbox', { name: 'Select Sample, Bo' })).toBeInTheDocument();
+    const panel = screen.getByLabelText('Search contacts').closest('[class~="w-[240px]"]') as HTMLElement;
+    expect(within(panel).getByRole('checkbox', { name: 'Select Sample, Bo' })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Search contacts'), { target: { value: 'nobody' } });
+    expect(within(screen.getByRole('region', { name: 'Not ranked' })).queryByRole('button', { name: 'Open Sample, Bo' })).toBeNull();
   });
 
   it('archived contacts are off every list, and the Archived dialog restores them with the status untouched', async () => {
@@ -350,8 +382,10 @@ describe('contacts index', () => {
     renderAt('/contacts');
     await screen.findByText('Sample, Bo');
     expect(queryClient.getQueryCache().getAll().length).toBeGreaterThan(0);
+    fireEvent.keyDown(screen.getByRole('button', { name: /^Signed in as/ }), { key: 'Enter' });
+    const signOut = await screen.findByRole('menuitem', { name: 'Sign out' });
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+      fireEvent.click(signOut);
     });
     await screen.findByLabelText('Email');
     expect(queryClient.getQueryCache().getAll()).toEqual([]);
@@ -453,12 +487,14 @@ describe('board and table (wide screens)', () => {
   });
 
   it('a column heading filters the index with ?view=, and an unknown view filters nothing', async () => {
-    renderAt('/contacts?tab=all&view=nonsense');
+    renderAt('/contacts?tab=pipeline&view=nonsense');
     const hot = await screen.findByRole('region', { name: 'Hot column' });
     expect(indexNames()).toHaveLength(3);
     fireEvent.click(within(hot).getAllByRole('button', { pressed: false })[0]);
     await waitFor(() => expect(indexNames()).toEqual(['Cy Test']));
-    expect(window.location.search).toBe('?tab=all&view=leads_hot');
+    expect(window.location.search).toBe('?tab=pipeline&view=leads_hot');
+    // The record link keeps the filter, so the panel keeps its rows beside the record.
+    expect(screen.getByRole('link', { name: 'Cy Test' })).toHaveAttribute('href', `/contacts/${CY}?view=leads_hot`);
   });
 
   it('the Table tab counts what is in view and is remembered', async () => {
@@ -715,10 +751,11 @@ describe('record overview', () => {
 
   it('the header carries the tier mark; the index rows never do', async () => {
     fake.state.tables.contacts[1].tier = 'A';
-    renderAt(`/contacts/${BO}?tab=all`);
+    setWide(true);
+    renderAt(`/contacts/${BO}`);
     await screen.findByRole('heading', { name: 'Bo Sample' });
     expect(screen.getByRole('img', { name: 'A tier' })).toBeInTheDocument();
-    expect(within(screen.getByRole('region', { name: 'Client' })).queryByRole('img', { name: /tier/ })).toBeNull();
+    expect(within(await screen.findByRole('region', { name: 'Clients' })).queryByRole('img', { name: /tier/ })).toBeNull();
   });
 
   it('deletes through the edge function from the More menu and returns to the list', async () => {

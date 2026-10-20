@@ -53,26 +53,26 @@ export function statusInList(status: string, list: CrmListKey): boolean {
 }
 
 /**
- * The contacts page's tabs, across the top. Each names the list the index shows and what
- * the wide pane holds with no record open: the pipeline board, the tier rows, or the
- * table. Clients is the default. The tab lives in `?tab=` (a tab is a link) and the last
- * one chosen is remembered per browser for a bare /contacts.
+ * The contacts page's tabs, on the workspace's strip. Each names the list it ranks and what
+ * the pane holds with no record open: the pipeline board, the tier rows, or the table.
+ * Pipeline is the default. The tab lives in `?tab=` (a tab is a link) and the last one
+ * chosen is remembered per browser for a bare /contacts. The lists that used to be tabs
+ * (Clients, All) are the client panel's switch; an old `?tab=` naming one is not a tab,
+ * so it falls back like any unknown value.
  *
- * A search on any tab but Tiers looks through everyone; Tiers ranks active clients only,
- * so its list holds during a search and a board filter.
+ * The panel's search looks through everyone; Tiers ranks active clients only, so its rows
+ * hold that during a search and a board filter.
  */
 export const CRM_TABS = [
-  { key: 'clients', label: 'Clients', list: 'clients', pane: 'board' },
   { key: 'pipeline', label: 'Pipeline', list: 'leads', pane: 'board' },
   { key: 'tiers', label: 'Tiers', list: 'active', pane: 'tiers' },
-  { key: 'all', label: 'All', list: 'all', pane: 'board' },
   { key: 'table', label: 'Table', list: 'all', pane: 'table' },
 ] as const satisfies ReadonlyArray<{ key: string; label: string; list: CrmListKey; pane: 'board' | 'tiers' | 'table' }>;
 
 export type CrmTabKey = (typeof CRM_TABS)[number]['key'];
 export type CrmTab = (typeof CRM_TABS)[number];
 
-export const DEFAULT_CRM_TAB: CrmTabKey = 'clients';
+export const DEFAULT_CRM_TAB: CrmTabKey = 'pipeline';
 
 export function isCrmTabKey(value: unknown): value is CrmTabKey {
   return CRM_TABS.some((t) => t.key === value);
@@ -82,7 +82,7 @@ export function crmTab(key: CrmTabKey): CrmTab {
   return CRM_TABS.find((t) => t.key === key)!;
 }
 
-/** The tab to show: an explicit `?tab=` when it names one, else the remembered one, else Clients. */
+/** The tab to show: an explicit `?tab=` when it names one, else the remembered one, else Pipeline. */
 export function resolveCrmTab(param: string | null, stored: unknown): CrmTabKey {
   if (isCrmTabKey(param)) return param;
   return isCrmTabKey(stored) ? stored : DEFAULT_CRM_TAB;

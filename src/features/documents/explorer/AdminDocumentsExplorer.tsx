@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useState, useCallback, useRef, lazy, Suspense, type ComponentType } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Menu, FileText, Loader2 } from 'lucide-react';
-import { Sheet, SheetContent, SheetTitle, SheetDescription, SheetTrigger } from '@/components/ui/sheet';
-import { Button } from '@/components/ui/button';
+import { FileText, Loader2 } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
 import { contactDisplayName, listContacts } from '@/api/contacts';
@@ -12,7 +10,7 @@ import { useAuth } from '@/lib/auth';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { getErrorMessage } from '@/lib/errors';
 import { toast } from '@/components/ui/sonner';
-import { PageHeader, SIDE_BAR_W } from '@/components/layout/page';
+import { PageHeader } from '@/components/layout/page';
 import { runBulk } from '../lib/bulkRun';
 import { childPath } from '../lib/folderPath';
 import { validateUploadFiles } from '../lib/documentNames';
@@ -35,11 +33,9 @@ import type { ExplorerContact, ClientDocument, ClientFolder } from './types';
 import { selectDocumentTreeContacts } from './selectDocumentTreeContacts';
 import { unreviewedPrefixCounts, countsByFolderId } from './unreviewedDescendantCounts';
 import { partitionSelection } from './selectionPartition';
-import FolderTree from './FolderTree';
 import FileGrid, { type RowActions } from './FileGrid';
 import ExplorerBreadcrumb from './ExplorerBreadcrumb';
 import ExplorerToolbar from './ExplorerToolbar';
-import { cn } from '@/lib/utils';
 import UploadDropZone from './UploadDropZone';
 import { CreateButtons } from './ExplorerToolbar';
 import UploadProgressBar from './UploadProgressBar';
@@ -60,12 +56,22 @@ const DocumentWorkstation = lazy(() => import('../workstation/DocumentWorkstatio
 export type { ExplorerContact } from './types';
 
 export default function AdminDocumentsExplorer({
-  initialClientId,
+  pickedClientId,
+  onClientChange,
   lockedClient,
   variant = 'card',
   contactPanel: ContactPanel,
 }: {
-  initialClientId?: string;
+  /**
+   * The documents page's contact, picked in the workspace's client panel (`?contact=`). The
+   * explorer draws no contact index of its own, like a locked one, but keeps the full
+   * roster, so the workstation's contact switcher still reaches everyone. The pick is added
+   * to the roster when it is missing (a lead with no files yet), for the same reason
+   * `lockedClient` takes a row: an id outside the roster would match nothing.
+   */
+  pickedClientId?: string;
+  /** The workstation switched contact: the page moves its `?contact=` (and so the panel's mark) to follow. */
+  onClientChange?: (contactId: string) => void;
   /**
    * Scope the whole explorer to ONE contact: the contact record's Documents tab
    * mounts it this way so a contact shows the same hierarchy, the same two
@@ -98,7 +104,6 @@ export default function AdminDocumentsExplorer({
   const state = useExplorerState();
   const actions = useExplorerActions();
   const queryClient = useQueryClient();
-  const [sidebarOpen, setSidebarOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [bulkDelete, setBulkDelete] = useState<{
     files: { id: string; held_by: Section }[];
@@ -140,8 +145,8 @@ export default function AdminDocumentsExplorer({
     () =>
       lockedClient
         ? [lockedClient]
-        : selectDocumentTreeContacts(allContacts, contactIdsWithDocs),
-    [lockedClient, allContacts, contactIdsWithDocs]
+        : withPicked(selectDocumentTreeContacts(allContacts, contactIdsWithDocs), allContacts, pickedClientId),
+    [lockedClient, allContacts, contactIdsWithDocs, pickedClientId]
   );
 
   // Same roster the index shows, flattened for the workstation's client switcher.
@@ -154,17 +159,19 @@ export default function AdminDocumentsExplorer({
     [clientContacts],
   );
 
-  // Deep link (?contact=): preselect that contact once contacts load. A locked
-  // contact uses the same path: it is the same job, and it is what opens on the
-  // contact instead of on a picker.
-  const preselectClientId = lockedClient?.id ?? initialClientId;
-  const initialClientAppliedRef = useRef(false);
+  // The contact to open (the page's pick, or the record's lock): select it once contacts
+  // load, and again whenever the pick changes (the panel picked someone else). The ref holds
+  // the id last applied, so a roster refetch never re-selects (which would reset the folder
+  // path), and a workstation switch, which records its id here first, is not undone when
+  // the URL catches up.
+  const preselectClientId = lockedClient?.id ?? pickedClientId;
+  const appliedClientIdRef = useRef<string | null>(null);
   const { selectClient } = state;
   useEffect(() => {
-    if (initialClientAppliedRef.current || !preselectClientId) return;
+    if (!preselectClientId || appliedClientIdRef.current === preselectClientId) return;
     const match = clientContacts.find((c) => c.id === preselectClientId);
     if (!match) return;
-    initialClientAppliedRef.current = true;
+    appliedClientIdRef.current = match.id;
     selectClient(match.id, contactDisplayName(match));
   }, [preselectClientId, clientContacts, selectClient]);
 
@@ -530,11 +537,6 @@ export default function AdminDocumentsExplorer({
     setWorkstationDocId(id);
   }, [state.previewTarget, state.selectedClientId]);
 
-  const handleSelectClient = useCallback((clientId: string, clientName: string) => {
-    state.selectClient(clientId, clientName);
-    setSidebarOpen(false);
-  }, [state]);
-
   // Overview-mode handlers: clicking a section header / folder / file should
   // navigate the user *into* that section so the existing toolbar + grid take
   // over. Folders pass their path so we land directly in the right place.
@@ -558,14 +560,6 @@ export default function AdminDocumentsExplorer({
     // full-screen would just read as inconsistent.
     if (canWorkstation) setWorkstationDocId(file.id);
   }, [state, canWorkstation]);
-
-  // `FolderTree` is the CONTACT index: it chooses which contact, and nothing
-  // else. The right pane owns the folders, so these three props are all it needs.
-  const treeProps = {
-    clients: clientContacts,
-    selectedClientId: state.selectedClientId,
-    onSelectClient: handleSelectClient,
-  };
 
   // The row verbs, built once and spread into the folder view and the client
   // root alike; see `RowActions` for why none of them needs a section.
@@ -628,8 +622,8 @@ export default function AdminDocumentsExplorer({
       return (
         <div className="flex flex-col items-center justify-center h-full text-center">
           <FileText className="w-10 h-10 text-muted-foreground mb-2" aria-hidden="true" />
-          <p className="text-sm text-muted-foreground font-medium">Select a contact</p>
-          <p className="text-xs text-muted-foreground mt-1">Choose a contact from the list to see their documents.</p>
+          <p className="text-sm text-muted-foreground font-medium">Pick a contact</p>
+          <p className="text-xs text-muted-foreground mt-1">Choose a contact on the left to see their documents.</p>
         </div>
       );
     }
@@ -765,26 +759,8 @@ export default function AdminDocumentsExplorer({
       }
       style={{ minHeight: 0 }}
     >
-      {/* Mobile: sheet trigger + content. The trigger is a CONTACT PICKER, so a
-          locked explorer has nothing for it to pick; see the desktop block. */}
+      {/* Mobile: the pane, and the viewer overlay. */}
       <div className="lg:hidden flex flex-col h-full">
-        {!lockedClient && (
-          <div className="flex items-center gap-2 px-3 py-2 border-b border-border flex-shrink-0">
-            <Sheet open={sidebarOpen} onOpenChange={setSidebarOpen}>
-              <SheetTrigger asChild>
-                <Button variant="outline" size="sm" className="h-8 gap-1.5">
-                  <Menu className="w-4 h-4" aria-hidden="true" />
-                  <span className="max-w-[60vw] truncate">{state.selectedClientName || 'Select a contact'}</span>
-                </Button>
-              </SheetTrigger>
-              <SheetContent side="left" className="w-72 p-0">
-                <SheetTitle className="sr-only">Contacts</SheetTitle>
-                <SheetDescription className="sr-only">Select a contact to manage their documents</SheetDescription>
-                <FolderTree {...treeProps} />
-              </SheetContent>
-            </Sheet>
-          </div>
-        )}
         <div className="flex-1 min-h-0">
           {renderRightPaneContent()}
         </div>
@@ -809,28 +785,14 @@ export default function AdminDocumentsExplorer({
         )}
       </div>
 
-      {/* Desktop: two columns, or one when the explorer is already scoped to a
-          single contact.
-
-          The index's job is choosing WHICH contact, and inside a contact record
-          that choice is already made: locked, it would be a search box over a
-          list of one. The folder HIERARCHY is not lost with it: the landing
-          view is the contact overview, which lists both sections with every
-          folder under each, and the breadcrumb walks back up from inside one. */}
+      {/* Desktop: one pane. The explorer draws no contact index of its own: on the
+          documents page the workspace's client panel chooses the contact, and inside
+          a contact record the choice is already made. The folder HIERARCHY is in the
+          pane: the landing view is the contact overview, which lists both sections
+          with every folder under each, and the breadcrumb walks back up from inside
+          one. */}
       <div className="hidden lg:flex h-full">
-        {lockedClient ? (
-          <div className="h-full w-full min-w-0">{renderRightPaneContent()}</div>
-        ) : (
-          <div className="flex h-full w-full min-w-0">
-            {/* The same fixed width as every owner side bar (SIDE_BAR_W). */}
-            <div className={cn('h-full shrink-0 overflow-hidden', SIDE_BAR_W)}>
-              <FolderTree {...treeProps} />
-            </div>
-            <div className="h-full min-w-0 flex-1">
-              {renderRightPaneContent()}
-            </div>
-          </div>
-        )}
+        <div className="h-full w-full min-w-0">{renderRightPaneContent()}</div>
       </div>
 
       {/* Dialogs */}
@@ -897,7 +859,11 @@ export default function AdminDocumentsExplorer({
             initialDocId={workstationDocId}
             initialScope={{ kind: 'section', heldBy: state.activeSection || 'client' }}
             clients={workstationClients}
-            onClientChange={(id, name) => state.selectClient(id, name)}
+            onClientChange={(id, name) => {
+              appliedClientIdRef.current = id;
+              state.selectClient(id, name);
+              onClientChange?.(id);
+            }}
             // Clearing previewTarget too: a file click arms it (it feeds the
             // review toggle, the mobile overlay and the no-arg open), and the
             // explorer renders `previewTarget ? <preview> : <grid>`, so without
@@ -913,4 +879,11 @@ export default function AdminDocumentsExplorer({
     </div>
     </>
   );
+}
+
+/** The roster with the picked contact in it, once (a lead with no files yet is not in it). */
+function withPicked(roster: ExplorerContact[], everyone: readonly ExplorerContact[], pickedId: string | undefined): ExplorerContact[] {
+  if (!pickedId || roster.some((c) => c.id === pickedId)) return roster;
+  const picked = everyone.find((c) => c.id === pickedId);
+  return picked ? [...roster, picked] : roster;
 }

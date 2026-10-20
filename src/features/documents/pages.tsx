@@ -25,13 +25,31 @@ const ContactRequestsStrip = lazy(() =>
 
 const Loading = () => <Skeleton className="m-4 h-40" />;
 
-/** /documents: every contact's files, each picked contact's requests above them. `?contact=<id>` opens on one contact. */
+/**
+ * /documents, a workspace screen: the contact picked in the client panel (`?contact=<id>`),
+ * their requests above their folders. A new pick re-selects in the SAME explorer (its
+ * folder path resets), and a contact switched inside the workstation moves `?contact=` to
+ * follow, so the panel always marks the contact on screen. Clearing the pick starts a fresh
+ * explorer (the key), which opens on "Pick a contact".
+ */
 export function DocumentsPage() {
-  const [params] = useSearchParams();
-  const contact = params.get('contact') ?? undefined;
+  const [params, setParams] = useSearchParams();
+  const raw = params.get('contact') ?? undefined;
+  const contact = isUuid(raw) ? raw : undefined;
+  const follow = (contactId: string) => {
+    const next = new URLSearchParams(params);
+    next.set('contact', contactId);
+    setParams(next, { replace: true });
+  };
   return (
     <Suspense fallback={<Loading />}>
-      <AdminDocumentsExplorer variant="flush" initialClientId={isUuid(contact) ? contact : undefined} contactPanel={ContactRequestsStrip} />
+      <AdminDocumentsExplorer
+        key={contact ? 'picked' : 'none'}
+        variant="flush"
+        pickedClientId={contact}
+        onClientChange={follow}
+        contactPanel={ContactRequestsStrip}
+      />
     </Suspense>
   );
 }
