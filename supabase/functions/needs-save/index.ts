@@ -43,9 +43,11 @@ Deno.serve(
 
     loadList: ownList,
 
-    async updateContact(contactId, fields) {
-      const { error } = await server.from('contacts').update(fields).eq('id', contactId);
+    async saveContact(contactId, listId, fields) {
+      const { data, error } = await server.rpc('needs_client_save_contact', { p_contact_id: contactId, p_list_id: listId, p_fields: fields });
       if (error) throw error;
+      if (data === 'saved' || data === 'not_found' || data === 'not_open') return data;
+      throw new Error('needs_client_save_contact returned an unexpected value');
     },
 
     async setAnswer(contactId, itemId, text, ciphertextHex) {

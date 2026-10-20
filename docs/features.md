@@ -62,7 +62,8 @@ link that creates their sign-in.
 Every request sits in one list grouped by whose move it is: Waiting on you (handed back, or an
 answer to accept), Waiting on client, Drafts, and Archived, which stays folded until asked. New
 request asks who it is for, then opens the builder. A request closes itself once every answer is
-accepted (Close by hand stays, for a request the client will not finish). Open lists refresh
+accepted; one that asks the client to confirm their details waits until they submit it (Close
+by hand stays, for a request the client will not finish). Open lists refresh
 every 30 seconds while in view and as soon as you come back to the tab. On Documents, a picked
 contact's requests sit above their folders, with New request for that contact. You hear about
 uploads to a request at most once a day per request, plus once when the client submits.
