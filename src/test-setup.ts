@@ -1,5 +1,7 @@
 import '@testing-library/jest-dom';
 import { configure } from '@testing-library/react';
+import { toast } from 'sonner';
+import { afterAll } from 'vitest';
 import { publicQueryClient, queryClient } from '@/lib/queryClient';
 
 // Every screen is a lazy chunk now, so a suite's first findBy* also waits for the modules to
@@ -53,4 +55,11 @@ if (typeof window !== 'undefined') {
       disconnect() {}
     };
   }
+
+  // sonner removes a closed toast on a 200 ms timer that unmounting never clears. On a slow
+  // runner that timer can fire after the file's window is gone ("window is not defined"), so
+  // a file that showed a toast waits it out first.
+  afterAll(async () => {
+    if (toast.getHistory().length > 0) await new Promise((resolve) => setTimeout(resolve, 250));
+  });
 }
