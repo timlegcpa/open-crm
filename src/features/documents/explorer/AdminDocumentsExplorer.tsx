@@ -175,6 +175,22 @@ export default function AdminDocumentsExplorer({
     selectClient(match.id, contactDisplayName(match));
   }, [preselectClientId, clientContacts, selectClient]);
 
+  // Every dialog here acts on the contact on screen. When that contact changes under an
+  // open one (a pick in the panel, the browser's Back), it closes rather than act on whoever
+  // is on screen now. The workstation is not one of them: it switches contacts itself.
+  const contactOnScreen = state.selectedClientId;
+  const { setRenameTarget, setMoveTarget, setMoveToSharedTarget, setDeleteTarget, setNewFolderOpen } = state;
+  useEffect(() => {
+    setRenameTarget(null);
+    setMoveTarget(null);
+    setMoveToSharedTarget(null);
+    setDeleteTarget(null);
+    setNewFolderOpen(false);
+    setBulkDelete(null);
+    setBulkMoveOpen(false);
+    setShareTarget(null);
+  }, [contactOnScreen, setRenameTarget, setMoveTarget, setMoveToSharedTarget, setDeleteTarget, setNewFolderOpen]);
+
   // Folders at current path
   const { data: folders = NO_FOLDERS, isLoading: foldersLoading } = useQuery({
     queryKey: folderKeys.atPath(state.selectedClientId ?? '', state.currentPath, state.activeSection || 'owner'),

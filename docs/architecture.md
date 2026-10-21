@@ -52,8 +52,9 @@ light and dark, the account), the content, and a bottom bar pinned to the window
 
 - **The workspace** is a layout route around the contacts, the board, documents, requests,
   messages, e-sign and marketing (each domain's `workspaceRoutes`). It mounts the client panel
-  (every contact, an All / Clients switch remembered per browser, one A to Z list of clients,
-  a search that reaches everyone, selection and bulk actions) and one tab strip across the
+  (every contact, an All / Clients switch remembered per browser, one A to Z list by last name
+  with each row's status as its tint, a search that reaches everyone, selection and bulk
+  actions over the rows on screen) and one tab strip across the
   top (`workspaceTabs`, with the waiting counts their badges draw). The strip is the top row
   and never scrolls; on a phone each tab is its icon. A page's `PageHeader` lands in the row
   under the tabs: on a workspace screen the workspace holds THE top-bar slot and the shell
@@ -61,11 +62,14 @@ light and dark, the account), the content, and a bottom bar pinned to the window
   routes as one tree (`ownerRouteTree`), so a literal path such as `contacts/new` beats the
   workspace's `contacts/:id`, and the router and the shell can never disagree.
 - A workspace route's `handle` may carry `panelFirst` (below `lg`, where one pane fits, the
-  panel is that pane: the documents page with nobody picked) and `pickParam` (a pick sets that
-  query parameter in place instead of opening the record: documents' `?contact=`).
+  panel is that pane: the contacts screen outside Tiers) and `pickParam` (a pick sets that
+  query parameter in place instead of opening the record: documents' `?contact=`; below `lg`
+  the panel is the screen until the parameter holds a valid id).
 - **The bottom bar** draws `shellCounts`: what is waiting (unread, to review, to accept) and the
-  size of the book (clients, open leads), each a link. A count is a lazy render-prop component
-  on the same query key as the feature's badge, so the two share one fetch.
+  size of the book (clients, open leads), each a link. A count is a lazy render-prop component.
+  A waiting count shares the query key of the feature's badge, so the two share one fetch;
+  the book's figures are head-only counts under the contacts key, so any contact write
+  refreshes them and no page loads the contact list for them.
 - **The New menu** draws `newMenu`: an entry goes to its feature's create screen (`path`) or
   opens its feature's dialog where the owner is (`Dialog`), and closing the dialog hands focus
   back to New.

@@ -108,6 +108,9 @@ test('one workspace: the panel and the strip stay while the screen changes, and 
 
 test('on a phone the workspace keeps one pane: the panel where choosing a contact is the screen', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
+  // A pick the page cannot read is no pick: the panel stays the screen.
+  await page.goto('/documents?contact=invalid');
+  await expect(panel(page)).toBeVisible();
   await page.goto('/documents');
   await expect(panel(page)).toBeVisible();
   await panel(page).getByRole('link', { name: 'Lovelace, Ada' }).click();
@@ -123,7 +126,9 @@ test('on a phone the drawer carries New, and its dialog opens over the page', as
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/settings');
   await page.getByRole('button', { name: 'Open menu' }).click();
-  const drawer = page.getByRole('dialog', { name: 'Menu' });
+  // Found by its heading: once a dialog opened from it has closed, Radix leaves the drawer
+  // without its accessible name, so a name match would call an open drawer hidden.
+  const drawer = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: 'Menu', exact: true }) });
   await drawer.getByRole('button', { name: 'New', exact: true }).click();
   await page.getByRole('menuitem', { name: 'Work item' }).click();
   const dialog = page.getByRole('dialog', { name: 'Add work item' });
@@ -133,7 +138,18 @@ test('on a phone the drawer carries New, and its dialog opens over the page', as
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
 
+  // A dialog that moves on to a screen (Request's Next) lands with the drawer closed.
+  await drawer.getByRole('button', { name: 'New', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Request' }).click();
+  const request = page.getByRole('dialog', { name: 'New request' });
+  await request.getByRole('button', { name: /Contact/ }).click();
+  await page.getByRole('option', { name: /Grace Hopper/ }).click();
+  await request.getByRole('button', { name: 'Next' }).click();
+  await expect(page).toHaveURL(`/requests/new?contact=${ID.grace}`);
+  await expect(drawer).toBeHidden();
+
   // An entry that goes to a screen closes the drawer on the way.
+  await page.getByRole('button', { name: 'Open menu' }).click();
   await drawer.getByRole('button', { name: 'New', exact: true }).click();
   await page.getByRole('menuitem', { name: 'Contact' }).click();
   await expect(page).toHaveURL(/\/contacts\/new$/);

@@ -10,8 +10,9 @@ named in its section.
 (new, active, hot, warm, cold, client, one-time client, former client, lost), in each stage's
 colour. The workspace's tab strip holds Pipeline (the default), Tiers and Table beside the
 board, requests, messages, e-sign and marketing; the client panel on the left lists everyone
-(All) or every client, one-time clients included, in one A to Z list (Clients), and remembers
-the choice in the browser. The tab is part of the address, and the last one chosen is
+(All) or every client, one-time clients included (Clients), as one A to Z list by last name
+with each contact's status as the colour of its row's mark, and remembers the choice in the
+browser. The tab is part of the address, and the last one chosen is
 remembered. A search in the panel looks through everyone and also narrows the board, the
 tiers and the table. Add a contact by hand, or let one arrive through lead intake.
 

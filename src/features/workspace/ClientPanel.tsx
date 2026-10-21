@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from 'react';
 import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Search, X } from 'lucide-react';
@@ -22,17 +22,15 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Segmented } from '@/components/ui/segmented';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from '@/components/ui/sonner';
-import { useCollapsedSections } from '@/hooks/useCollapsedSections';
 import { useByKey, useContactStatuses, useServiceTypes } from '@/hooks/usePickLists';
 import { links } from '@/features/links';
 import { CLIENT_PANEL_SEARCH_ID } from '@/features/types';
-import { ContactIndexGroup, ContactIndexRow } from '@/features/crm/components/ContactIndex';
+import { ContactIndexRow } from '@/features/crm/components/ContactIndex';
 import { useContacts, useOrganizationRoster, useOrganizationsByContact } from '@/features/crm/hooks';
 import { contactIdsForView, matchesCrmSearch } from '@/features/crm/lib/board';
 import { contactCsvRows } from '@/features/crm/lib/csv';
-import { bucketBySection, mergeClientSections, statusInList } from '@/features/crm/lib/sections';
-import { CRM_COLLAPSED_KEY } from '@/features/crm/prefs';
-import { isClientLike, isSystemStatus } from '@/lib/contactStatus';
+import { statusInList } from '@/features/crm/lib/sections';
+import { isSystemStatus } from '@/lib/contactStatus';
 import { csvBlob } from '@/lib/csv';
 import { downloadBlob } from '@/lib/download';
 import { getErrorMessage } from '@/lib/errors';
@@ -54,16 +52,17 @@ const isScope = (value: unknown): value is PanelScope => value === 'all' || valu
 
 /**
  * The client panel, on every workspace screen, mounted once by the layout so it stays put
- * while the screen beside it changes. Two lists: **All** (the default) is everyone, leads by
- * stage first so the pipeline shows; **Clients** is every paying contact. Either way the
- * clients are ONE A-Z list by last name, one-time clients included. A search looks through
- * everyone, whichever list is on, and so does a board filter (`?view=`).
+ * while the screen beside it changes. Two lists: **All** (the default) is everyone; **Clients**
+ * is every paying contact, one-time clients included. Either is ONE list, A to Z by last name;
+ * a row's status is its monogram's tint (and its text for a screen reader). A search looks
+ * through everyone, whichever list is on, and so does a board filter (`?view=`).
  *
  * A pick opens the contact's record, except where the screen names a `pickParam`
  * (documents): there it sets that query parameter and the owner stays on the screen.
  *
  * Archived contacts are off the lists; the contacts page's Archived dialog lists them.
- * Selection (a checkbox on each row) and the bulk bar live here, over the same rows.
+ * Selection (a checkbox on each row) and the bulk bar live here, over the same rows. A bulk
+ * action acts on the selected rows on screen, never on one a switch or a search has hidden.
  */
 export function ClientPanel({ pickParam }: { pickParam?: string }) {
   const queryClient = useQueryClient();
@@ -86,35 +85,57 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
   const [scope, setScopeState] = useState<PanelScope>(() => safeStorage.getJson(PANEL_SCOPE_KEY, isScope) ?? 'all');
   const setScope = (next: PanelScope) => {
     setScopeState(next);
+    // Another list is another set of rows: the selection was made over the old one.
+    if (next !== scope) setSelected(new Set());
     // Storage may be unavailable; the switch then lasts for this visit.
     safeStorage.setJson(PANEL_SCOPE_KEY, next);
   };
-  const { collapsed, toggle } = useCollapsedSections(CRM_COLLAPSED_KEY);
 
   // THE one matcher and THE one view resolver, shared with the board and the table.
   const matches = useCallback((c: Contact) => matchesCrmSearch(c, orgsByContact.get(c.id) ?? [], query), [orgsByContact, query]);
   const viewIds = useMemo(() => contactIdsForView(view, all, { serviceLabels, organizations }), [view, all, serviceLabels, organizations]);
   const filtering = query.trim() !== '' || view !== null;
-  const sections = useMemo(() => {
-    const rows = all.filter((c) => (!viewIds || viewIds.has(c.id)) && matches(c) && (filtering || scope === 'all' || statusInList(c.status, 'clients')));
-    return mergeClientSections(bucketBySection(rows, statusByKey)).filter((s) => s.rows.length > 0);
-  }, [all, viewIds, matches, filtering, scope, statusByKey]);
-  const visible = sections.reduce((n, s) => n + s.rows.length, 0);
+  const rows = useMemo(
+    () =>
+      all
+        .filter((c) => (!viewIds || viewIds.has(c.id)) && matches(c) && (filtering || scope === 'all' || statusInList(c.status, 'clients')))
+        .sort((a, b) => a.last_name.localeCompare(b.last_name) || a.first_name.localeCompare(b.first_name) || a.id.localeCompare(b.id)),
+    [all, viewIds, matches, filtering, scope],
+  );
+  const visible = rows.length;
 
   const statusLabel = useCallback((key: string) => statusByKey.get(key)?.label ?? key, [statusByKey]);
   const businessOf = useCallback((c: Contact) => orgsByContact.get(c.id)?.[0]?.name ?? c.business_name ?? '', [orgsByContact]);
 
   // ── Selection and the bulk bar ──────────────────────────────────
-  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [selected, setSelectedState] = useState<ReadonlySet<string>>(new Set());
+  // Bumped by every change to the selection. A bulk action notes it when it starts and puts
+  // its result into the selection only if it is unchanged when the server answers: by then
+  // the owner may have cleared, switched list or screen, and picked someone else.
+  const generation = useRef(0);
+  const setSelected = useCallback((next: SetStateAction<ReadonlySet<string>>) => {
+    generation.current += 1;
+    setSelectedState(next);
+  }, []);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkStatus, setBulkStatus] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(false);
   const { archiveOne, pending: archiving, setArchived } = useArchiveOne();
-  const selecting = selected.size > 0;
+  // What a bulk action acts on: the selected rows on screen. A search can hide a selected
+  // row for a moment; it stays selected, but nothing is done to it while it is out of view.
+  const targets = useMemo(() => rows.filter((c) => selected.has(c.id)).map((c) => c.id), [rows, selected]);
+  const selecting = targets.length > 0;
   // A selection belongs to the screen it was made on: moving to another screen (the board,
   // documents) clears it. A tab of the same screen keeps it, and so does a tab redirect.
   const screen = location.pathname.split('/')[1] ?? '';
-  useEffect(() => setSelected(new Set()), [screen]);
+  useEffect(() => setSelected(new Set()), [screen, setSelected]);
+
+  /** After a bulk action: `next` becomes the selection, unless it changed while the action ran. */
+  const settle = (startedAt: number, next: Iterable<string>) => {
+    if (generation.current !== startedAt) return false;
+    setSelected(new Set(next));
+    return true;
+  };
 
   const toggleSelect = (contactId: string) =>
     setSelected((prev) => {
@@ -127,16 +148,16 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
   const applyStatus = async () => {
     if (!bulkStatus || bulkBusy) return;
     setBulkBusy(true);
+    const startedAt = generation.current;
     try {
-      const result = await bulkUpdateStatus([...selected], bulkStatus);
+      const result = await bulkUpdateStatus(targets, bulkStatus);
       if (result.error) {
         toast.error(`Status changed on ${result.updated} of ${result.requested} contacts. ${result.error}`);
         // Failures stay selected, so they can be tried again.
-        setSelected(new Set(result.failedIds));
+        settle(startedAt, result.failedIds);
       } else {
         toast.success(`Status changed on ${result.updated} of ${result.requested} contacts.`);
-        setSelected(new Set());
-        setBulkStatus('');
+        if (settle(startedAt, [])) setBulkStatus('');
       }
     } finally {
       setBulkBusy(false);
@@ -147,10 +168,11 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
   const archiveSelected = async () => {
     if (bulkBusy) return;
     setBulkBusy(true);
+    const startedAt = generation.current;
     try {
-      const result = await setArchived.run([...selected], true);
+      const result = await setArchived.run(targets, true);
       // Failures stay selected, so they can be tried again.
-      setSelected(new Set(result.failedIds));
+      settle(startedAt, result.failedIds);
     } finally {
       setBulkBusy(false);
     }
@@ -159,8 +181,9 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
   const deleteSelected = async () => {
     setConfirmDelete(false);
     setBulkBusy(true);
+    const startedAt = generation.current;
     try {
-      const outcomes = await deleteContacts([...selected]);
+      const outcomes = await deleteContacts(targets);
       const failed = outcomes.filter((o) => !o.ok);
       const done = outcomes.length - failed.length;
       const names = new Map(all.map((c) => [c.id, c.full_name || c.business_name || 'Unnamed contact']));
@@ -171,7 +194,7 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
         });
       }
       // Failures stay selected, so they can be tried again.
-      setSelected(new Set(failed.map((f) => f.id)));
+      settle(startedAt, failed.map((f) => f.id));
     } finally {
       setBulkBusy(false);
       void queryClient.invalidateQueries({ queryKey: queryKeys.contacts.all });
@@ -179,8 +202,8 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
   };
 
   const exportSelected = () => {
-    const rows = all.filter((c) => selected.has(c.id));
-    downloadBlob(csvBlob(contactCsvRows(rows, { businessOf, statusLabel })), `contacts-selected-${todayISODate()}.csv`);
+    const chosen = rows.filter((c) => selected.has(c.id));
+    downloadBlob(csvBlob(contactCsvRows(chosen, { businessOf, statusLabel })), `contacts-selected-${todayISODate()}.csv`);
   };
 
   /** Where a row goes: the record, or this screen with the contact picked. */
@@ -214,23 +237,17 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
         }
       />
     );
-  } else if (sections.length === 0) {
+  } else if (rows.length === 0) {
     body = <p className="px-3 py-4 text-[13px] text-muted-foreground">{filtering ? 'No contacts match.' : 'No clients yet.'}</p>;
   } else {
-    body = sections.map((s) => (
-      <ContactIndexGroup
-        key={s.status}
-        section={s}
-        label={isClientLike(s.status) ? 'Clients' : statusLabel(s.status)}
-        count={s.rows.length}
-        collapsed={!filtering && !!s.collapsible && (collapsed[s.status] ?? true)}
-        onToggle={() => toggle(s.status)}
-      >
-        {s.rows.map((c) => (
+    body = (
+      <ul className="pt-1">
+        {rows.map((c) => (
           <ContactIndexRow
             key={c.id}
             contact={c}
             status={statusByKey.get(c.status)}
+            statusLabel={statusLabel(c.status)}
             selected={selected.has(c.id)}
             selecting={selecting}
             onToggleSelect={toggleSelect}
@@ -241,8 +258,8 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
             archiving={archiving.has(c.id)}
           />
         ))}
-      </ContactIndexGroup>
-    ));
+      </ul>
+    );
   }
 
   const selectableStatuses = (statuses.data ?? []).filter((s) => !isSystemStatus(s.key));
@@ -279,7 +296,7 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
       {selecting && (
         <div role="region" aria-label="Selected contacts" className="absolute inset-x-2 bottom-2 flex flex-col gap-2 rounded-lg border border-border bg-popover p-2.5 text-[13px] shadow-lg">
           <div className="flex items-center justify-between">
-            <span className="font-medium">{selected.size} selected</span>
+            <span className="font-medium">{targets.length} selected</span>
             <Button type="button" size="xs" variant="ghost" onClick={() => setSelected(new Set())}>
               Clear
             </Button>
@@ -308,7 +325,7 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
               </Button>
             ) : (
               <Button asChild size="xs" variant="outline">
-                <Link to={links.newGroupEmail([...selected])}>Email them</Link>
+                <Link to={links.newGroupEmail(targets)}>Email them</Link>
               </Button>
             )}
             <Button type="button" size="xs" variant="outline" disabled={bulkBusy} onClick={exportSelected}>
@@ -327,7 +344,7 @@ export function ClientPanel({ pickParam }: { pickParam?: string }) {
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete {selected.size} contacts?</AlertDialogTitle>
+            <AlertDialogTitle>Delete {targets.length} contacts?</AlertDialogTitle>
             <AlertDialogDescription>Each contact is deleted with everything recorded on it. This cannot be undone.</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

@@ -1,4 +1,4 @@
-import { Fragment, Suspense, useId, useState } from 'react';
+import { Fragment, Suspense, useEffect, useId, useState } from 'react';
 import { Link, Outlet, matchPath, useLocation } from 'react-router-dom';
 import { ChevronDown, LogOut, Menu, Moon, Settings, Sun } from 'lucide-react';
 import { BottomBar } from '@/components/layout/BottomBar';
@@ -294,7 +294,10 @@ export function AppShell(props: ShellProps) {
   const { isDark, toggle } = useTheme();
   const theme: ThemeControls = { isDark, toggle };
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const { pathname } = useLocation();
+  const { pathname, key: locationKey } = useLocation();
+  // Any move to another screen closes the drawer: its own rows, a New entry, and a dialog
+  // opened from it that goes on to a screen (Request's Next).
+  useEffect(() => setDrawerOpen(false), [locationKey]);
   const workspace = isWorkspacePage(pathname);
   const bounded = workspace || isBoundedPage(pathname);
 

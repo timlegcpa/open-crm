@@ -26,6 +26,23 @@ test('the folder view lists both sections and flags what needs review', async ({
   await expect(page.getByRole('main').getByRole('button', { name: 'Grace Hopper' }).filter({ visible: true }).first()).toBeVisible();
 });
 
+test('a dialog open on one contact closes when the browser goes Back to another', async ({ page, mock }) => {
+  await page.goto(`/documents?contact=${ID.grace}`);
+  await page.getByRole('complementary', { name: 'Contact list' }).getByRole('link', { name: 'Lovelace, Ada' }).click();
+  await expect(page).toHaveURL((url) => url.searchParams.get('contact') === ID.ada);
+  await page.getByRole('row', { name: /Agreements/ }).click();
+  await page.getByRole('button', { name: 'New folder' }).click();
+  const dialog = page.getByRole('dialog', { name: 'New folder' });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel('Folder name').fill('For Ada');
+
+  await page.goBack();
+  await expect(page).toHaveURL((url) => url.searchParams.get('contact') === ID.grace);
+  // Closed, so it can never make Ada's folder in Grace's documents.
+  await expect(dialog).toBeHidden();
+  expect(mock.callsTo('rest', 'client_folders').filter((c) => c.method === 'POST')).toEqual([]);
+});
+
 test('a document link opens the same viewer on its own page', async ({ page }) => {
   await page.goto(`/documents/${AGREEMENT_DOC}`);
   await expect(page.getByText('Page 1 of 1')).toBeVisible({ timeout: 20_000 });

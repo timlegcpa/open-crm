@@ -1,6 +1,5 @@
-import type { ReactNode } from 'react';
 import { Link, NavLink } from 'react-router-dom';
-import { Archive, ChevronRight } from 'lucide-react';
+import { Archive } from 'lucide-react';
 import type { Contact } from '@/api/contacts';
 import type { ContactStatus } from '@/api/pickLists';
 import { StatusMonogram } from '@/components/contacts/StatusBadge';
@@ -9,7 +8,7 @@ import { ClickRegion } from '@/components/ui/click-region';
 import { initialsOf } from '@/components/ui/monogram';
 import { links } from '@/features/links';
 import { cn } from '@/lib/utils';
-import { contactRowName, type CrmSection } from '../lib/sections';
+import { contactRowName } from '../lib/sections';
 
 const NAME_LINK = 'min-w-0 flex-1 truncate rounded-sm text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring';
 
@@ -22,6 +21,7 @@ const NAME_LINK = 'min-w-0 flex-1 truncate rounded-sm text-[13px] outline-none f
 export function ContactIndexRow({
   contact,
   status,
+  statusLabel,
   selected,
   selecting,
   onToggleSelect,
@@ -33,6 +33,8 @@ export function ContactIndexRow({
 }: {
   contact: Contact;
   status: ContactStatus | undefined;
+  /** The status in words, for a screen reader: the eye reads it off the monogram's tint. */
+  statusLabel?: string;
   selected: boolean;
   /** Something is selected: every row shows its checkbox. */
   selecting: boolean;
@@ -75,6 +77,7 @@ export function ContactIndexRow({
           {name}
         </NavLink>
       )}
+      {statusLabel && <span className="sr-only">{statusLabel}</span>}
       {onArchive && (
         <ClickRegion
           aria-label={`Archive ${name}`}
@@ -87,45 +90,5 @@ export function ContactIndexRow({
         </ClickRegion>
       )}
     </li>
-  );
-}
-
-/** A section heading: its status label and count; a collapsible one toggles. */
-export function ContactIndexGroup({
-  section,
-  label,
-  count,
-  collapsed,
-  onToggle,
-  children,
-}: {
-  section: CrmSection;
-  label: string;
-  count: number;
-  collapsed: boolean;
-  onToggle: () => void;
-  children: ReactNode;
-}) {
-  const heading = (
-    <>
-      {section.collapsible && (
-        <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', !collapsed && 'rotate-90')} aria-hidden="true" />
-      )}
-      <span className="truncate">{label}</span>
-      <span className="ml-auto tabular-nums">{count}</span>
-    </>
-  );
-  const headClass = 'flex w-full items-center gap-1.5 px-3 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground';
-  return (
-    <section aria-label={label}>
-      {section.collapsible ? (
-        <ClickRegion aria-expanded={!collapsed} onClick={onToggle} className={cn(headClass, 'hover:text-foreground')}>
-          {heading}
-        </ClickRegion>
-      ) : (
-        <h3 className={headClass}>{heading}</h3>
-      )}
-      {!collapsed && <ul>{children}</ul>}
-    </section>
   );
 }

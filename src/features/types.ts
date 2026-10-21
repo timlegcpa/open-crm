@@ -280,14 +280,15 @@ export const BOUNDED_PAGE: OwnerRouteHandle = { bounded: true };
 export interface WorkspaceRouteHandle extends OwnerRouteHandle {
   /**
    * Below `lg` there is room for one pane. True when the client panel is that pane: where
-   * choosing a contact IS the screen (the documents page with nobody picked). Default: the
-   * screen wins.
+   * choosing a contact IS the screen. Default: the screen wins (a `pickParam` screen has its
+   * own rule, below).
    */
   panelFirst?: (search: URLSearchParams) => boolean;
   /**
    * A pick in the client panel sets this query parameter on the current screen (documents:
-   * `?contact=<id>`), and the panel marks the contact it names. Default: a pick opens the
-   * contact's record.
+   * `?contact=<id>`), and the panel marks the contact it names. Below `lg` the panel is the
+   * screen until the parameter holds a valid id, the same check the page makes before it
+   * reads one. Default: a pick opens the contact's record.
    */
   pickParam?: string;
 }

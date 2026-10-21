@@ -123,19 +123,24 @@ beforeEach(() => {
 afterEach(() => setWide(false));
 
 describe('contacts index', () => {
-  it('puts every contact under its status section, titled from the table, clients as "Last, First"', async () => {
-    renderAt('/contacts?tab=all');
-    expect(await screen.findByRole('region', { name: 'New' })).toHaveTextContent('Ada Example');
-    expect(screen.getByRole('region', { name: 'Hot' })).toHaveTextContent('Cy Test');
-    // The clients are one list, whatever their status's own label.
-    expect(screen.getByRole('region', { name: 'Clients' })).toHaveTextContent('Sample, Bo');
+  it('lists everyone as ONE A-Z list by last name, leads and clients mixed, clients as "Last, First"', async () => {
+    fake.state.tables.contacts.push(
+      contact('10000000-0000-4000-8000-00000000000d', 'Zoe', 'Zulu', { status: 'hot' }),
+      contact('10000000-0000-4000-8000-00000000000e', 'Al', 'Able', { status: 'client' }),
+    );
+    renderAt('/contacts?tab=pipeline');
+    await screen.findByText('Sample, Bo');
+    // No status sections: a lead named Zulu sorts after a client named Able.
+    expect(indexNames()).toEqual(['Able, Al', 'Ada Example', 'Sample, Bo', 'Cy Test', 'Zoe Zulu']);
+    expect(screen.queryByRole('region', { name: 'Hot' })).toBeNull();
   });
 
-  it('shows a renamed status label straight from the table', async () => {
+  it("a row says its status in the table's own words, for a screen reader", async () => {
     fake.state.tables.contact_statuses[0].label = 'Fresh enquiry';
-    renderAt('/contacts?tab=all');
+    renderAt('/contacts?tab=pipeline');
     await screen.findByText('Ada Example');
-    expect(screen.getByRole('region', { name: 'Fresh enquiry' })).toHaveTextContent('Ada Example');
+    const row = screen.getByRole('checkbox', { name: 'Select Ada Example' }).closest('li') as HTMLElement;
+    expect(row).toHaveTextContent('Fresh enquiry');
   });
 
   it('searches name, email, business, phone digits and the spouse', async () => {
@@ -174,13 +179,51 @@ describe('contacts index', () => {
     await screen.findByText('Sample, Bo');
     expect(screen.getByRole('radio', { name: 'Clients' })).toHaveAttribute('aria-checked', 'true');
     expect(indexNames()).toEqual(['Able, Di', 'Sample, Bo', 'Zed, Ed']);
-    expect(screen.getByRole('region', { name: 'Clients' })).toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: 'One-time client' })).toBeNull();
-    // A search reaches everyone, and the clients stay one list.
+    // A search reaches everyone, still one A-Z list.
     fireEvent.change(screen.getByLabelText('Search contacts'), { target: { value: 'e' } });
-    expect(screen.getByRole('region', { name: 'Clients' })).toHaveTextContent('Able, Di');
-    expect(screen.queryByRole('region', { name: 'One-time client' })).toBeNull();
-    expect(indexNames()).toContain('Ada Example');
+    expect(indexNames()).toEqual(['Able, Di', 'Ada Example', 'Sample, Bo', 'Cy Test', 'Zed, Ed']);
+  });
+
+  it('switching the list clears the selection, and a bulk action never reaches a row out of view', async () => {
+    renderAt('/contacts?tab=pipeline');
+    await screen.findByText('Ada Example');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Sample, Bo' }));
+    const bar = () => screen.getByRole('region', { name: 'Selected contacts' });
+    expect(bar()).toHaveTextContent('2 selected');
+
+    // A search hides the lead: the bar counts, and acts on, the client alone.
+    fireEvent.change(screen.getByLabelText('Search contacts'), { target: { value: 'sample' } });
+    expect(bar()).toHaveTextContent('1 selected');
+    const email = new URL(within(bar()).getByRole('link', { name: 'Email them' }).getAttribute('href')!, 'http://x');
+    expect(email.searchParams.get('to')).toBe(BO);
+
+    // The Clients switch is another list: what was selected over All is let go.
+    fireEvent.change(screen.getByLabelText('Search contacts'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Cy Test' }));
+    expect(bar()).toHaveTextContent(/selected/);
+    fireEvent.click(screen.getByRole('radio', { name: 'Clients' }));
+    expect(screen.queryByRole('region', { name: 'Selected contacts' })).toBeNull();
+    fireEvent.click(screen.getByRole('radio', { name: 'All' }));
+    expect(screen.getByRole('checkbox', { name: 'Select Cy Test' })).not.toBeChecked();
+  });
+
+  it('a bulk failure that lands after the owner moved on leaves the new selection alone', async () => {
+    renderAt('/contacts?tab=pipeline');
+    await screen.findByText('Ada Example');
+    let release!: () => void;
+    fake.state.holds['contacts:update'] = new Promise<void>((resolve) => (release = resolve));
+    fake.state.errors['contacts:update'] = { message: 'permission denied' };
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Ada Example' }));
+    const bar = () => screen.getByRole('region', { name: 'Selected contacts' });
+    fireEvent.click(within(bar()).getByRole('button', { name: 'Archive' }));
+    // While it is saving the owner clears and picks someone else.
+    fireEvent.click(within(bar()).getByRole('button', { name: 'Clear' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Cy Test' }));
+    release();
+    expect(await screen.findByText(/0 of 1 contacts archived/)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Select Cy Test' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Select Ada Example' })).not.toBeChecked();
   });
 
   it('the workspace tabs are links, remembered, and leaving the contacts screen clears the selection', async () => {
@@ -210,7 +253,6 @@ describe('contacts index', () => {
     await waitFor(() => expect(screen.getByRole('tab', { name: 'Tiers' })).toHaveAttribute('aria-selected', 'true'));
     first.unmount();
     localStorage.setItem('open-crm:contacts:tab', 'null');
-    localStorage.setItem('open-crm:contacts:collapsed', '3');
     const second = renderAt('/contacts');
     await screen.findByText('Sample, Bo');
     await waitFor(() => expect(window.location.search).toBe('?tab=pipeline'));
@@ -755,7 +797,9 @@ describe('record overview', () => {
     renderAt(`/contacts/${BO}`);
     await screen.findByRole('heading', { name: 'Bo Sample' });
     expect(screen.getByRole('img', { name: 'A tier' })).toBeInTheDocument();
-    expect(within(await screen.findByRole('region', { name: 'Clients' })).queryByRole('img', { name: /tier/ })).toBeNull();
+    const panel = await screen.findByRole('complementary', { name: 'Contact list' });
+    await within(panel).findByText('Sample, Bo');
+    expect(within(panel).queryByRole('img', { name: /tier/ })).toBeNull();
   });
 
   it('deletes through the edge function from the More menu and returns to the list', async () => {

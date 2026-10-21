@@ -17,11 +17,7 @@ export const manifest: FeatureManifest = {
   workspaceRoutes: [
     // The explorer lays out its own scrolling panes. The client panel picks whose files
     // show (`?contact=`), and on a phone it is the screen until someone is picked.
-    {
-      path: 'documents',
-      element: <DocumentsPage />,
-      handle: { ...BOUNDED_PAGE, pickParam: 'contact', panelFirst: (search: URLSearchParams) => !search.get('contact') },
-    },
+    { path: 'documents', element: <DocumentsPage />, handle: { ...BOUNDED_PAGE, pickParam: 'contact' } },
   ],
   // The workstation lays out its own scrolling panes.
   ownerRoutes: [{ path: 'documents/:id', element: <DocumentPage />, handle: BOUNDED_PAGE }],

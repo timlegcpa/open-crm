@@ -1,5 +1,6 @@
 import { Suspense, useMemo, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { isUuid } from '@/api/contacts';
 import { TOPBAR_SLOT_ID } from '@/components/layout/topbarSlot';
 import { PageTabsList, PageTabsTrigger } from '@/components/ui/page-tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -25,7 +26,8 @@ export const CLIENT_PANEL_W = 'w-[240px]';
  * the row under it: THE top-bar slot lives here on a workspace screen, one id, one element.
  *
  * Below `lg` there is room for one pane: the client panel where choosing a contact IS the
- * screen (the route's `panelFirst`), else the screen. The screen stays MOUNTED either way,
+ * screen (the route's `panelFirst`, or a `pickParam` screen until its pick is a valid id),
+ * else the screen. The screen stays MOUNTED either way,
  * only hidden, so its own effects (a tab redirect) still run on a phone.
  */
 export function WorkspaceLayout() {
@@ -36,7 +38,8 @@ export function WorkspaceLayout() {
   const search = useMemo(() => new URLSearchParams(location.search), [location.search]);
   const handle = workspaceHandle(location.pathname);
   const active = activeWorkspaceTab(location.pathname, search);
-  const panelFirst = !wide && (handle.panelFirst?.(search) ?? false);
+  const pickMissing = !!handle.pickParam && !isUuid(search.get(handle.pickParam) ?? undefined);
+  const panelFirst = !wide && (handle.panelFirst?.(search) ?? pickMissing);
   const bounded = isBoundedPage(location.pathname);
   const searchValue = useMemo(() => ({ query, setQuery }), [query]);
 

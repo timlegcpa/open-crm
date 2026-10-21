@@ -297,8 +297,8 @@ describe('feature registry', () => {
 
   it('reads the deepest handle: the documents pick and the phone rule', () => {
     expect(workspaceHandle('/documents').pickParam).toBe('contact');
-    expect(workspaceHandle('/documents').panelFirst?.(new URLSearchParams())).toBe(true);
-    expect(workspaceHandle('/documents').panelFirst?.(new URLSearchParams('contact=c-1'))).toBe(false);
+    // A pick screen's phone rule is the layout's (panel until the pick is a valid id).
+    expect(workspaceHandle('/documents').panelFirst).toBeUndefined();
     expect(workspaceHandle('/contacts').panelFirst?.(new URLSearchParams('tab=pipeline'))).toBe(true);
     expect(workspaceHandle('/contacts').panelFirst?.(new URLSearchParams('tab=tiers'))).toBe(false);
     // An open record is the screen: its own handle carries no phone rule.
