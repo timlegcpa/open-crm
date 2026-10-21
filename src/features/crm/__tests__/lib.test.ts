@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Contact, ContactService } from '@/api/contacts';
-import { PIPELINE_STATUSES, SELECTABLE_STATUSES, STORED_STATUSES } from '@/lib/contactStatus';
+import { PIPELINE_STATUSES, SELECTABLE_STATUSES } from '@/lib/contactStatus';
 import { parseCsv, toCsv } from '@/lib/csv';
 import { activityAfter, flattenActivity } from '../api';
 import { ACTIVITY_CATALOG, describeActivity } from '@/lib/activityCatalog';
@@ -26,15 +26,11 @@ import { allowedOrganizationStatusTargets, findOrganizationNameClash } from '../
 import { contactPatchForQuoteChange, parseCurrencyInput, statusChangePatch } from '../lib/quotes';
 import {
   addedAt,
-  bucketBySection,
   contactRowName,
   CRM_LISTS,
-  CRM_SECTIONS,
   CRM_TABS,
   isCrmTabKey,
-  mergeClientSections,
   resolveCrmTab,
-  statusesWithoutSection,
   statusInList,
 } from '../lib/sections';
 import { addedCutoff, crmTableMrrTotal, crmTableRows, DEFAULT_CRM_TABLE_FILTERS } from '../lib/table';
@@ -90,13 +86,6 @@ function contact(id: string, extra: Partial<Contact> = {}): Contact {
 const SOURCES = { serviceLabels: new Map([['retainer', 'Retainer']]), organizations: [] };
 
 describe('sections', () => {
-  it('every stored status belongs to exactly one section, so no contact can vanish', () => {
-    expect(statusesWithoutSection()).toEqual([]);
-    const held = CRM_SECTIONS.map((s) => s.status);
-    expect(new Set(held).size).toBe(held.length);
-    expect([...held].sort()).toEqual([...STORED_STATUSES].sort());
-  });
-
   it('the Leads list is the pipeline and Clients holds paying contacts only', () => {
     expect(CRM_LISTS.find((l) => l.key === 'leads')!.statuses).toEqual([...PIPELINE_STATUSES]);
     expect(statusInList('client', 'clients')).toBe(true);
@@ -107,18 +96,6 @@ describe('sections', () => {
     expect(statusInList('client', 'active')).toBe(true);
     expect(statusInList('one_time', 'active')).toBe(false);
     expect(statusInList('one_time', 'clients')).toBe(true);
-  });
-
-  it('sorts client sections A-Z by last name, every other section newest added first', () => {
-    const rows = [
-      contact('1', { status: 'client', first_name: 'Zed', last_name: 'Adams' }),
-      contact('2', { status: 'client', first_name: 'Amy', last_name: 'Young' }),
-      contact('3', { created_at: '2026-01-01T00:00:00Z' }),
-      contact('4', { created_at: '2025-06-01T00:00:00Z', submitted_at: '2026-02-01T00:00:00Z' }),
-    ];
-    const sections = bucketBySection(rows);
-    expect(sections.find((s) => s.status === 'client')!.rows.map((r) => r.id)).toEqual(['1', '2']);
-    expect(sections.find((s) => s.status === 'new_lead')!.rows.map((r) => r.id)).toEqual(['4', '3']);
   });
 
   it('names a client "Last, First" and anyone else naturally, falling back to the business', () => {
@@ -242,11 +219,6 @@ describe('status order comes from the database', () => {
     ['hot', { sort_order: 1 }],
     ['new_lead', { sort_order: 2 }],
   ]);
-  it('sections follow sort_order, and statuses it does not list keep code order after them', () => {
-    const sections = bucketBySection([], order).map((s) => s.status);
-    expect(sections.slice(0, 3)).toEqual(['hot', 'new_lead', 'active_lead']);
-    expect(bucketBySection([]).map((s) => s.status)).toEqual(CRM_SECTIONS.map((s) => s.status));
-  });
   it('board columns follow sort_order', () => {
     expect(leadPipeline([], { ...SOURCES, statusOrder: order }).map((g) => g.status)).toEqual(['hot', 'new_lead', 'active_lead', 'warm', 'cold']);
   });
@@ -417,8 +389,8 @@ it('the status keys offered never include a system status', () => {
 });
 
 describe('tabs', () => {
-  it('run Clients, Pipeline, Tiers, All, Table, each naming a real list', () => {
-    expect(CRM_TABS.map((t) => t.key)).toEqual(['clients', 'pipeline', 'tiers', 'all', 'table']);
+  it('run Pipeline, Tiers, Table, each naming a real list (Clients and All are the panel switch)', () => {
+    expect(CRM_TABS.map((t) => t.key)).toEqual(['pipeline', 'tiers', 'table']);
     const lists = new Set<string>(CRM_LISTS.map((l) => l.key));
     for (const t of CRM_TABS) expect(lists.has(t.list), t.key).toBe(true);
   });
@@ -428,36 +400,15 @@ describe('tabs', () => {
     expect(CRM_TABS.find((t) => t.key === 'table')).toMatchObject({ list: 'all', pane: 'table' });
   });
 
-  it('an explicit ?tab= wins, then the remembered tab, then Clients; anything else is refused', () => {
+  it('an explicit ?tab= wins, then the remembered tab, then Pipeline; anything else is refused', () => {
     expect(resolveCrmTab('tiers', 'table')).toBe('tiers');
     expect(resolveCrmTab(null, 'table')).toBe('table');
-    expect(resolveCrmTab('nonsense', 'pipeline')).toBe('pipeline');
-    expect(resolveCrmTab(null, null)).toBe('clients');
-    expect(resolveCrmTab(null, 3)).toBe('clients');
+    expect(resolveCrmTab('nonsense', 'tiers')).toBe('tiers');
+    expect(resolveCrmTab(null, null)).toBe('pipeline');
+    expect(resolveCrmTab(null, 3)).toBe('pipeline');
+    // The old list tabs, linked or remembered, are not tabs any more.
+    expect(resolveCrmTab('clients', null)).toBe('pipeline');
+    expect(resolveCrmTab(null, 'all')).toBe('pipeline');
     expect(isCrmTabKey('leads')).toBe(false);
-  });
-});
-
-describe('the merged Clients list', () => {
-  const rows = [
-    contact('1', { status: 'client', first_name: 'Al', last_name: 'Young' }),
-    contact('2', { status: 'one_time', first_name: 'Jo', last_name: 'Adams' }),
-    contact('3', { status: 'client', first_name: 'Kim', last_name: 'Brown' }),
-    contact('4', { status: 'one_time', first_name: 'Abe', last_name: 'Brown' }),
-    contact('5', { status: 'new_lead', first_name: 'Lee', last_name: 'Zed' }),
-  ];
-
-  it('folds one-time clients into one list, A-Z by last name then first', () => {
-    const merged = mergeClientSections(bucketBySection(rows));
-    const clients = merged.find((s) => s.status === 'client')!;
-    expect(clients.rows.map((r) => r.id)).toEqual(['2', '4', '3', '1']);
-    expect(clients.collapsible).toBe(false);
-    expect(merged.some((s) => s.status === 'one_time')).toBe(false);
-  });
-
-  it('leaves every other section alone', () => {
-    const merged = mergeClientSections(bucketBySection(rows));
-    expect(merged.find((s) => s.status === 'new_lead')!.rows.map((r) => r.id)).toEqual(['5']);
-    expect(merged).toHaveLength(CRM_SECTIONS.length - 1);
   });
 });

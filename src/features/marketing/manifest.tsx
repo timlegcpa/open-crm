@@ -6,6 +6,6 @@ const MarketingPage = lazyNamed(() => import('./pages'), 'MarketingPage');
 
 export const manifest: FeatureManifest = {
   id: 'marketing',
-  ownerNav: [{ label: 'Marketing', icon: TrendingUp, path: '/marketing', order: 10, section: 'growth' }],
-  ownerRoutes: [{ path: 'marketing', element: <MarketingPage /> }],
+  workspaceTabs: [{ key: 'marketing', label: 'Marketing', icon: TrendingUp, path: '/marketing', order: 30 }],
+  workspaceRoutes: [{ path: 'marketing', element: <MarketingPage /> }],
 };

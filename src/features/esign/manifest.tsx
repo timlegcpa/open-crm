@@ -1,5 +1,6 @@
 import { PenLine } from 'lucide-react';
 import { lazyNamed } from '@/features/lazy';
+import { links } from '@/features/links';
 import type { FeatureManifest } from '@/features/types';
 
 const EsignPage = lazyNamed(() => import('./pages'), 'EsignPage');
@@ -17,11 +18,14 @@ const VerifyPage = lazyNamed(() => import('./public/VerifyPage'), 'VerifyPage');
 export const manifest: FeatureManifest = {
   id: 'esign',
   ownerNav: [{ label: 'E-sign', icon: PenLine, path: '/esign', order: 50, section: 'workflow' }],
+  workspaceTabs: [{ key: 'esign', label: 'E-sign', icon: PenLine, path: '/esign', order: 70 }],
+  workspaceRoutes: [{ path: 'esign', element: <EsignPage /> }],
+  // The composer and an envelope are editors with their own chrome, outside the workspace.
   ownerRoutes: [
-    { path: 'esign', element: <EsignPage /> },
     { path: 'esign/new', element: <NewEnvelopePage /> },
     { path: 'esign/:id', element: <EnvelopePage /> },
   ],
+  newMenu: [{ key: 'envelope', label: 'E-sign envelope', icon: PenLine, order: 40, path: links.newEnvelope() }],
   portalRoutes: [{ path: 'sign', element: <PortalSignPage /> }],
   portalHomeCards: [{ key: 'esign', order: 15, Component: SignatureNeededCard }],
   publicRoutes: [

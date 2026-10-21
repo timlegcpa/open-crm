@@ -177,20 +177,22 @@ describe('the signed-in gate', () => {
 
   it("never wipes a principal's first queries with the clear meant for the one before", async () => {
     fake.state.session = OWNER;
-    // The All tab: the default Clients tab does not list a lead.
-    renderAt('/contacts?tab=all');
+    // The Table tab lists every contact, the lead included.
+    renderAt('/contacts?tab=table');
     expect(await screen.findByText('Ada Example')).toBeInTheDocument();
 
     await authEvent('SIGNED_OUT', null);
     await screen.findByLabelText('Email');
-    const before = fake.calls('contacts', 'select').length;
+    // The list read, not the bottom bar's head-only counts (those read the id column alone).
+    const listReads = () => fake.calls('contacts', 'select').filter((c) => c.columns !== 'id').length;
+    const before = listReads();
 
     // Back in as the owner: every chunk is loaded now, so the list renders in the same
     // pass as the gate opens. Its query must survive, and run once.
     await authEvent('SIGNED_IN', OWNER);
     expect(await screen.findByText('Ada Example')).toBeInTheDocument();
     await act(async () => {});
-    expect(fake.calls('contacts', 'select').length - before).toBe(1);
+    expect(listReads() - before).toBe(1);
     expect(queryClient.getQueryCache().getAll().length).toBeGreaterThan(0);
   });
 });

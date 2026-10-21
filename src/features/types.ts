@@ -1,4 +1,4 @@
-import type { ComponentType, LazyExoticComponent } from 'react';
+import type { ComponentType, LazyExoticComponent, ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import type { RouteObject } from 'react-router-dom';
 
@@ -25,7 +25,7 @@ import type { RouteObject } from 'react-router-dom';
  *   `public-*`, and bundleBoundary.test.ts proves it never loads supabase-js).
  */
 
-/** The sidebar's groups, in display order. A nav item with no section sits at the top, without a heading. */
+/** The rail's groups, in display order (a hairline apart; headed in the phone drawer). A nav item with no section sits at the top. */
 export const NAV_SECTIONS = [
   { key: 'workflow', label: 'Workflow' },
   { key: 'growth', label: 'Growth' },
@@ -65,6 +65,11 @@ export interface OwnerNavItem {
   badge?: BadgeComponent;
   /** Highlight only on the exact path. */
   end?: boolean;
+  /**
+   * The item stands for the workspace: it is also highlighted on every workspace screen
+   * that no other rail item claims (the board, requests, messages...). One item sets it.
+   */
+  workspace?: boolean;
 }
 
 export interface PortalTab {
@@ -159,12 +164,87 @@ export interface PortalProfileSection {
   Component: LazyComponent;
 }
 
+/**
+ * A tab on the workspace's one strip (the board, the pipeline, requests...), contributed by
+ * the feature that owns the screen. The strip sits above every workspace screen, beside the
+ * client panel. A tab is a link: it is on while the URL is under `path` and carries every
+ * query parameter `path` names ('/contacts?tab=tiers').
+ */
+export interface WorkspaceTab {
+  /** Unique across features. */
+  key: string;
+  label: string;
+  /** Drawn alone on a phone, where the labels do not fit; the label stays its name. */
+  icon: LucideIcon;
+  /** Absolute, may carry a query: '/requests', '/contacts?tab=tiers'. Must open a workspace route. */
+  path: string;
+  order: number;
+  /** What is WAITING behind the tab (never a total): a lazy <CountBadge> or null. */
+  badge?: BadgeComponent;
+}
+
+/** What a shell count receives: the number, once known, to draw however the shell draws it. */
+export interface ShellCountProps {
+  children: (value: number | undefined) => ReactNode;
+}
+
+/**
+ * A figure in the shell's bottom bar, contributed by the feature that owns it. `waiting` is
+ * what is waiting on the owner (unread, to review, to accept); `total` is the size of the
+ * book (clients, open leads). Each is a link to where the work is. `Count` is lazy and runs
+ * its own query, on the same key as the feature's badge, so the two share one fetch.
+ */
+export interface ShellCount {
+  /** Unique across features. */
+  key: string;
+  label: string;
+  /** Absolute, may carry a query. */
+  path: string;
+  order: number;
+  kind: 'waiting' | 'total';
+  Count: LazyComponent<ShellCountProps>;
+}
+
+/** What a New-menu dialog receives: it opens where the owner is and closes itself. */
+export interface NewMenuDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}
+
+/**
+ * An entry in the shell's one New menu (Contact, Work item, Request, E-sign envelope),
+ * contributed by the feature that creates the thing. Exactly one of `path` (go to the
+ * feature's own create screen) or `Dialog` (open the feature's create dialog on the page
+ * the owner is on).
+ */
+export interface NewMenuItem {
+  /** Unique across features. */
+  key: string;
+  label: string;
+  icon: LucideIcon;
+  order: number;
+  path?: string;
+  Dialog?: LazyComponent<NewMenuDialogProps>;
+}
+
 export interface FeatureManifest {
   /** The folder name under src/features/. */
   id: string;
+  /** The rail. A screen that is a workspace tab is not also a rail item. */
   ownerNav?: OwnerNavItem[];
-  /** Owner routes inside the shell (sidebar, top bar). Relative paths; `{ index: true }` is '/'. */
+  /** Owner routes inside the shell (rail, top bar). Relative paths; `{ index: true }` is '/'. */
   ownerRoutes?: RouteObject[];
+  /**
+   * Owner routes inside the WORKSPACE: the shell, plus the client panel on the left and the
+   * tab strip across the top, mounted once while the screen under them changes. Relative
+   * paths. The workspace bounds every screen; one without `handle: BOUNDED_PAGE` scrolls in
+   * a ScrollArea the workspace provides. `handle` may also carry `panelFirst`/`pickParam`
+   * (WorkspaceRouteHandle).
+   */
+  workspaceRoutes?: RouteObject[];
+  workspaceTabs?: WorkspaceTab[];
+  shellCounts?: ShellCount[];
+  newMenu?: NewMenuItem[];
   /** Owner-only routes WITHOUT the shell (a connector's consent popup). Relative paths. */
   ownerStandaloneRoutes?: RouteObject[];
   portalTabs?: PortalTab[];
@@ -195,3 +275,23 @@ export interface OwnerRouteHandle {
 
 /** `handle` for an owner route whose page manages its own scrolling: `{ path: 'board', element: <BoardPage />, handle: BOUNDED_PAGE }`. */
 export const BOUNDED_PAGE: OwnerRouteHandle = { bounded: true };
+
+/** What a workspace route may carry in `handle`, read for the deepest route that matched. */
+export interface WorkspaceRouteHandle extends OwnerRouteHandle {
+  /**
+   * Below `lg` there is room for one pane. True when the client panel is that pane: where
+   * choosing a contact IS the screen. Default: the screen wins (a `pickParam` screen has its
+   * own rule, below).
+   */
+  panelFirst?: (search: URLSearchParams) => boolean;
+  /**
+   * A pick in the client panel sets this query parameter on the current screen (documents:
+   * `?contact=<id>`), and the panel marks the contact it names. Below `lg` the panel is the
+   * screen until the parameter holds a valid id, the same check the page makes before it
+   * reads one. Default: a pick opens the contact's record.
+   */
+  pickParam?: string;
+}
+
+/** The id of the client panel's search box: Ctrl K focuses it while it is on screen. */
+export const CLIENT_PANEL_SEARCH_ID = 'workspace-client-search';

@@ -4,42 +4,52 @@ test.beforeEach(async ({ page, mock }) => {
   await signIn(page, mock, 'owner');
 });
 
-test('the contacts list shows every contact, grouped, and opens a record', async ({ page }) => {
-  await page.goto('/contacts?tab=all');
-  await expect(page.getByText('2 contacts')).toBeVisible();
-  const ada = page.getByRole('link', { name: /Lovelace, Ada/ }).first();
+const panel = (page: import('@playwright/test').Page) => page.getByRole('complementary', { name: 'Contact list' });
+
+test('the client panel lists every contact, grouped, and opens a record', async ({ page }) => {
+  await page.goto('/contacts');
+  await expect(panel(page).getByText('2 contacts')).toBeVisible();
+  const ada = panel(page).getByRole('link', { name: 'Lovelace, Ada' });
   await expect(ada).toBeVisible();
-  await expect(page.getByRole('link', { name: /Grace Hopper/ }).first()).toBeVisible();
+  await expect(panel(page).getByRole('link', { name: 'Grace Hopper' })).toBeVisible();
 
   await ada.click();
   await expect(page).toHaveURL(new RegExp(`/contacts/${ID.ada}$`));
   await expect(page.getByRole('heading', { level: 1, name: 'Ada Lovelace' })).toBeVisible();
+  // The panel stays, marking the contact on screen; no strip tab is on over a record.
+  await expect(panel(page).getByRole('link', { name: 'Lovelace, Ada' })).toHaveAttribute('aria-current', 'page');
+  await expect(page.getByRole('tablist', { name: 'Workspace' }).getByRole('tab', { selected: true })).toHaveCount(0);
 });
 
-test('the page opens on Clients; the tabs are links, and Tiers ranks the active clients', async ({ page }) => {
+test('the page opens on the pipeline; the strip tabs are links, Tiers ranks, and the panel switches to Clients', async ({ page }) => {
   await page.goto('/contacts');
-  const tabs = page.getByRole('tablist', { name: 'Contact lists' });
-  await expect(tabs.getByRole('tab', { name: 'Clients' })).toHaveAttribute('aria-selected', 'true');
-  const index = page.getByRole('region', { name: 'Clients' });
-  await expect(index.getByRole('link', { name: 'Lovelace, Ada' })).toBeVisible();
-  // A lead is not a client: Grace is on the board, not in the Clients list.
-  await expect(index.getByRole('link', { name: /Grace/ })).toHaveCount(0);
+  await expect(page).toHaveURL(/\/contacts\?tab=pipeline$/);
+  const tabs = page.getByRole('tablist', { name: 'Workspace' });
+  await expect(tabs.getByRole('tab', { name: 'Pipeline' })).toHaveAttribute('aria-selected', 'true');
+
+  // All by default; Clients is every paying contact, so the lead leaves the list.
+  await panel(page).getByRole('radio', { name: 'Clients' }).click();
+  await expect(panel(page).getByRole('link', { name: 'Lovelace, Ada' })).toBeVisible();
+  await expect(panel(page).getByRole('link', { name: /Grace/ })).toHaveCount(0);
 
   await tabs.getByRole('tab', { name: 'Tiers' }).click();
   await expect(page).toHaveURL(/\/contacts\?tab=tiers$/);
   await expect(page.getByRole('region', { name: 'S tier' }).getByRole('button', { name: 'Open Lovelace, Ada' })).toBeVisible();
-  // Remembered: a bare /contacts comes back to Tiers.
+  // Remembered: a bare /contacts comes back to Tiers, and the panel to Clients.
   await page.goto('/contacts');
   await expect(tabs.getByRole('tab', { name: 'Tiers' })).toHaveAttribute('aria-selected', 'true');
+  await expect(panel(page).getByRole('radio', { name: 'Clients' })).toHaveAttribute('aria-checked', 'true');
 });
 
 test('a contact is archived from the list, leaves every list, and comes back from Archived', async ({ page, mock }) => {
-  await page.goto('/contacts?tab=all');
-  await expect(page.getByRole('link', { name: /Grace Hopper/ }).first()).toBeVisible();
-  await page.getByRole('button', { name: 'Archive Grace Hopper' }).first().click();
+  await page.goto('/contacts');
+  await expect(panel(page).getByRole('link', { name: 'Grace Hopper' })).toBeVisible();
+  await panel(page).getByRole('button', { name: 'Archive Grace Hopper' }).click();
   await expect(page.getByText('Grace Hopper archived. The record is kept.')).toBeVisible();
   await expect(page.getByRole('link', { name: /Grace Hopper/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Show Grace Hopper' })).toHaveCount(0);
+  // Off the book's figures too: Grace was the one open lead.
+  await expect(page.getByRole('region', { name: 'Status' }).getByRole('link', { name: /^Open leads/ })).toHaveText('Open leads0');
   const archive = mock.callsTo('rest', 'contacts').find((c) => c.method === 'PATCH');
   expect(Object.keys(archive?.json as object)).toEqual(['archived_at']);
 

@@ -20,13 +20,18 @@ test.describe('owner sign-in', () => {
     await page.getByLabel('Code').fill('123456');
     await page.getByRole('button', { name: 'Verify' }).click();
 
+    // The rail holds the doors; the workspace's screens are the tabs across the top.
     const nav = page.getByRole('navigation', { name: 'Main' });
     await expect(nav).toBeVisible();
-    for (const item of ['Contacts', 'Board', 'Requests', 'Documents', 'Messages', 'E-sign', 'Marketing', 'Email', 'Settings']) {
+    for (const item of ['Contacts', 'Documents', 'E-sign', 'Email', 'Settings']) {
       await expect(nav.getByRole('link', { name: item, exact: true })).toBeVisible();
     }
-    await expect(page.getByText(`Signed in as ${OWNER.email}.`)).toBeVisible();
-    await expect(page.getByRole('link', { name: /Lovelace, Ada/ })).toBeVisible();
+    const strip = page.getByRole('tablist', { name: 'Workspace' });
+    for (const tab of ['Board', 'Pipeline', 'Marketing', 'Tiers', 'Table', 'Requests', 'Messages', 'E-sign']) {
+      await expect(strip.getByRole('tab', { name: new RegExp(`^${tab}`) })).toBeVisible();
+    }
+    await expect(page.getByRole('button', { name: `Signed in as ${OWNER.email}.` })).toBeVisible();
+    await expect(page.getByRole('complementary', { name: 'Contact list' }).getByRole('link', { name: /Lovelace, Ada/ })).toBeVisible();
 
     // The owner check asked the database, with the second-factor session.
     const ownerCheck = mock.callsTo('rpc', 'is_owner');

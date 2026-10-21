@@ -22,8 +22,9 @@ browser ──(anon key + user token)──> PostgREST ──> Postgres (RLS on 
 Each domain is a folder, `src/features/<domain>/`, with a `manifest.tsx` that exports a
 `FeatureManifest` (`src/features/types.ts`). A manifest declares what the domain contributes:
 
-- owner nav items and routes inside the shell, and standalone owner routes (the connector's
+- owner rail items and routes inside the shell, and standalone owner routes (the connector's
   consent page);
+- workspace routes, workspace tabs, bottom-bar counts and New-menu entries (see below);
 - portal tabs, routes, home cards and profile sections, and the portal frame;
 - public routes (no session: `/sign`, `/invite`, `/start`, `/unsubscribe`, `/esign/verify`,
   the password pages);
@@ -41,6 +42,39 @@ only React, the router, icons and three small helpers; everything it points at i
 chunks `public-*`, and `bundleBoundary.test.ts` proves none of them loads supabase-js.
 `registry.test.ts` checks the other rules (relative routes, unique keys and paths, every nav
 item opens a screen).
+
+## The owner shell and the workspace
+
+The owner app is a shell of four zones (`src/components/layout/AppShell.tsx`): a permanent icon
+rail on the left (New, search, the rail items with each count drawn once on its icon's corner,
+light and dark, the account), the content, and a bottom bar pinned to the window's foot. Below
+`md` the rail is a labelled drawer opened from a top bar, and the bottom bar is not drawn.
+
+- **The workspace** is a layout route around the contacts, the board, documents, requests,
+  messages, e-sign and marketing (each domain's `workspaceRoutes`). It mounts the client panel
+  (every contact, an All / Clients switch remembered per browser, one A to Z list by last name
+  with each row's status as its tint, a search that reaches everyone, selection and bulk
+  actions over the rows on screen) and one tab strip across the
+  top (`workspaceTabs`, with the waiting counts their badges draw). The strip is the top row
+  and never scrolls; on a phone each tab is its icon. A page's `PageHeader` lands in the row
+  under the tabs: on a workspace screen the workspace holds THE top-bar slot and the shell
+  draws none (one id, one element). `registry.ts` matches the shell's and the workspace's
+  routes as one tree (`ownerRouteTree`), so a literal path such as `contacts/new` beats the
+  workspace's `contacts/:id`, and the router and the shell can never disagree.
+- A workspace route's `handle` may carry `panelFirst` (below `lg`, where one pane fits, the
+  panel is that pane: the contacts screen outside Tiers) and `pickParam` (a pick sets that
+  query parameter in place instead of opening the record: documents' `?contact=`; below `lg`
+  the panel is the screen until the parameter holds a valid id).
+- **The bottom bar** draws `shellCounts`: what is waiting (unread, to review, to accept) and the
+  size of the book (clients, open leads), each a link. A count is a lazy render-prop component.
+  A waiting count shares the query key of the feature's badge, so the two share one fetch;
+  the book's figures are head-only counts under the contacts key, so any contact write
+  refreshes them and no page loads the contact list for them.
+- **The New menu** draws `newMenu`: an entry goes to its feature's create screen (`path`) or
+  opens its feature's dialog where the owner is (`Dialog`), and closing the dialog hands focus
+  back to New.
+- **Ctrl K** (or Cmd K) reaches the search: the client panel's box where it is on screen, else
+  a box that floats beside the rail and clears when dismissed.
 
 Inside a domain: one api module with its own query keys, Zod at the boundaries, paged reads with
 a stable tiebreaker, and mutations with error toasts and rollback of optimistic updates. Shared
