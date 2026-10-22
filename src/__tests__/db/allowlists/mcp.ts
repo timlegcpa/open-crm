@@ -52,7 +52,6 @@ export const allowlist: DomainAllowlist = {
     'mcp_update_note(uuid,uuid,text,text,uuid,text,text)',
     'mcp_delete_note(uuid,uuid,uuid,text,text)',
     'mcp_accept_quote(uuid,uuid,uuid,text,uuid,text,text)',
-    'mcp_change_portal_email(uuid,text,text,uuid,text,text)',
     'mcp_read_request_answers(uuid,uuid,uuid,text,text)',
     'mcp_list_documents(uuid,integer,uuid,text,text)',
     'mcp_read_document(uuid,uuid,text,text)',

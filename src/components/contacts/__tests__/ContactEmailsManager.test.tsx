@@ -5,10 +5,16 @@ import type { ReactNode } from 'react';
 
 vi.mock('@/lib/supabase', async () => (await import('@/__tests__/fakeSupabase')).supabaseModule);
 const changeSignInEmail = vi.fn();
-vi.mock('@/features/portal/api', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/features/portal/api')>()),
-  changeSignInEmail: (...args: unknown[]) => changeSignInEmail(...args),
-}));
+// Set to hold the portal-access read pending or make it fail; null reads the fake database.
+const access = vi.hoisted(() => ({ override: null as null | (() => Promise<never>) }));
+vi.mock('@/features/portal/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/features/portal/api')>();
+  return {
+    ...actual,
+    changeSignInEmail: (...args: unknown[]) => changeSignInEmail(...args),
+    getPortalAccess: (contactId: string) => (access.override ? access.override() : actual.getPortalAccess(contactId)),
+  };
+});
 
 import { fake } from '@/__tests__/fakeSupabase';
 import { ContactEmailsManager } from '@/components/contacts/ContactEmailsManager';
@@ -33,6 +39,7 @@ const account = (extra: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   fake.reset();
   changeSignInEmail.mockReset();
+  access.override = null;
   fake.state.session = { user: { id: 'owner-1', email: 'owner@example.com' } };
   fake.state.tables.contacts = [{ id: ADA, portal_sidebar_config: {} }];
   fake.state.tables.contact_emails = [
@@ -96,6 +103,31 @@ describe('ContactEmailsManager and the portal sign-in', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Another portal account already uses that address.');
     expect(fake.state.tables.contact_emails[0]).toMatchObject({ email: 'ada@example.com' });
+  });
+
+  it('while the sign-ins are still loading, no address can be edited', async () => {
+    access.override = () => new Promise<never>(() => {});
+    render(<ContactEmailsManager contactId={ADA} kind="primary" />, { wrapper });
+    for (const address of ['ada@example.com', 'ada.work@example.com']) {
+      const edit = within(await rowOf(address)).getByRole('button', { name: 'Edit' });
+      expect(edit).toBeDisabled();
+      expect(edit).toHaveAttribute('title', 'Checking portal sign-ins...');
+      fireEvent.click(edit);
+    }
+    expect(screen.queryByRole('textbox', { name: /^Edit / })).not.toBeInTheDocument();
+    expect(fake.calls('contact_emails', 'update')).toHaveLength(0);
+  });
+
+  it('when the sign-ins cannot be read, the panel says so and no address can be edited', async () => {
+    access.override = () => Promise.reject(new Error('network down'));
+    render(<ContactEmailsManager contactId={ADA} kind="primary" />, { wrapper });
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Could not check which addresses sign in to the portal.*network down/);
+    const edit = within(await rowOf('ada@example.com')).getByRole('button', { name: 'Edit' });
+    expect(edit).toBeDisabled();
+    fireEvent.click(edit);
+    expect(screen.queryByRole('textbox', { name: 'Edit ada@example.com' })).not.toBeInTheDocument();
+    expect(fake.calls('contact_emails', 'update')).toHaveLength(0);
+    expect(changeSignInEmail).not.toHaveBeenCalled();
   });
 
   it('an address that is not a sign-in is still a plain row update', async () => {

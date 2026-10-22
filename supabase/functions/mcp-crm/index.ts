@@ -29,10 +29,6 @@ Deno.serve(
         if (error) throw error;
         return new Uint8Array(await data.arrayBuffer());
       },
-      async updateUserEmail(userId, email) {
-        const { error } = await service.auth.admin.updateUserById(userId, { email, email_confirm: true });
-        return { error: error ? { status: error.status } : null };
-      },
     }),
     orgName: async () => (await org.load()).displayName,
     // The review-token key derives from the service-role key, which a connector never

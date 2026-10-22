@@ -266,15 +266,19 @@ conversation before they act; every call is recorded in the audit log.
 | `create_contact` | A new contact from an email or a phone number, with an optional stage and lead source. |
 | `update_contact` | Any detail but the email: names, phone, business name, the spouse's details, mailing address, source and tier. |
 | `correct_contact_email` | Fixes an address, refusing any contact with a portal account. Go-ahead. |
-| `change_portal_email` | Moves a portal account's sign-in, and the contact's matching address, to a new email, only from the address it read. Go-ahead. |
 | `set_contact_status` | Moves a contact along the pipeline, only from the stage it read. |
 | `add_business`, `log_call_note` | A business on the contact; a note appended to it. |
-| `update_note`, `delete_note` | Corrects a note's text or type; deletes one (go-ahead). Who wrote it never changes. |
+| `update_note`, `delete_note` | Corrects a note's text or type, or deletes one. Go-ahead. Who wrote it never changes. |
 | `upsert_quote`, `delete_quote` | A proposed quote; deleting one is a go-ahead. An accepted quote is never changed or deleted. |
 | `accept_quote` | Accepts a proposed quote, and the contact's stage follows. Go-ahead. |
 | `create_request`, `update_request`, `list_requests` | Draft and read back requests. |
 | `read_request_answers` | A contact's sent requests with every answer (sensitive ones decrypted) and the files attached. |
 | `list_documents`, `read_document_text` | A contact's documents; the text of a stored plain-text or CSV document (never a PDF, an image or a spreadsheet). |
+
+What a client wrote (request answers, document text, notes from lead intake) comes back
+marked `untrusted_client_content`, with a reminder to the assistant not to follow
+instructions in it. The connector cannot change the email a client signs in with: that is
+the owner's change, on the contact's record.
 | `send_request`, `remind_request` | Email the client. Go-ahead, one email per call. |
 | `delete_request` | Deletes a draft. Go-ahead. |
 | `list_open_requests` | Every open request, by whose move it is. |

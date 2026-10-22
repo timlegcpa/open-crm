@@ -13,10 +13,11 @@
 --     address, the lead source and the tier (mcp_get_contact and mcp_update_contact are
 --     replaced in place, signatures and privileges unchanged). The contact's own address
 --     still has its own doors.
---   * A portal account's sign-in address can be changed (portal_login_for_change,
---     portal_set_login_email, and the connector's audited mcp_change_portal_email). Auth
+--   * The owner can change a portal account's sign-in address (portal_login_for_change and
+--     portal_set_login_email, behind the owner-only change-portal-email function). Auth
 --     holds the sign-in, and Postgres cannot reach Auth, so the server changes Auth first
---     and these functions own the database half.
+--     and these functions own the database half. The connector has no door to this: its
+--     go-ahead is a flag the model sets, and it reads text clients wrote.
 --   * The connector reads a contact's request answers (sensitive ones come out encrypted,
 --     for the server to open), lists a contact's documents, and reads a stored text
 --     document. Each read is audited inside its own transaction, before anything returns.
@@ -44,8 +45,9 @@
 --     writing the audit row INSIDE the act's transaction (an audit failure rolls the act
 --     back, so a retry is safe). Audit details carry ids, keys, counts and outcome codes,
 --     never what a person typed, never an address.
---   * A refusal that hands state back is audited like a read; one that reveals nothing
---     (no such row) is not.
+--   * Every call of the connector's functions leaves an audit row, refusals included: a
+--     refusal is RETURNED as an outcome (never raised, which would roll its row back) and
+--     audited with the ids the caller sent.
 --   * No cron schedules.
 
 -- ---------------------------------------------------------------------------
@@ -67,7 +69,8 @@ COMMENT ON TABLE public.contact_notes IS
 
 -- Correct a note's text, its kind, or both (NULL keeps a value). One not_found for every
 -- mismatch (no such note, or a note on another contact), so an id never reveals that some
--- other contact holds it. The body never enters the audit row: its length does.
+-- other contact holds it; it is audited with the ids the caller sent, so every call leaves a
+-- row. The body never enters the audit row: its length does.
 CREATE FUNCTION public.mcp_update_note(
   p_note_id uuid, p_contact_id uuid, p_body text, p_kind text, p_actor uuid, p_ip text, p_user_agent text)
 RETURNS jsonb
@@ -82,6 +85,8 @@ BEGIN
    WHERE n.id = p_note_id
      FOR UPDATE;
   IF NOT FOUND OR v_row.contact_id IS DISTINCT FROM p_contact_id THEN
+    PERFORM public.mcp_audit_row(p_actor, 'mcp_update_note',
+      jsonb_build_object('contact_id', p_contact_id, 'note_id', p_note_id, 'outcome', 'not_found'), p_ip, p_user_agent);
     RETURN jsonb_build_object('outcome', 'not_found');
   END IF;
 
@@ -96,7 +101,8 @@ BEGIN
                        'note_source', v_row.source, 'body_length', char_length(v_row.body),
                        'fields', to_jsonb(array_remove(ARRAY[
                          CASE WHEN p_body IS NOT NULL THEN 'body' END,
-                         CASE WHEN p_kind IS NOT NULL THEN 'kind' END], NULL))),
+                         CASE WHEN p_kind IS NOT NULL THEN 'kind' END], NULL)),
+                       'outcome', 'updated'),
     p_ip, p_user_agent);
 
   RETURN jsonb_build_object('outcome', 'updated', 'id', v_row.id, 'contact_id', v_row.contact_id,
@@ -106,7 +112,7 @@ END;
 $$;
 
 -- Delete one note. A hard delete; the audit row (ids, kind, source, length) is the record
--- that it existed, and commits with the delete or not at all.
+-- that it existed, and commits with the delete or not at all. A not_found is audited too.
 CREATE FUNCTION public.mcp_delete_note(p_note_id uuid, p_contact_id uuid, p_actor uuid, p_ip text, p_user_agent text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -120,6 +126,8 @@ BEGIN
    WHERE n.id = p_note_id
      FOR UPDATE;
   IF NOT FOUND OR v_row.contact_id IS DISTINCT FROM p_contact_id THEN
+    PERFORM public.mcp_audit_row(p_actor, 'mcp_delete_note',
+      jsonb_build_object('contact_id', p_contact_id, 'note_id', p_note_id, 'outcome', 'not_found'), p_ip, p_user_agent);
     RETURN jsonb_build_object('outcome', 'not_found');
   END IF;
 
@@ -128,7 +136,7 @@ BEGIN
   PERFORM public.mcp_audit_row(
     p_actor, 'mcp_delete_note',
     jsonb_build_object('contact_id', p_contact_id, 'note_id', p_note_id, 'kind', v_row.kind,
-                       'note_source', v_row.source, 'body_length', v_row.body_length),
+                       'note_source', v_row.source, 'body_length', v_row.body_length, 'outcome', 'deleted'),
     p_ip, p_user_agent);
 
   RETURN jsonb_build_object('outcome', 'deleted', 'id', p_note_id);
@@ -151,7 +159,8 @@ $$;
 -- accepted as though it were still the one described. One not_found for every mismatch.
 -- The contact is locked first, then the quote (the order every quote writer takes), and a
 -- system contact (created only to sign) or an archived one is refused: promoting either is
--- the owner's call.
+-- the owner's call. Every refusal is RETURNED as an outcome and audited, as 0015's
+-- mcp_set_contact_status does: a raised refusal would roll its own audit row back.
 CREATE FUNCTION public.mcp_accept_quote(
   p_contact_id uuid, p_quote_id uuid, p_organization_id uuid, p_service_type text,
   p_actor uuid, p_ip text, p_user_agent text)
@@ -164,36 +173,36 @@ DECLARE
   v_quote record;
   v_derived text;
   v_after record;
+  v_refusal text;
 BEGIN
   SELECT c.id, c.status, c.archived_at INTO v_contact
     FROM public.contacts c
    WHERE c.id = p_contact_id
      FOR UPDATE;
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'mcp_accept_quote: not_found';
+    v_refusal := 'not_found';
+  ELSE
+    SELECT s.id, s.contact_id, s.organization_id, s.service_type, s.state, s.cadence, s.amount INTO v_quote
+      FROM public.contact_services s
+     WHERE s.id = p_quote_id
+       FOR UPDATE;
+    IF NOT FOUND
+       OR v_quote.contact_id IS DISTINCT FROM p_contact_id
+       OR v_quote.service_type IS DISTINCT FROM p_service_type
+       OR v_quote.organization_id IS DISTINCT FROM p_organization_id THEN
+      v_refusal := 'not_found';
+    ELSIF v_contact.status = 'esign_signer' THEN
+      v_refusal := 'system_status';
+    ELSIF v_contact.archived_at IS NOT NULL THEN
+      v_refusal := 'archived';
+    ELSIF v_quote.state = 'accepted' THEN
+      v_refusal := 'already_accepted';
+    END IF;
   END IF;
-
-  SELECT s.id, s.contact_id, s.organization_id, s.service_type, s.state, s.cadence, s.amount INTO v_quote
-    FROM public.contact_services s
-   WHERE s.id = p_quote_id
-     FOR UPDATE;
-  IF NOT FOUND
-     OR v_quote.contact_id IS DISTINCT FROM p_contact_id
-     OR v_quote.service_type IS DISTINCT FROM p_service_type
-     OR v_quote.organization_id IS DISTINCT FROM p_organization_id THEN
-    RAISE EXCEPTION 'mcp_accept_quote: not_found';
-  END IF;
-
-  IF v_contact.status = 'esign_signer' THEN
+  IF v_refusal IS NOT NULL THEN
     PERFORM public.mcp_audit_row(p_actor, 'mcp_accept_quote',
-      jsonb_build_object('contact_id', p_contact_id, 'quote_id', p_quote_id, 'outcome', 'system_status'), p_ip, p_user_agent);
-    RAISE EXCEPTION 'mcp_accept_quote: system_status';
-  END IF;
-  IF v_contact.archived_at IS NOT NULL THEN
-    RAISE EXCEPTION 'mcp_accept_quote: archived';
-  END IF;
-  IF v_quote.state = 'accepted' THEN
-    RAISE EXCEPTION 'mcp_accept_quote: already_accepted';
+      jsonb_build_object('contact_id', p_contact_id, 'quote_id', p_quote_id, 'outcome', v_refusal), p_ip, p_user_agent);
+    RETURN jsonb_build_object('outcome', v_refusal);
   END IF;
 
   UPDATE public.contact_services SET state = 'accepted' WHERE id = p_quote_id;
@@ -218,10 +227,11 @@ BEGIN
     p_actor, 'mcp_accept_quote',
     jsonb_build_object('contact_id', p_contact_id, 'quote_id', p_quote_id, 'service_type', v_quote.service_type,
                        'organization_id', v_quote.organization_id, 'cadence', v_quote.cadence,
-                       'amount', v_quote.amount, 'from', v_contact.status, 'to', v_after.status),
+                       'amount', v_quote.amount, 'from', v_contact.status, 'to', v_after.status,
+                       'outcome', 'accepted'),
     p_ip, p_user_agent);
 
-  RETURN jsonb_build_object('id', p_quote_id, 'service_type', v_quote.service_type, 'state', 'accepted',
+  RETURN jsonb_build_object('outcome', 'accepted', 'id', p_quote_id, 'service_type', v_quote.service_type, 'state', 'accepted',
                             'cadence', v_quote.cadence, 'amount', v_quote.amount,
                             'organization_id', v_quote.organization_id,
                             'contact_status', v_after.status, 'previous_status', v_contact.status,
@@ -300,9 +310,10 @@ $$;
 -- value. The names are NOT NULL, so clearing one stores ''. The source is NOT NULL too and
 -- must be a lead source a model may set (active, not a system source); the server checks
 -- it against the vocabulary first, and this is the backstop. Never the contact's own
--- address (correct_contact_email and change_portal_email are its doors), and never the
+-- address (correct_contact_email, and the owner's sign-in change, are its doors), and never the
 -- spouse's address while a portal account signs in with it: that address is then a live
--- sign-in route. NULL when there is no such contact.
+-- sign-in route. NULL when there is no such contact (0007's answer, kept). Every refusal
+-- is audited and RETURNED as {outcome}, never raised: a raise would roll its row back.
 CREATE OR REPLACE FUNCTION public.mcp_update_contact(p_contact_id uuid, p_patch jsonb, p_actor uuid, p_ip text, p_user_agent text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -317,13 +328,17 @@ BEGIN
    WHERE c.id = p_contact_id
      FOR UPDATE;
   IF NOT FOUND THEN
+    PERFORM public.mcp_audit_row(p_actor, 'mcp_update_contact',
+      jsonb_build_object('contact_id', p_contact_id, 'outcome', 'not_found'), p_ip, p_user_agent);
     RETURN NULL;
   END IF;
 
   IF p_patch ? 'source' AND NOT EXISTS (
     SELECT 1 FROM public.lead_sources t
      WHERE t.key = p_patch ->> 'source' AND t.is_active AND t.key NOT IN ('lead_intake', 'esign')) THEN
-    RAISE EXCEPTION 'mcp_update_contact: inactive_source';
+    PERFORM public.mcp_audit_row(p_actor, 'mcp_update_contact',
+      jsonb_build_object('contact_id', p_contact_id, 'outcome', 'inactive_source'), p_ip, p_user_agent);
+    RETURN jsonb_build_object('outcome', 'inactive_source');
   END IF;
 
   IF p_patch ? 'spouse_email' AND v_spouse IS NOT NULL AND EXISTS (
@@ -331,7 +346,7 @@ BEGIN
      WHERE a.contact_id = p_contact_id AND lower(a.invited_email) = lower(btrim(v_spouse))) THEN
     PERFORM public.mcp_audit_row(p_actor, 'mcp_update_contact',
       jsonb_build_object('contact_id', p_contact_id, 'outcome', 'spouse_address_signs_in'), p_ip, p_user_agent);
-    RAISE EXCEPTION 'mcp_update_contact: spouse_address_signs_in';
+    RETURN jsonb_build_object('outcome', 'spouse_address_signs_in');
   END IF;
 
   UPDATE public.contacts SET
@@ -357,7 +372,8 @@ BEGIN
   PERFORM public.mcp_audit_row(
     p_actor, 'mcp_update_contact',
     jsonb_build_object('contact_id', p_contact_id,
-      'fields', (SELECT COALESCE(jsonb_agg(k ORDER BY k), '[]'::jsonb) FROM jsonb_object_keys(p_patch) AS k)),
+      'fields', (SELECT COALESCE(jsonb_agg(k ORDER BY k), '[]'::jsonb) FROM jsonb_object_keys(p_patch) AS k),
+      'outcome', 'updated'),
     p_ip, p_user_agent);
 
   RETURN to_jsonb(v_row);
@@ -461,6 +477,16 @@ BEGIN
   IF lower(btrim(COALESCE(v_account.invited_email, ''))) = lower(v_email) THEN
     RETURN jsonb_build_object('outcome', 'unchanged', 'contact_id', v_contact);
   END IF;
+  -- The check's cross-contact rule, repeated now the rows are locked: the open-invite index
+  -- covers one contact only, so an open account on ANY other contact holding the address is
+  -- found here. The transaction lock on the address serializes two changes to the same new
+  -- address on different contacts, so both cannot pass this read.
+  PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('portal_login_email:' || lower(v_email)));
+  IF EXISTS (SELECT 1 FROM public.client_portal_accounts o
+              WHERE o.id <> p_account_id AND o.status IN ('invited', 'active')
+                AND lower(o.invited_email) = lower(v_email)) THEN
+    RETURN jsonb_build_object('outcome', 'address_in_use', 'contact_id', v_contact);
+  END IF;
 
   BEGIN
     UPDATE public.client_portal_accounts SET invited_email = v_email WHERE id = p_account_id;
@@ -494,28 +520,6 @@ BEGIN
 
   RETURN jsonb_build_object('outcome', 'updated', 'contact_id', v_contact, 'account_id', p_account_id,
                             'contact_address', v_moved);
-END;
-$$;
-
--- The connector's door to the database half, audited in the same transaction: ids and the
--- outcome, never either address.
-CREATE FUNCTION public.mcp_change_portal_email(
-  p_account_id uuid, p_email text, p_expected_email text, p_actor uuid, p_ip text, p_user_agent text)
-RETURNS jsonb
-LANGUAGE plpgsql
-SET search_path = ''
-AS $$
-DECLARE
-  v_out jsonb;
-BEGIN
-  v_out := public.portal_set_login_email(p_account_id, p_email, p_expected_email);
-  IF v_out ->> 'outcome' <> 'not_found' THEN
-    PERFORM public.mcp_audit_row(
-      p_actor, 'mcp_change_portal_email',
-      jsonb_build_object('contact_id', v_out ->> 'contact_id', 'account_id', p_account_id, 'outcome', v_out ->> 'outcome'),
-      p_ip, p_user_agent);
-  END IF;
-  RETURN v_out;
 END;
 $$;
 
@@ -688,7 +692,6 @@ REVOKE ALL ON FUNCTION
   public.mcp_accept_quote(uuid, uuid, uuid, text, uuid, text, text),
   public.portal_login_for_change(uuid, text, text),
   public.portal_set_login_email(uuid, text, text),
-  public.mcp_change_portal_email(uuid, text, text, uuid, text, text),
   public.mcp_read_request_answers(uuid, uuid, uuid, text, text),
   public.mcp_list_documents(uuid, integer, uuid, text, text),
   public.mcp_read_document(uuid, uuid, text, text)
@@ -700,7 +703,6 @@ GRANT EXECUTE ON FUNCTION
   public.mcp_accept_quote(uuid, uuid, uuid, text, uuid, text, text),
   public.portal_login_for_change(uuid, text, text),
   public.portal_set_login_email(uuid, text, text),
-  public.mcp_change_portal_email(uuid, text, text, uuid, text, text),
   public.mcp_read_request_answers(uuid, uuid, uuid, text, text),
   public.mcp_list_documents(uuid, integer, uuid, text, text),
   public.mcp_read_document(uuid, uuid, text, text)

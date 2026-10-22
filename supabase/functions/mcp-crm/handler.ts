@@ -23,8 +23,6 @@
 //   5. Every read and every write is audited with source 'mcp', inside the same transaction
 //      (see tools.ts and 0007_mcp.sql). The two tools that email a client audit after the
 //      fact, since an email cannot be rolled back, and allow one such email per request.
-//      A sign-in address change audits its database half in that half's transaction, and a
-//      half-finished one (the sign-in moved, the record did not) after the fact.
 //   6. A request is bounded: 100,000 bytes of body, 20 messages per batch, 20 tool calls per
 //      request. Batches run serially and each element can cost a database round trip, so
 //      an uncapped batch would turn one request into any number of writes.
@@ -59,7 +57,7 @@ export interface McpCrmDeps {
   /** The OAuth issuer. Null refuses to serve: a connector could never find the OAuth server. */
   siteUrl: string | null;
   db: ToolDb;
-  /** The answer key, Storage and Auth, for the tools that need them (createPrivilegedOps in index.ts). */
+  /** The answer key and Storage, for the tools that need them (createPrivilegedOps in index.ts). */
   privileged: PrivilegedOps;
   /** org_profile.display_name, for the metadata's resource_name. */
   orgName(): Promise<string>;

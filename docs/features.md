@@ -55,8 +55,13 @@ lets no one rewrite that.
 **Emails.** An address a portal account signs in with is marked Portal sign-in. Editing it
 changes the sign-in and the contact's address together (the `change-portal-email` function:
 the sign-in moves first, so a refusal there changes nothing); a change built on an address
-that changed meanwhile is refused. If the sign-in moved but the record could not, the screen
-says so and the same edit, tried again, finishes it.
+that changed meanwhile (in the record or in the sign-in itself) is refused. If the sign-in
+moved but the record could not, or the sign-in change got no clear answer, the screen says so;
+reopening the record and editing from the address it shows finishes it. The old address gets
+an email saying the sign-in was changed (it does not name the new one). Devices already signed in
+stay signed in: the change does not end open sessions.
+Until the panel knows which addresses sign in, and whenever it cannot find out, addresses
+cannot be edited, so a sign-in is never changed as a plain address.
 
 The record's tabs come from the other domains: Billing (quotes), Requests, Documents, Messages,
 E-sign, Portal and Activity.
@@ -155,10 +160,12 @@ never a sign-in id), create them from an email or a phone number with a stage an
 update any detail but the email (which has its own correction tool), move them along the
 pipeline, add businesses, log, correct and delete notes, manage quotes, and accept a proposed
 quote (the contact's stage follows, as in the CRM; a lost, cold or former client stays where
-they are). With the owner's go-ahead it changes a portal account's sign-in email, the same
-change the record's Emails section makes. It reads a contact's request answers (sensitive
-answers decrypted on the server), lists a contact's documents and reads a stored plain-text or
-CSV document; it cannot open a PDF, an image or a spreadsheet. It works the board (list,
+they are). It reads a contact's request answers (sensitive answers decrypted on the server),
+lists a contact's documents and reads a stored plain-text or CSV document; it cannot open a
+PDF, an image or a spreadsheet. What a client wrote (answers, document text, lead-intake
+notes) comes back marked as untrusted client content, so the assistant treats it as data and
+never as instructions. It cannot change the email a client signs in with: only the owner
+does that, from the record. It works the board (list,
 create, edit, move with a reason, and note cards), and handles requests end to end: create,
 send and remind them, see every open request by whose move it is (the same sections as the
 requests screen), accept answers (accepting the last one closes the request, as in the CRM),

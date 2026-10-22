@@ -53,7 +53,10 @@ function LabelSelect({ value, onChange, ariaLabel }: { value: EmailLabel; onChan
  *
  * An address a portal account signs in with is marked "Portal sign-in". Editing it goes
  * through change-portal-email, which moves the sign-in and the contact's address together;
- * a plain row update would leave the person signing in with the old one.
+ * a plain row update would leave the person signing in with the old one. So an address is
+ * editable only while the sign-ins are KNOWN: while they load (or reload) Edit waits, and
+ * when they cannot be read Edit stays off and the panel says why. Never a guess that an
+ * address is not a sign-in.
  */
 export function ContactEmailsManager({ contactId, kind: onlyKind }: { contactId: string; kind?: EmailKind }) {
   const queryClient = useQueryClient();
@@ -67,6 +70,13 @@ export function ContactEmailsManager({ contactId, kind: onlyKind }: { contactId:
     accountId: a.id,
     email: a.invited_email as string,
   }));
+  // A refetch counts as unknown too: after a sign-in change the cached accounts still hold
+  // the old address until the read lands.
+  const editLock = access.isError
+    ? 'error'
+    : !access.isSuccess || access.isFetching
+      ? 'checking'
+      : null;
 
   // A trigger rewrites the contact's mirrored address, so the contact is stale too; a
   // sign-in change also moves the portal account's address.
@@ -91,6 +101,11 @@ export function ContactEmailsManager({ contactId, kind: onlyKind }: { contactId:
     <section aria-label={onlyKind ? KIND_TITLES[onlyKind] : 'Emails'} className="flex flex-col gap-4">
       {!onlyKind && <h2 className="text-base font-semibold">Emails</h2>}
       {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+      {editLock === 'error' && (
+        <p role="alert" className="text-sm text-destructive">
+          Could not check which addresses sign in to the portal, so addresses cannot be edited right now: {getErrorMessage(access.error)}
+        </p>
+      )}
       {kinds.map((kind) => (
         <EmailKindSection
           key={kind}
@@ -99,6 +114,7 @@ export function ContactEmailsManager({ contactId, kind: onlyKind }: { contactId:
           rows={emails.data.filter((e) => e.kind === kind)}
           showTitle={!onlyKind}
           signIns={signIns}
+          editLock={editLock}
           busy={run.isPending}
           run={(action) => run.mutateAsync(action).then(() => true, () => false)}
         />
@@ -115,12 +131,14 @@ function EmailKindSection({
   run,
   showTitle,
   signIns,
+  editLock,
 }: {
   kind: EmailKind;
   contactId: string;
   rows: ContactEmail[];
   showTitle: boolean;
   signIns: SignIn[];
+  editLock: 'checking' | 'error' | null;
   busy: boolean;
   run: (action: () => Promise<unknown>) => Promise<boolean>;
 }) {
@@ -167,7 +185,7 @@ function EmailKindSection({
       {rows.length === 0 && <p className="text-sm text-muted-foreground">No addresses.</p>}
       <ul className="flex flex-col gap-2">
         {rows.map((row) => (
-          <EmailRow key={row.id} row={row} signIn={signIns.find((s) => sameAddress(s.email, row.email))} busy={busy} run={run} />
+          <EmailRow key={row.id} row={row} signIn={signIns.find((s) => sameAddress(s.email, row.email))} editLock={editLock} busy={busy} run={run} />
         ))}
       </ul>
       <form onSubmit={(e) => void add(e)} noValidate className="flex flex-wrap items-end gap-2" aria-label={`Add ${title.toLowerCase()}`}>
@@ -190,11 +208,13 @@ function EmailKindSection({
 function EmailRow({
   row,
   signIn,
+  editLock,
   busy,
   run,
 }: {
   row: ContactEmail;
   signIn?: SignIn;
+  editLock: 'checking' | 'error' | null;
   busy: boolean;
   run: (action: () => Promise<unknown>) => Promise<boolean>;
 }) {
@@ -206,6 +226,8 @@ function EmailRow({
 
   if (editing) {
     const save = async () => {
+      // The sign-ins went unknown while the editor was open: never fall back to a plain update.
+      if (editLock) return;
       const value = email.trim();
       if (!isEmail(value)) {
         setRowError('Enter a valid email address.');
@@ -226,9 +248,10 @@ function EmailRow({
       <li className="flex flex-wrap items-center gap-2">
         <Input aria-label={`Edit ${row.email}`} type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full max-w-64" />
         <LabelSelect value={label} onChange={setLabel} ariaLabel={`Label for ${row.email}`} />
-        <Button size="sm" disabled={busy} onClick={() => void save()}>Save</Button>
+        <Button size="sm" disabled={busy || editLock !== null} onClick={() => void save()}>Save</Button>
         <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>Cancel</Button>
         {signIn && <p className="w-full text-xs text-muted-foreground">This address signs in to the portal. Changing it changes the sign-in too.</p>}
+        {editLock === 'checking' && <p className="w-full text-xs text-muted-foreground">Checking portal sign-ins...</p>}
         {rowError && <p className="w-full text-sm text-destructive">{rowError}</p>}
       </li>
     );
@@ -251,7 +274,15 @@ function EmailRow({
           Make default
         </Button>
       )}
-      <Button size="xs" variant="ghost" onClick={() => setEditing(true)}>Edit</Button>
+      <Button
+        size="xs"
+        variant="ghost"
+        disabled={editLock !== null}
+        title={editLock === 'checking' ? 'Checking portal sign-ins...' : editLock === 'error' ? 'Portal sign-ins could not be checked' : undefined}
+        onClick={() => setEditing(true)}
+      >
+        Edit
+      </Button>
       {confirming ? (
         <>
           <Button size="xs" variant="destructive" disabled={busy} onClick={() => void run(() => deleteContactEmail(row.id))}>

@@ -42,13 +42,17 @@ export const CAN = [
   'Move a contact to another pipeline stage',
   'Log call notes, correct a note, and delete a note you confirm',
   'Record proposed quotes, and accept or delete a proposed quote you confirm',
-  "Change a portal account's sign-in email when you confirm",
   "Read a contact's request answers, sensitive ones included, and list their documents and read their text files",
   'Read, add, edit, move and note cards on your work board',
   'Draft requests, and send, remind, accept the answers on or close a request you confirm',
   'See every open request, and pause or resume its reminders',
 ];
-export const CANNOT = ['Delete a contact', 'Change or delete an accepted quote', 'Open a PDF, an image or a spreadsheet'];
+export const CANNOT = [
+  'Delete a contact',
+  'Change or delete an accepted quote',
+  "Change the email a client signs in to the portal with",
+  'Open a PDF, an image or a spreadsheet',
+];
 
 function Centered({ children }: { children: ReactNode }) {
   return <main className="flex min-h-svh items-center justify-center p-4">{children}</main>;

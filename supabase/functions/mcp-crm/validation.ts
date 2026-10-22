@@ -43,8 +43,8 @@ export function normalizeEmail(v: unknown): { email: string } | { error: string 
  * The fields a model may set on a contact. Creation takes the four base fields and the
  * address (plus a stage and a lead source, which create_contact checks against the
  * vocabulary itself). An update reaches the whole record but two things: the contact's own
- * address, which routes invitations and sign-in and has its own tools (correct_contact_email,
- * change_portal_email), and the stage, which moves only through set_contact_status,
+ * address, which routes invitations and sign-in and has its own tool (correct_contact_email;
+ * a portal sign-in moves only on the owner's record), and the stage, which moves only through set_contact_status,
  * compare-and-swapped. The client-since date is the status trigger's. The connector's
  * provenance lives in the audit log either way.
  */

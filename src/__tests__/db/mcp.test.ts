@@ -220,7 +220,6 @@ const SERVER_FUNCTIONS = [
   'mcp_update_note(uuid,uuid,text,text,uuid,text,text)',
   'mcp_delete_note(uuid,uuid,uuid,text,text)',
   'mcp_accept_quote(uuid,uuid,uuid,text,uuid,text,text)',
-  'mcp_change_portal_email(uuid,text,text,uuid,text,text)',
   'mcp_read_request_answers(uuid,uuid,uuid,text,text)',
   'mcp_list_documents(uuid,integer,uuid,text,text)',
   'mcp_read_document(uuid,uuid,text,text)',
@@ -2223,12 +2222,12 @@ describe('mcp_update_note and mcp_delete_note', () => {
     expect(out.kind).toMatchObject({ outcome: 'updated', kind: 'call' });
     expect(out.row).toEqual({ body: 'Called about the new scope', kind: 'call', source: 'mcp' });
     expect(out.rows[0].details).toEqual({
-      source: 'mcp', contact_id: contactA, note_id: out.id, kind: 'note', note_source: 'mcp', body_length: 26, fields: ['body'],
+      source: 'mcp', contact_id: contactA, note_id: out.id, kind: 'note', note_source: 'mcp', body_length: 26, fields: ['body'], outcome: 'updated',
     });
     expect(JSON.stringify(out.rows)).not.toContain('new scope');
   });
 
-  it('one not_found for a note on another contact or no note at all, changing and auditing nothing', async () => {
+  it('one not_found for a note on another contact or no note at all, changing nothing, each call audited with the ids sent', async () => {
     const out = await asServerTx(async (tx) => {
       const id = await note(tx, contactA);
       return {
@@ -2241,7 +2240,11 @@ describe('mcp_update_note and mcp_delete_note', () => {
     });
     expect([out.other, out.none, out.gone]).toEqual([{ outcome: 'not_found' }, { outcome: 'not_found' }, { outcome: 'not_found' }]);
     expect(out.row).toEqual({ body: 'Called about scope' });
-    expect(out.rows).toEqual([]);
+    expect(out.rows.map((r) => r.details)).toEqual([
+      { source: 'mcp', contact_id: contactB, note_id: expect.any(String), outcome: 'not_found' },
+      { source: 'mcp', contact_id: contactA, note_id: expect.any(String), outcome: 'not_found' },
+      { source: 'mcp', contact_id: contactB, note_id: expect.any(String), outcome: 'not_found' },
+    ]);
   });
 
   it('deletes the note with its audit row in one transaction', async () => {
@@ -2252,7 +2255,7 @@ describe('mcp_update_note and mcp_delete_note', () => {
     });
     expect(out.deleted).toEqual({ outcome: 'deleted', id: out.id });
     expect(out.left).toEqual([]);
-    expect(out.rows[0].details).toEqual({ source: 'mcp', contact_id: contactA, note_id: out.id, kind: 'note', note_source: 'owner', body_length: 18 });
+    expect(out.rows[0].details).toEqual({ source: 'mcp', contact_id: contactA, note_id: out.id, kind: 'note', note_source: 'owner', body_length: 18, outcome: 'deleted' });
   });
 
   it('a delete whose audit row cannot be written deletes nothing', async () => {
@@ -2292,10 +2295,10 @@ describe('mcp_accept_quote', () => {
         FROM public.contacts c JOIN public.contact_services s ON s.contact_id = c.id WHERE c.id = $1`, [ids.contact])).rows[0];
       return { ids, accepted, row, rows: await auditRows(tx, 'mcp_accept_quote') };
     });
-    expect(out.accepted).toMatchObject({ id: out.ids.quote, state: 'accepted', contact_status: 'client', previous_status: 'hot' });
+    expect(out.accepted).toMatchObject({ outcome: 'accepted', id: out.ids.quote, state: 'accepted', contact_status: 'client', previous_status: 'hot' });
     expect(out.accepted.client_since).not.toBeNull();
     expect(out.row).toEqual({ status: 'client', since: true, h: 2, state: 'accepted' });
-    expect(out.rows[0].details).toMatchObject({ source: 'mcp', quote_id: out.ids.quote, service_type: 'project', cadence: 'monthly', from: 'hot', to: 'client' });
+    expect(out.rows[0].details).toMatchObject({ source: 'mcp', quote_id: out.ids.quote, service_type: 'project', cadence: 'monthly', from: 'hot', to: 'client', outcome: 'accepted' });
   });
 
   it('one-time work alone makes a one-time client; a terminal stage is sticky', async () => {
@@ -2309,17 +2312,22 @@ describe('mcp_accept_quote', () => {
     expect(out.cold.contact_status).toBe('cold');
   });
 
-  it('binds the quote to its contact, service and business: one not_found for every mismatch', async () => {
+  it('binds the quote to its contact, service and business: one not_found for every mismatch, each audited', async () => {
     const out = await asServerTx(async (tx) => {
       const ids = await lead(tx, { organization: true });
-      const errors: Array<string | null> = [];
-      for (const over of [{ p_contact_id: contactB }, { p_service_type: 'retainer' }, { p_organization_id: null }, { p_quote_id: randomUUID() }]) {
-        errors.push(await attempt(tx, () => accept(tx, ids, over)));
+      const results: Array<Record<string, unknown>> = [];
+      for (const over of [{ p_contact_id: contactB }, { p_service_type: 'retainer' }, { p_organization_id: null }, { p_quote_id: randomUUID() }, { p_contact_id: randomUUID() }]) {
+        results.push(await accept(tx, ids, over));
       }
-      return { errors, state: (await tx.query(`SELECT state FROM public.contact_services WHERE id = $1`, [ids.quote])).rows[0] };
+      return {
+        results,
+        state: (await tx.query(`SELECT state FROM public.contact_services WHERE id = $1`, [ids.quote])).rows[0],
+        outcomes: (await auditRows(tx, 'mcp_accept_quote')).map((r) => r.details.outcome),
+      };
     });
-    for (const e of out.errors) expect(e).toMatch(/mcp_accept_quote: not_found/);
+    expect(out.results).toEqual(Array(5).fill({ outcome: 'not_found' }));
     expect(out.state).toEqual({ state: 'proposed' });
+    expect(out.outcomes).toEqual(Array(5).fill('not_found'));
   });
 
   it('refuses an accepted quote, a system contact and an archived one, changing nothing', async () => {
@@ -2329,15 +2337,18 @@ describe('mcp_accept_quote', () => {
       const signer = await lead(tx, { status: 'esign_signer' });
       const archived = await lead(tx, { archived: true });
       return {
-        again: await attempt(tx, () => accept(tx, ids)),
-        signer: await attempt(tx, () => accept(tx, signer)),
-        archived: await attempt(tx, () => accept(tx, archived)),
+        again: await accept(tx, ids),
+        signer: await accept(tx, signer),
+        archived: await accept(tx, archived),
         states: (await tx.query(`SELECT c.status, s.state FROM public.contact_services s JOIN public.contacts c ON c.id = s.contact_id WHERE s.id = ANY($1) ORDER BY c.status`, [[signer.quote, archived.quote]])).rows,
+        // The refusals' rows survive: they are returned, not raised.
+        outcomes: (await auditRows(tx, 'mcp_accept_quote')).map((r) => r.details.outcome),
       };
     });
-    expect(out.again).toMatch(/already_accepted/);
-    expect(out.signer).toMatch(/system_status/);
-    expect(out.archived).toMatch(/archived/);
+    expect(out.again).toEqual({ outcome: 'already_accepted' });
+    expect(out.signer).toEqual({ outcome: 'system_status' });
+    expect(out.archived).toEqual({ outcome: 'archived' });
+    expect(out.outcomes).toEqual(['accepted', 'already_accepted', 'system_status', 'archived']);
     expect(out.states).toEqual([{ status: 'esign_signer', state: 'proposed' }, { status: 'hot', state: 'proposed' }]);
   });
 });
@@ -2365,17 +2376,22 @@ describe('mcp_update_contact: the whole record', () => {
   it('refuses a retired or system source, and a spouse address a portal account signs in with', async () => {
     const out = await asServerTx(async (tx) => {
       await asSetup(tx, `UPDATE public.lead_sources SET is_active = false WHERE key = 'referral'`);
-      const retired = await attempt(tx, () => call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { source: 'referral' }, ...audit }));
-      const system = await attempt(tx, () => call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { source: 'lead_intake' }, ...audit }));
+      const retired = await call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { source: 'referral' }, ...audit });
+      const system = await call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { source: 'lead_intake' }, ...audit });
       const login = (await tx.query<{ e: string }>(`SELECT invited_email AS e FROM public.client_portal_accounts WHERE contact_id = $1`, [contactA])).rows[0].e;
       await asSetup(tx, `UPDATE public.contacts SET spouse_email = upper($2) WHERE id = $1`, [contactA, login]);
-      const spouse = await attempt(tx, () => call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { spouse_email: 'other@example.com' }, ...audit }));
+      const spouse = await call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { spouse_email: 'other@example.com' }, ...audit });
+      const none = await call(tx, 'mcp_update_contact', { p_contact_id: randomUUID(), p_patch: { phone: '1' }, ...audit });
       const kept = (await tx.query<{ e: string }>(`SELECT spouse_email AS e FROM public.contacts WHERE id = $1`, [contactA])).rows[0].e;
-      return { retired, system, spouse, kept, login };
+      const outcomes = (await auditRows(tx, 'mcp_update_contact')).map((r) => r.details.outcome);
+      return { retired, system, spouse, none, kept, login, outcomes };
     });
-    expect(out.retired).toMatch(/inactive_source/);
-    expect(out.system).toMatch(/inactive_source/);
-    expect(out.spouse).toMatch(/spouse_address_signs_in/);
+    expect(out.retired).toEqual({ outcome: 'inactive_source' });
+    expect(out.system).toEqual({ outcome: 'inactive_source' });
+    expect(out.spouse).toEqual({ outcome: 'spouse_address_signs_in' });
+    expect(out.none).toBeNull();
+    // Every refusal leaves its row: returned, never raised.
+    expect(out.outcomes).toEqual(['inactive_source', 'inactive_source', 'spouse_address_signs_in', 'not_found']);
     expect(out.kept).toBe(out.login.toUpperCase());
   });
 
@@ -2389,7 +2405,7 @@ describe('mcp_update_contact: the whole record', () => {
   });
 });
 
-describe('portal sign-in address: portal_login_for_change, portal_set_login_email, mcp_change_portal_email', () => {
+describe('portal sign-in address: portal_login_for_change and portal_set_login_email', () => {
   const accountOf = async (tx: Tx, contact: string) =>
     (await tx.query<{ id: string; e: string }>(`SELECT id, invited_email AS e FROM public.client_portal_accounts WHERE contact_id = $1 AND user_id IS NOT NULL`, [contact])).rows[0];
 
@@ -2470,20 +2486,25 @@ describe('portal sign-in address: portal_login_for_change, portal_set_login_emai
     expect(out.listed).toEqual([{ is_default: false }]);
   });
 
-  it('the connector door audits ids and the outcome, never an address', async () => {
+  it('the write refuses an address an open account on ANOTHER contact holds, even when the check passed before it', async () => {
     const out = await asServerTx(async (tx) => {
       const a = await accountOf(tx, contactA);
-      await call(tx, 'mcp_change_portal_email', { p_account_id: a.id, p_email: 'stale@example.com', p_expected_email: 'nope@example.com', ...audit });
-      await call(tx, 'mcp_change_portal_email', { p_account_id: a.id, p_email: 'ada.mcp@example.com', p_expected_email: a.e, ...audit });
-      await call(tx, 'mcp_change_portal_email', { p_account_id: randomUUID(), p_email: 'x@example.com', p_expected_email: null, ...audit });
-      return { id: a.id, rows: await auditRows(tx, 'mcp_change_portal_email') };
+      const free = await call<Record<string, unknown>>(tx, 'portal_login_for_change', { p_account_id: a.id, p_email: 'claimed@example.com', p_expected_email: a.e });
+      // Between the check and the write, another contact's invitation takes the address.
+      await asSetup(tx, `INSERT INTO public.client_portal_accounts (contact_id, status, invited_email) VALUES ($1, 'invited', 'Claimed@Example.com')`, [contactB]);
+      const set = await call<Record<string, unknown>>(tx, 'portal_set_login_email', { p_account_id: a.id, p_email: 'claimed@example.com', p_expected_email: a.e });
+      return { free, set, before: a.e, after: (await accountOf(tx, contactA)).e };
     });
-    expect(out.rows.map((r) => r.details)).toEqual([
-      { source: 'mcp', contact_id: contactA, account_id: out.id, outcome: 'stale' },
-      { source: 'mcp', contact_id: contactA, account_id: out.id, outcome: 'updated' },
-    ]);
-    expect(JSON.stringify(out.rows)).not.toMatch(/@/);
+    expect(out.free).toMatchObject({ outcome: 'ok' });
+    expect(out.set).toEqual({ outcome: 'address_in_use', contact_id: contactA });
+    expect(out.after).toBe(out.before);
   });
+});
+
+it('the connector has no function that changes a portal sign-in', async () => {
+  const rows = (await db.query<{ proname: string }>(
+    `SELECT proname FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname LIKE 'mcp\\_%' AND proname LIKE '%portal%'`)).rows;
+  expect(rows).toEqual([]);
 });
 
 describe('mcp_read_request_answers, mcp_list_documents and mcp_read_document', () => {
