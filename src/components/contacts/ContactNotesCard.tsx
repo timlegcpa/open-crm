@@ -1,8 +1,27 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { addContactNote, listContactNotes, NOTE_KINDS, type NoteKind } from '@/api/contactNotes';
+import { Pencil, Trash2 } from 'lucide-react';
+import {
+  addContactNote,
+  deleteContactNote,
+  listContactNotes,
+  NOTE_KINDS,
+  updateContactNote,
+  type ContactNote,
+  type NoteKind,
+} from '@/api/contactNotes';
 import { queryKeys } from '@/api/queryKeys';
 import { Panel } from '@/components/layout/page';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
@@ -16,14 +35,41 @@ const KIND_TEXT: Record<NoteKind, string> = { note: 'Note', call: 'Call', email:
 const SOURCE_CHIP: Record<string, string> = { mcp: 'Agent', lead_intake: 'Lead intake' };
 
 /**
- * Notes are a record: added, never edited or removed (the table grants SELECT and INSERT
- * only). The list has no height cap and no inner scroll; it grows with the page.
+ * The contact's note log. A note can be corrected in place (its text and its kind) or
+ * deleted behind a confirm; who wrote it never changes (0017 grants UPDATE on body and kind
+ * only). Every change also refreshes the pipeline cards, which show each lead's newest note.
+ * The list has no height cap and no inner scroll; it grows with the page.
  */
 export function ContactNotesCard({ contactId }: { contactId: string }) {
   const queryClient = useQueryClient();
   const notes = useQuery({ queryKey: queryKeys.contactNotes.forContact(contactId), queryFn: () => listContactNotes(contactId) });
   const [body, setBody] = useState('');
   const [kind, setKind] = useState<NoteKind>('note');
+  const [editing, setEditing] = useState<{ id: string; body: string; kind: NoteKind } | null>(null);
+  const [deleting, setDeleting] = useState<ContactNote | null>(null);
+
+  const refresh = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.contactNotes.forContact(contactId) }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.contacts.leadNotes() }),
+    ]);
+
+  const save = useMutation({
+    mutationFn: (e: { id: string; body: string; kind: NoteKind }) => updateContactNote(e.id, { body: e.body.trim(), kind: e.kind }),
+    onSuccess: () => setEditing(null),
+    onError: (err) => toast.error(getErrorMessage(err, 'The note was not saved.')),
+    onSettled: refresh,
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: string) => deleteContactNote(id),
+    onSuccess: () => toast.success('Note deleted.'),
+    onError: (err) => toast.error(getErrorMessage(err, 'The note was not deleted.')),
+    onSettled: () => {
+      setDeleting(null);
+      return refresh();
+    },
+  });
 
   const add = useMutation({
     mutationFn: (sent: string) => addContactNote(contactId, sent.trim(), kind),
@@ -33,7 +79,7 @@ export function ContactNotesCard({ contactId }: { contactId: string }) {
       setKind('note');
     },
     onError: (err) => toast.error(getErrorMessage(err, 'The note was not saved.')),
-    onSettled: () => queryClient.invalidateQueries({ queryKey: queryKeys.contactNotes.forContact(contactId) }),
+    onSettled: refresh,
   });
 
   const submit = () => {
@@ -78,13 +124,82 @@ export function ContactNotesCard({ contactId }: { contactId: string }) {
                     <span className="rounded-full bg-secondary px-1.5 py-px text-[10px] font-medium text-foreground">{SOURCE_CHIP[n.source]}</span>
                   )}
                   <span>{formatDateTime(n.created_at)}</span>
+                  {editing?.id !== n.id && (
+                    <span className="ml-auto flex items-center gap-0.5">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6"
+                        aria-label="Edit note"
+                        onClick={() => setEditing({ id: n.id, body: n.body, kind: n.kind })}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button type="button" variant="ghost" size="icon" className="h-6 w-6" aria-label="Delete note" onClick={() => setDeleting(n)}>
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </span>
+                  )}
                 </div>
-                <p className="whitespace-pre-wrap break-words">{n.body}</p>
+                {editing?.id === n.id ? (
+                  <div className="flex flex-col gap-2">
+                    <Textarea
+                      aria-label="Edit note text"
+                      value={editing.body}
+                      onChange={(e) => setEditing({ ...editing, body: e.target.value })}
+                      maxLength={10000}
+                      className="min-h-[64px] text-[13px]"
+                    />
+                    <div className="flex items-center gap-2">
+                      <Select value={editing.kind} onValueChange={(v) => setEditing({ ...editing, kind: v as NoteKind })}>
+                        <SelectTrigger aria-label="Edited note type" className="h-8 w-32 text-[13px]"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          {NOTE_KINDS.map((k) => <SelectItem key={k} value={k}>{KIND_TEXT[k]}</SelectItem>)}
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={editing.body.trim() === '' || save.isPending}
+                        onClick={() => void save.mutateAsync(editing).catch(() => undefined)}
+                      >
+                        Save
+                      </Button>
+                      <Button type="button" size="sm" variant="ghost" disabled={save.isPending} onClick={() => setEditing(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="whitespace-pre-wrap break-words">{n.body}</p>
+                )}
               </li>
             ))}
           </ul>
         )}
       </div>
+      <AlertDialog open={deleting !== null} onOpenChange={(open) => !open && !remove.isPending && setDeleting(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this note?</AlertDialogTitle>
+            <AlertDialogDescription>The note is removed from the record for good. This cannot be undone.</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={remove.isPending}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={remove.isPending}
+              onClick={(e) => {
+                e.preventDefault();
+                if (deleting) void remove.mutateAsync(deleting.id).catch(() => undefined);
+              }}
+            >
+              Delete note
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Panel>
   );
 }

@@ -20,7 +20,7 @@ import {
   setDefaultContactEmail,
   updateContactEmail,
 } from '@/api/contactEmails';
-import { addContactNote, listContactNotes } from '@/api/contactNotes';
+import { addContactNote, deleteContactNote, listContactNotes, updateContactNote } from '@/api/contactNotes';
 import { addRelationship, listHousehold, removeRelationship } from '@/api/contactRelationships';
 
 const A = '10000000-0000-4000-8000-00000000000a';
@@ -267,6 +267,31 @@ describe('contact notes', () => {
     expect(notes).toHaveLength(1001);
     expect([notes[0].body, notes[1000].body]).toEqual(['note 1000', 'note 0']);
     expect(fake.calls('contact_notes', 'select')).toHaveLength(2);
+  });
+
+  it('a correction sends only the text and the kind, never who wrote it', async () => {
+    fake.state.tables.contact_notes = [
+      { id: 'n1', contact_id: A, body: 'typo', kind: 'note', source: 'mcp', created_at: '2026-01-01T00:00:00Z' },
+    ];
+    await updateContactNote('n1', { body: 'fixed', kind: 'call' });
+    expect(fake.calls('contact_notes', 'update')[0].payload).toEqual({ body: 'fixed', kind: 'call' });
+    expect(fake.state.tables.contact_notes[0]).toMatchObject({ body: 'fixed', kind: 'call', source: 'mcp' });
+    await updateContactNote('n1', { kind: 'note' });
+    expect(fake.calls('contact_notes', 'update')[1].payload).toEqual({ kind: 'note' });
+  });
+
+  it('a correction to a note deleted meanwhile says so instead of succeeding silently', async () => {
+    fake.state.tables.contact_notes = [];
+    await expect(updateContactNote('gone', { body: 'x' })).rejects.toThrow('That note no longer exists.');
+  });
+
+  it('deletes one note by id', async () => {
+    fake.state.tables.contact_notes = [
+      { id: 'n1', contact_id: A, body: 'a', kind: 'note', source: 'owner', created_at: '2026-01-01T00:00:00Z' },
+      { id: 'n2', contact_id: A, body: 'b', kind: 'note', source: 'owner', created_at: '2026-01-02T00:00:00Z' },
+    ];
+    await deleteContactNote('n1');
+    expect((fake.state.tables.contact_notes as Array<{ id: string }>).map((n) => n.id)).toEqual(['n2']);
   });
 });
 

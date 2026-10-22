@@ -42,8 +42,8 @@ never changes an existing value. Do not edit them, and do not copy them between 
 
 | Variable | What it is | Without it |
 | --- | --- | --- |
-| `DOCUMENT_ENCRYPTION_KEY` | AES-256 key (base64) that encrypts every stored document. | `encrypt-document` and `decrypt-document` do not start: no upload, preview or download. Changing it makes every stored document unreadable. |
-| `PII_ENCRYPTION_KEY` | AES-256 key (base64) for sensitive request answers and e-sign signers' phone numbers. | A client's sensitive answer is refused and the owner's Reveal fails (`encryption_unavailable`); text message codes for e-signature are refused. Changing it makes those values unreadable. |
+| `DOCUMENT_ENCRYPTION_KEY` | AES-256 key (base64) that encrypts every stored document. | `encrypt-document` and `decrypt-document` do not start: no upload, preview or download; the AI connector's `read_document_text` cannot read an encrypted document. Changing it makes every stored document unreadable. |
+| `PII_ENCRYPTION_KEY` | AES-256 key (base64) for sensitive request answers and e-sign signers' phone numbers. | A client's sensitive answer is refused and the owner's Reveal fails (`encryption_unavailable`); text message codes for e-signature are refused; the AI connector's `read_request_answers` returns sensitive answers unopened. Changing it makes those values unreadable. |
 | `CRON_SHARED_SECRET` | 64 hex characters. Scheduled calls send it in the `x-cron-secret` header; `schedules:install` copies it into Vault. | Every scheduled call is refused (an unset or shorter-than-32-character secret refuses all callers), so reminders, digests, envelope expiry and clean-up never run. Run `schedules:install` again after changing it. |
 | `ESIGN_INTERNAL_TOKEN` | 64 hex characters, sent by `esign-signer-sign` to `esign-finalize-envelope`. | The last signature is recorded but finalize is skipped: no executed PDF, no completion emails. |
 | `ESIGN_SMS_CODE_KEY` | 32 bytes as 64 hex characters, the HMAC key for e-sign text message codes. | High-verification signing (a text message code) fails. |

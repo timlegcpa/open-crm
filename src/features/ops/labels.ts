@@ -90,6 +90,15 @@ export const AUDIT_ACTION_LABELS: Record<string, string> = {
   mcp_accept_request: "Agent accepted a request's answers",
   mcp_set_request_reminders: "Agent paused or resumed a request's reminders",
   mcp_list_open_requests: 'Agent read the open requests',
+  mcp_update_note: 'Agent corrected a note',
+  mcp_delete_note: 'Agent deleted a note',
+  mcp_accept_quote: 'Agent accepted a quote',
+  mcp_change_portal_email: 'Agent changed a portal sign-in email',
+  mcp_change_portal_email_partial: 'Agent changed a portal sign-in, but not the contact record',
+  mcp_read_request_answers: "Agent read a contact's request answers",
+  mcp_list_documents: "Agent listed a contact's documents",
+  mcp_read_document_text: 'Agent read a text document',
+  portal_login_email_changed: 'Portal sign-in email changed',
 };
 
 /** The portal's activity actions (0002_contacts.sql), every one. */

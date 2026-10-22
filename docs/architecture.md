@@ -177,6 +177,7 @@ test harness:
 | `0014_requests` | Requests that close themselves once nothing is left to do, the once-a-day upload notice, and the guarded write a client's contact confirmation goes through. |
 | `0015_mcp` | The AI connector's pipeline, work board and request follow-up tools, and a consent version, bound to each approval, that makes older connector approvals re-consent. |
 | `0016_small` | Deactivating a portal account expires the contact's pending start links in the same transaction. |
+| `0017_crm_full_access` | Notes that can be corrected and deleted (never relabelled), the database half of changing a portal sign-in email, and the AI connector's whole-record, quote-accept, note, sign-in email, answer and document tools, with the consent version moved to 3. |
 
 Every migration states the schema's rules in its header, and
 `src/__tests__/db/invariants.test.ts` checks the migrated catalog against them (row-level

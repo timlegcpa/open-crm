@@ -1,9 +1,11 @@
 // The safety contract of the connector's destructive tools, mechanized over the source.
 //
-// Seven tools need the user's explicit go-ahead (confirmed_with_user): delete_quote and
-// delete_request, which destroy a row; correct_contact_email, which moves a routing
-// address; send_request and remind_request, which email a client and cannot be recalled;
-// and close_request and accept_request, which change what the client sees and can do. The three request tools also need a review token, checked against the request
+// Ten tools need the user's explicit go-ahead (confirmed_with_user): delete_quote,
+// delete_request and delete_note, which destroy a row; accept_quote, which turns a proposal
+// into live work; correct_contact_email and change_portal_email, which move a routing or
+// sign-in address; send_request and remind_request, which email a client and cannot be
+// recalled; and close_request and accept_request, which change what the client sees and can
+// do. The three request tools also need a review token, checked against the request
 // as it stands, and the two outward ones spend the one client email an HTTP request
 // allows, before they act. delete_quote destroys a row permanently. It is bounded by a state gate (proposed only, in
 // the database), an explicit confirmed_with_user, a content binding (service and business
@@ -108,7 +110,10 @@ function stripSqlComments(sql: string): string {
 const required = requiredByTool(SOURCE);
 const bodies = handlerBodies(SOURCE);
 /** The tools that act only on the user's explicit go-ahead. Every delete_* tool must be one. */
-const CONFIRMED = ['accept_request', 'close_request', 'correct_contact_email', 'delete_quote', 'delete_request', 'remind_request', 'send_request'];
+const CONFIRMED = [
+  'accept_quote', 'accept_request', 'change_portal_email', 'close_request', 'correct_contact_email', 'delete_note', 'delete_quote',
+  'delete_request', 'remind_request', 'send_request',
+];
 /** The tools that email a client. Each spends the per-request send budget. */
 const OUTWARD = ['remind_request', 'send_request'];
 /** The tools that act on a request someone read: each takes and verifies a review token. */
@@ -122,9 +127,9 @@ const confirming = Object.keys(required).filter((n) => required[n].includes('con
 
 describe('the destructive tool contract', () => {
   it('finds every tool and the guarded ones (the parser still works)', () => {
-    expect(Object.keys(required)).toHaveLength(25);
+    expect(Object.keys(required)).toHaveLength(32);
     expect(Object.keys(bodies).sort()).toEqual(Object.keys(required).sort());
-    expect(destructive).toEqual(['delete_quote', 'delete_request']);
+    expect(destructive.sort()).toEqual(['delete_note', 'delete_quote', 'delete_request']);
     for (const tool of destructive) expect(CONFIRMED).toContain(tool);
   });
 
@@ -151,6 +156,41 @@ describe('the destructive tool contract', () => {
     expect(body).toContain("sentinel(error, 'mcp_delete_quote: not_found')");
     expect(body).toContain('in the CRM');
     expect(body).not.toMatch(/error\.message|\$\{error/);
+  });
+
+  it('accept_quote binds the accept to the quote that was read back, as delete_quote does, mapping every sentinel', () => {
+    expect(required.accept_quote).toEqual(['contact_id', 'quote_id', 'service_type', 'confirmed_with_user']);
+    const body = bodies.accept_quote;
+    expect(body).toContain('p_service_type: args.service_type');
+    expect(body).toContain('p_organization_id: organization.id');
+    expect(body).toContain('optionalId(args.organization_id, isUuid)');
+    expect(body.indexOf('args.confirmed_with_user !== true')).toBeLessThan(body.indexOf("rpc('mcp_accept_quote'"));
+    for (const code of ['already_accepted', 'system_status', 'archived', 'not_found']) {
+      expect(body).toContain(`sentinel(error, 'mcp_accept_quote: ${code}')`);
+    }
+    expect(body).not.toMatch(/error\.message|\$\{error/);
+  });
+
+  it('change_portal_email moves Auth before the record, only after the go-ahead and the compare-and-swap check', () => {
+    expect(required.change_portal_email).toEqual(['portal_account_id', 'new_email', 'expected_current_email', 'confirmed_with_user']);
+    const body = bodies.change_portal_email;
+    const at = (needle: string) => {
+      const i = body.indexOf(needle);
+      expect(i, needle).toBeGreaterThanOrEqual(0);
+      return i;
+    };
+    expect(at('args.confirmed_with_user !== true')).toBeLessThan(at("ctx.db.rpc('portal_login_for_change'"));
+    expect(at("ctx.db.rpc('portal_login_for_change'")).toBeLessThan(at('ctx.privileged.setSignInEmail('));
+    expect(at('ctx.privileged.setSignInEmail(')).toBeLessThan(at("rpc('mcp_change_portal_email'"));
+    // A half-done change is recorded and said, never reported as a clean refusal.
+    expect(body).toContain("auditDelegated(ctx, 'mcp_change_portal_email_partial'");
+    expect(body).toContain('normalizeEmail(args.new_email)');
+  });
+
+  it('the note tools write through their audited functions, and update_note never sends a source', () => {
+    expect(bodies.update_note).toContain("rpc('mcp_update_note'");
+    expect(bodies.delete_note).toContain("rpc('mcp_delete_note'");
+    expect(bodies.update_note).not.toMatch(/source/);
   });
 
   it('delete_quote goes through the audited function, never a direct table delete', () => {
@@ -255,7 +295,9 @@ describe('the destructive tool contract', () => {
       'if (false) {',
     ));
     expect(afterRefuse(late.send_request).startsWith('if (ctx.budget.sends >= MAX_SENDS_PER_REQUEST)')).toBe(false);
-    const unrequired = SOURCE.replace(
+    // replaceAll: accept_quote shares delete_quote's required list, so a single replace
+    // could strip one and leave the other.
+    const unrequired = SOURCE.replaceAll(
       "required: ['contact_id', 'quote_id', 'service_type', 'confirmed_with_user']",
       "required: ['contact_id', 'quote_id', 'service_type']",
     );
@@ -278,9 +320,10 @@ describe('the tool annotations', () => {
     for (const t of TOOLS) expect([t.name, hints[t.name]?.openWorldHint]).toEqual([t.name, false]);
   });
 
-  it('only the five reads are read-only', () => {
+  it('only the eight reads are read-only', () => {
     expect(TOOLS.filter((t) => hints[t.name]?.readOnlyHint === true).map((t) => t.name).sort()).toEqual([
-      'get_contact', 'list_board', 'list_open_requests', 'list_requests', 'search_contacts',
+      'get_contact', 'list_board', 'list_documents', 'list_open_requests', 'list_requests', 'read_document_text',
+      'read_request_answers', 'search_contacts',
     ]);
   });
 

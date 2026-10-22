@@ -285,7 +285,7 @@ function at(path: string, init: { method?: string; headers?: Record<string, stri
 }
 
 /** The consent version the screen sends: mcp_consent_version() (checked against the database below). */
-const CONSENT = 2;
+const CONSENT = 3;
 
 const consent = (body: unknown, token = OWNER_TOKEN) =>
   at('', { headers: { Authorization: `Bearer ${token}`, Origin: ALLOWED_ORIGIN }, body });

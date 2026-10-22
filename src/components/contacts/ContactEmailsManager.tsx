@@ -19,12 +19,20 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { changeSignInEmail, getPortalAccess, portalKeys, signInAccounts } from '@/features/portal/api';
 import { getErrorMessage } from '@/lib/errors';
 
 const KIND_TITLES: Record<EmailKind, string> = { primary: 'Contact emails', spouse: 'Spouse emails' };
 const LABEL_TEXT: Record<EmailLabel, string> = { business: 'Business', personal: 'Personal', other: 'Other' };
 
 const isEmail = (value: string) => z.string().email().safeParse(value).success;
+const sameAddress = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+
+/** A portal account this address signs in to: editing the address moves the sign-in too. */
+interface SignIn {
+  accountId: string;
+  email: string;
+}
 
 function LabelSelect({ value, onChange, ariaLabel }: { value: EmailLabel; onChange: (v: EmailLabel) => void; ariaLabel: string }) {
   return (
@@ -42,6 +50,10 @@ function LabelSelect({ value, onChange, ariaLabel }: { value: EmailLabel; onChan
  * an address changes ONLY here (or through the RPC this calls), never by a contact patch.
  * Pass `kind` to manage one kind where it belongs (primary in Details, spouse in Spouse,
  * primary on the board's card bar).
+ *
+ * An address a portal account signs in with is marked "Portal sign-in". Editing it goes
+ * through change-portal-email, which moves the sign-in and the contact's address together;
+ * a plain row update would leave the person signing in with the old one.
  */
 export function ContactEmailsManager({ contactId, kind: onlyKind }: { contactId: string; kind?: EmailKind }) {
   const queryClient = useQueryClient();
@@ -49,12 +61,19 @@ export function ContactEmailsManager({ contactId, kind: onlyKind }: { contactId:
     queryKey: queryKeys.contactEmails.forContact(contactId),
     queryFn: () => listContactEmails(contactId),
   });
+  const access = useQuery({ queryKey: portalKeys.access(contactId), queryFn: () => getPortalAccess(contactId) });
   const [error, setError] = useState<string | null>(null);
+  const signIns: SignIn[] = signInAccounts(access.data?.accounts ?? []).map((a) => ({
+    accountId: a.id,
+    email: a.invited_email as string,
+  }));
 
-  // A trigger rewrites the contact's mirrored address, so the contact is stale too.
+  // A trigger rewrites the contact's mirrored address, so the contact is stale too; a
+  // sign-in change also moves the portal account's address.
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: queryKeys.contactEmails.forContact(contactId) });
     void queryClient.invalidateQueries({ queryKey: queryKeys.contacts.all });
+    void queryClient.invalidateQueries({ queryKey: portalKeys.access(contactId) });
   };
 
   const run = useMutation({
@@ -79,6 +98,7 @@ export function ContactEmailsManager({ contactId, kind: onlyKind }: { contactId:
           contactId={contactId}
           rows={emails.data.filter((e) => e.kind === kind)}
           showTitle={!onlyKind}
+          signIns={signIns}
           busy={run.isPending}
           run={(action) => run.mutateAsync(action).then(() => true, () => false)}
         />
@@ -94,11 +114,13 @@ function EmailKindSection({
   busy,
   run,
   showTitle,
+  signIns,
 }: {
   kind: EmailKind;
   contactId: string;
   rows: ContactEmail[];
   showTitle: boolean;
+  signIns: SignIn[];
   busy: boolean;
   run: (action: () => Promise<unknown>) => Promise<boolean>;
 }) {
@@ -145,7 +167,7 @@ function EmailKindSection({
       {rows.length === 0 && <p className="text-sm text-muted-foreground">No addresses.</p>}
       <ul className="flex flex-col gap-2">
         {rows.map((row) => (
-          <EmailRow key={row.id} row={row} busy={busy} run={run} />
+          <EmailRow key={row.id} row={row} signIn={signIns.find((s) => sameAddress(s.email, row.email))} busy={busy} run={run} />
         ))}
       </ul>
       <form onSubmit={(e) => void add(e)} noValidate className="flex flex-wrap items-end gap-2" aria-label={`Add ${title.toLowerCase()}`}>
@@ -167,10 +189,12 @@ function EmailKindSection({
 
 function EmailRow({
   row,
+  signIn,
   busy,
   run,
 }: {
   row: ContactEmail;
+  signIn?: SignIn;
   busy: boolean;
   run: (action: () => Promise<unknown>) => Promise<boolean>;
 }) {
@@ -188,7 +212,15 @@ function EmailRow({
         return;
       }
       setRowError(null);
-      if (await run(() => updateContactEmail(row.id, { email: value, label }))) setEditing(false);
+      const action = signIn && !sameAddress(value, row.email)
+        ? async () => {
+            if (label !== row.label) await updateContactEmail(row.id, { email: row.email, label });
+            // Compare-and-swapped on the address this row showed.
+            // A listed address is renamed in place by the database half, label and all.
+            await changeSignInEmail(signIn.accountId, value, signIn.email);
+          }
+        : () => updateContactEmail(row.id, { email: value, label });
+      if (await run(action)) setEditing(false);
     };
     return (
       <li className="flex flex-wrap items-center gap-2">
@@ -196,6 +228,7 @@ function EmailRow({
         <LabelSelect value={label} onChange={setLabel} ariaLabel={`Label for ${row.email}`} />
         <Button size="sm" disabled={busy} onClick={() => void save()}>Save</Button>
         <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>Cancel</Button>
+        {signIn && <p className="w-full text-xs text-muted-foreground">This address signs in to the portal. Changing it changes the sign-in too.</p>}
         {rowError && <p className="w-full text-sm text-destructive">{rowError}</p>}
       </li>
     );
@@ -205,6 +238,7 @@ function EmailRow({
     <li className="flex flex-wrap items-center gap-2 text-sm">
       <span>{row.email}</span>
       <Badge variant="secondary">{LABEL_TEXT[row.label]}</Badge>
+      {signIn && <Badge variant="outline">Portal sign-in</Badge>}
       {row.is_default ? (
         <Badge>Default</Badge>
       ) : (

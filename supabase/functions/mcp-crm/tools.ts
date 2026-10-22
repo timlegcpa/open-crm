@@ -2,13 +2,26 @@
 // one mcp_* function in 0007_mcp.sql or 0015_mcp.sql, which writes its audit row inside the
 // same transaction: a write either commits with its record or not at all, so a retry is safe.
 //
-// Writes are deliberately narrow:
-//   * A quote is written PROPOSED only. Accepting one is the owner's act in the CRM, and it
-//     is what moves the revenue figures; an accepted quote is never changed or deleted here.
-//   * A note is appended; no tool edits or deletes one.
-//   * An address changes only through correct_contact_email, which refuses any contact with
-//     a portal account, demands the address the caller read (a compare-and-swap) and, like
-//     delete_quote, the user's explicit go-ahead (confirmed_with_user).
+// The owner chose near full access for the connector: it reads and writes the whole contact
+// record. What stays bounded, and why:
+//   * A quote is written PROPOSED (upsert_quote). accept_quote is the one way to accepted,
+//     on the user's explicit go-ahead (confirmed_with_user), and it moves the contact's
+//     stage the way the CRM's own accept does, in the same transaction. An accepted quote
+//     is never changed or deleted here: that is live work.
+//   * A note can be logged, corrected (update_note) and deleted (delete_note, on the
+//     go-ahead). Its source is never writable, so a note this connector wrote can never be
+//     relabelled as the owner's.
+//   * The contact's own address changes only through correct_contact_email, which refuses
+//     any contact with a portal account, or change_portal_email, which moves a portal
+//     account's sign-in. Each demands the address the caller read (a compare-and-swap) and
+//     the go-ahead. change_portal_email changes Auth first, through ctx.privileged, so a
+//     refusal there changes nothing. A spouse's address is an ordinary field unless a portal
+//     account signs in with it.
+//   * The reads of what a client sent (read_request_answers, list_documents,
+//     read_document_text) are audited inside the read's own transaction before anything
+//     returns. A sensitive answer leaves the database encrypted and is opened here, never
+//     stored opened; only plain text and CSV documents are read, never a PDF, an image or a
+//     spreadsheet.
 //   * add_business adds a registry entry and nothing else.
 //   * A stage changes only through set_contact_status, compare-and-swapped on the stage the
 //     caller read, and never into or out of the system status (a contact created only to
@@ -57,7 +70,9 @@ import { answersToAccept, requestRosterSections } from '../_shared/request-roste
 import { REVIEW_TOKEN_RE, canonicalRequest, type ReviewItem, type ReviewList, type ReviewRecipient, type ReviewSigner } from './review-token.ts';
 import {
   CARD_PRIORITIES,
+  CONTACT_CLEARABLE,
   CONTACT_CREATABLE,
+  CONTACT_TIERS,
   CONTACT_UPDATABLE,
   EMAIL_MAX_LEN,
   KEY_RE,
@@ -105,8 +120,27 @@ export interface Vocabulary {
   work_item_types: string[];
 }
 
+/**
+ * What a tool needs beyond the database: the answer key, Storage and Auth. index.ts wires
+ * each over the server's own clients and keys; tests pass fakes. Nothing here audits: the
+ * database function a tool calls first does.
+ */
+export interface PrivilegedOps {
+  /** Opens a sensitive answer's ciphertext (bytea as text) with the answer key. Throws when it cannot. */
+  openAnswer(ciphertext: string): Promise<string>;
+  /** A stored document's plaintext: downloaded, then opened when it is encrypted. Throws on any failure. */
+  readDocument(doc: { storage_path: string; encryption_status: string; encryption_iv: string | null }): Promise<Uint8Array>;
+  /**
+   * Moves a sign-in user's address in Auth, confirmed. 'refused' when Auth answers with a
+   * refusal (most often an address another sign-in holds): then nothing changed. Throws when
+   * the outcome is unknown.
+   */
+  setSignInEmail(userId: string, email: string): Promise<'changed' | 'refused'>;
+}
+
 export interface ToolContext {
   db: ToolDb;
+  privileged: PrivilegedOps;
   /** The owner who approved this connection: the actor on every audit row. */
   actor: string;
   ip: string | null;
@@ -141,6 +175,11 @@ export const LIST_REQUESTS_LIMIT = 25;
 export const LIST_OPEN_REQUESTS_LIMIT = 500;
 /** Cards list_board returns; it says so when there are more. */
 export const BOARD_LIST_LIMIT = 200;
+/** Documents list_documents returns by default, and at most. */
+export const DOCUMENT_LIST_DEFAULT = 100;
+export const DOCUMENT_LIST_MAX = 500;
+/** Characters read_document_text returns; it says when a file is longer. */
+export const DOCUMENT_TEXT_LIMIT = 20_000;
 
 const REQUEST_ITEM_SCHEMA = {
   type: 'object',
@@ -186,7 +225,7 @@ export const TOOLS = [
     name: 'get_contact',
     annotations: { readOnlyHint: true, openWorldHint: false },
     description:
-      "Fetch one contact: name, email, phone, business name and status, their businesses, their quotes (service, state, cadence, amount and which business each sits on), and their 20 newest notes.",
+      "Fetch one contact's whole record: name, email, phone, business name, stage, spouse, mailing address, lead source, tier, client-since date and whether it is archived; every address on their email list; their portal accounts (status and sign-in address); their businesses; their quotes (service, state, cadence, amount and which business each sits on); and their 20 newest notes, each with its id.",
     inputSchema: {
       type: 'object',
       properties: { contact_id: { type: 'string', description: 'Contact id.' } },
@@ -215,7 +254,7 @@ export const TOOLS = [
     name: 'update_contact',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     description:
-      "Update an existing contact's first name, last name, phone or business name. Email addresses cannot be changed here, because an address routes portal invitations and sign-in. To correct the contact's address use correct_contact_email, which refuses any contact holding a portal account; a spouse's address changes in the CRM. Notes go through log_call_note; moving the contact along the pipeline goes through set_contact_status. Spouse details and quotes are not writable here.",
+      "Update an existing contact's details: names, phone, business name, the spouse's name, address and phone, the mailing address, the lead source and the tier. Send only what changes; an empty value (or null) clears a field. The contact's own email cannot be changed here, because it routes portal invitations and sign-in: use correct_contact_email for a contact with no portal account, or change_portal_email to move a portal account's sign-in. A spouse's address that a portal account signs in with is refused here too. Notes go through log_call_note and update_note; the stage through set_contact_status; quotes through upsert_quote and accept_quote.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -224,6 +263,16 @@ export const TOOLS = [
         last_name: { type: 'string' },
         phone: { type: 'string' },
         business_name: { type: 'string' },
+        spouse_first_name: { type: 'string' },
+        spouse_last_name: { type: 'string' },
+        spouse_email: { type: 'string' },
+        spouse_phone: { type: 'string' },
+        mailing_street: { type: 'string' },
+        mailing_city: { type: 'string' },
+        mailing_state: { type: 'string' },
+        mailing_zip: { type: 'string' },
+        source: { type: 'string', description: 'How the contact found your user.' },
+        tier: { type: ['string', 'null'], enum: [...CONTACT_TIERS, null], description: 'The client tier, S (best) to E. null clears it.' },
       },
       required: ['contact_id'],
     },
@@ -251,6 +300,28 @@ export const TOOLS = [
     },
   },
   {
+    name: 'change_portal_email',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      "Change the email address a portal account signs in with. It moves the sign-in itself and the contact's matching address together, so the client's next sign-in and every future invitation use the new address. Use it only when the client asked for the change. Read the contact with get_contact first and pass the account's current address (portal_accounts[].invited_email) as expected_current_email: the call is refused unless that still matches. Read the account, the current address and the new one back to your user and get their go-ahead first. An account with no sign-in yet (an invitation not accepted) cannot be changed here.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        portal_account_id: { type: 'string', description: 'The account id, from get_contact portal_accounts.' },
+        new_email: { type: 'string' },
+        expected_current_email: {
+          type: ['string', 'null'],
+          description: 'The address the account signs in with now, as get_contact reported it; null only if it has none.',
+        },
+        confirmed_with_user: {
+          type: 'boolean',
+          description: 'Must be true. Set it only after your user has heard the account, the current address and the new one, and told you to make the change.',
+        },
+      },
+      required: ['portal_account_id', 'new_email', 'expected_current_email', 'confirmed_with_user'],
+    },
+  },
+  {
     name: 'add_business',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     description:
@@ -269,7 +340,7 @@ export const TOOLS = [
     name: 'log_call_note',
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     description:
-      "Add a note to a contact's record, typically a summary of a phone call. Notes are append-only: this adds to the record and can never overwrite or delete an existing note. Use it after a call to capture what was discussed and agreed.",
+      "Add a note to a contact's record, typically a summary of a phone call. This only adds a note; it never overwrites one (update_note corrects a note, delete_note removes one). Use it after a call to capture what was discussed and agreed.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -281,10 +352,44 @@ export const TOOLS = [
     },
   },
   {
+    name: 'update_note',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      "Correct an existing note on a contact's record: its text, its kind, or both. Send only what changes. Each note is one row, so this edits that note and nothing else. Read the note back to your user first: a note can hold what was agreed on a call, and rewriting it replaces that record. Who wrote the note never changes.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        note_id: { type: 'string', description: 'The note id, from get_contact recent_notes.' },
+        body: { type: 'string', description: 'The corrected text, up to 10000 characters.' },
+        kind: { type: 'string', enum: [...NOTE_KINDS] },
+      },
+      required: ['contact_id', 'note_id'],
+    },
+  },
+  {
+    name: 'delete_note',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      "Permanently delete one note from a contact's record, for example a note logged against the wrong person or a duplicate. Read the note back to your user first and get their go-ahead. It cannot be undone.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        note_id: { type: 'string', description: 'The note id, from get_contact recent_notes.' },
+        confirmed_with_user: {
+          type: 'boolean',
+          description: 'Must be true. Set it only after your user has heard which note this is and told you to delete it.',
+        },
+      },
+      required: ['contact_id', 'note_id', 'confirmed_with_user'],
+    },
+  },
+  {
     name: 'upsert_quote',
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     description:
-      'Record what you are quoting a contact for a service, as a PROPOSED quote, on the contact or on one of their businesses when organization_id is given. It cannot accept a quote: accepting is done by the owner in the CRM, and it is what moves the revenue figures. Quoting the same service on the same business again updates that proposed quote. An accepted quote is never changed here.',
+      'Record what you are quoting a contact for a service, as a PROPOSED quote, on the contact or on one of their businesses when organization_id is given. This writes a proposal only: accept_quote turns it into accepted work. Quoting the same service on the same business again updates that proposed quote. An accepted quote is never changed here.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -318,6 +423,32 @@ export const TOOLS = [
         confirmed_with_user: {
           type: 'boolean',
           description: 'Must be true. Set it only after your user has heard which quote this is and told you to delete it.',
+        },
+      },
+      required: ['contact_id', 'quote_id', 'service_type', 'confirmed_with_user'],
+    },
+  },
+  {
+    name: 'accept_quote',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    description:
+      "Accept a PROPOSED quote: it becomes accepted work, it counts toward the revenue figures, and the contact moves to client (or one-time client, for one-time work alone) unless their stage is lost, cold or former client, which a quote never changes. Read the quote back to your user first (the service, the amount, the cadence and whether it sits on the contact or one of their businesses) and get their go-ahead. Send the quote's service and business exactly as get_contact reported them: with the id they prove you are accepting the quote you read, and a quote moved since is refused. A contact created only to sign, or an archived one, is refused.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        quote_id: { type: 'string', description: 'The quote id, from get_contact.' },
+        service_type: {
+          type: 'string',
+          description: 'The service the quote is for, as get_contact reported it. Proves you are accepting the quote you read.',
+        },
+        organization_id: {
+          type: 'string',
+          description: 'The business the quote sits on, as get_contact reported it. Leave it out for a quote on the contact itself.',
+        },
+        confirmed_with_user: {
+          type: 'boolean',
+          description: 'Must be true. Set it only after your user has heard which quote this is and told you to accept it.',
         },
       },
       required: ['contact_id', 'quote_id', 'service_type', 'confirmed_with_user'],
@@ -365,6 +496,20 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: { contact_id: { type: 'string' } },
+      required: ['contact_id'],
+    },
+  },
+  {
+    name: 'read_request_answers',
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    description:
+      "Read what a contact answered on their requests: every item's typed answer (a sensitive answer is opened for you), and the files uploaded to each item (name, folder, size, type and when). Drafts are left out, since a contact never saw one. The 25 newest requests, or one when list_id is given. This reads client data, and every call is recorded in the audit log; use it when the task needs the answers, never just to summarise a contact.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        list_id: { type: 'string', description: 'Optional: one request, from list_requests. Leave it out for every request.' },
+      },
       required: ['contact_id'],
     },
   },
@@ -577,6 +722,33 @@ export const TOOLS = [
       required: ['work_item_id', 'note'],
     },
   },
+  {
+    name: 'list_documents',
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    description:
+      "List the documents on a contact's record, newest first: id, name, folder, category, size, type, who holds it (the owner's section or the contact's) and whether it has been reviewed. Metadata only; read_document_text returns the contents of a plain text or CSV file. Every call is recorded in the audit log.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        limit: { type: 'integer', minimum: 1, maximum: DOCUMENT_LIST_MAX, description: `Max documents, 1 to ${DOCUMENT_LIST_MAX}. Default ${DOCUMENT_LIST_DEFAULT}.` },
+      },
+      required: ['contact_id'],
+    },
+  },
+  {
+    name: 'read_document_text',
+    annotations: { readOnlyHint: true, openWorldHint: false },
+    description:
+      `Read the text of a plain text or CSV document, opened on the server; the first ${DOCUMENT_TEXT_LIMIT.toLocaleString('en-US')} characters, and it says when the file is longer. A PDF, an image or a spreadsheet is refused: those are opened in the CRM's document viewer. Every call is recorded in the audit log.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        document_id: { type: 'string', description: 'The document id, from list_documents or read_request_answers.' },
+      },
+      required: ['document_id'],
+    },
+  },
 ];
 
 
@@ -618,6 +790,7 @@ export function toolCatalog(vocab: Vocabulary): unknown[] {
   for (const tool of ['list_board', 'create_work_item', 'move_work_item']) describe(tool, guide('Lanes', vocab.board_stages));
   set('add_business', 'organization_type', vocab.organization_types);
   set('upsert_quote', 'service_type', vocab.service_types);
+  set('update_contact', 'source', vocab.lead_sources);
   for (const tool of ['create_request', 'update_request']) {
     const item = (props(tool).items.items as { properties: Props }).properties;
     item.category.enum = [...vocab.request_categories];
@@ -637,6 +810,7 @@ const NO_REQUEST = 'No request with that id for that contact. Read the requests 
 const STALE_TOKEN =
   'That review_token does not match the request as it stands now (its content, its answers or its recipient changed, or the token belongs to another request). Nothing was done. Read it again with list_requests, read it back to your user, and confirm again.';
 const INACTIVE_KEY = 'An item names a category or tag that is not in use any more. List the tools again for the current ones.';
+const NO_NOTE = 'No note with that id on that contact. Read the contact again with get_contact.';
 const NO_CARD = 'No card with that id. Read the board again with list_board.';
 /** An archived card is off the board: nothing here changes it. */
 const ARCHIVED_CARD = (what: 'edited' | 'moved' | 'noted') =>
@@ -980,17 +1154,39 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
     if (!isUuid(args.contact_id)) return toolError('contact_id must be a valid id.');
     // Checked before the patch is built, so it refuses the WHOLE call: applying the other
     // fields and silently dropping the address would report a success the caller did not get.
-    if (args.email !== undefined || args.spouse_email !== undefined) {
+    if (args.email !== undefined) {
       return toolError(
-        "Email addresses cannot be changed here, because an address routes portal invitations and sign-in. Use correct_contact_email for the contact's address; a spouse's address changes in the CRM. Nothing was updated; send the call again without the email field to apply the other changes.",
+        "The contact's own email cannot be changed here, because it routes portal invitations and sign-in. Use correct_contact_email for a contact with no portal account, or change_portal_email for a portal account's sign-in. Nothing was updated; send the call again without the email field to apply the other changes.",
       );
     }
     const patch = pickFrom(CONTACT_UPDATABLE, args);
+    // pickFrom drops nulls; on an update an explicit null is a clear, sent as '' (the
+    // function stores '' as NULL, and a name as '').
+    for (const k of CONTACT_CLEARABLE) if (args[k] === null) patch[k] = '';
+    if (args.source === null) return toolError('source cannot be cleared; every contact has one.');
     if (Object.keys(patch).length === 0) return toolError('No updatable fields supplied.');
+    // Normalized before validating, as on create: a padded valid address is accepted, trimmed.
+    if (typeof patch.spouse_email === 'string' && patch.spouse_email.trim()) {
+      const norm = normalizeEmail(patch.spouse_email);
+      if ('error' in norm) return toolError(`spouse_${norm.error}`);
+      patch.spouse_email = norm.email;
+    }
     const bad = validateContactPatch(patch);
     if (bad) return toolError(`${bad}.`);
+    if (patch.source !== undefined) {
+      const { lead_sources } = await ctx.vocabulary();
+      if (!lead_sources.includes(patch.source as string)) return toolError(`source must be one of: ${lead_sources.join(', ')}.`);
+    }
     const { data, error } = await rpc('mcp_update_contact', { p_contact_id: args.contact_id, p_patch: patch });
-    if (error) throw error;
+    if (error) {
+      if (sentinel(error, 'mcp_update_contact: inactive_source')) return toolError('That lead source is not in use any more. List the tools again for the current ones.');
+      if (sentinel(error, 'mcp_update_contact: spouse_address_signs_in')) {
+        return toolError(
+          "A portal account signs in with the spouse's current address, so it cannot be changed here. Move that account's sign-in with change_portal_email instead. Nothing was updated.",
+        );
+      }
+      throw error;
+    }
     if (!data) return toolError(NO_CONTACT);
     return toolText({ updated: data });
   }
@@ -1120,7 +1316,7 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
       if (sentinel(error, 'mcp_upsert_quote: inactive_service')) return toolError('That service is not in use any more. List the tools again for the current services.');
       throw error;
     }
-    return toolText({ quote: data, note: 'Saved as a PROPOSED quote. The owner accepts it in the CRM.' });
+    return toolText({ quote: data, note: 'Saved as a PROPOSED quote. accept_quote accepts it, after your user approves.' });
   }
 
   if (name === 'delete_quote') {
@@ -1837,6 +2033,228 @@ export async function callTool(name: string, args: Record<string, unknown>, ctx:
       default:
         throw new Error(`mcp_add_work_item_note returned an unknown outcome: ${String((data as { outcome?: string } | null)?.outcome)}`);
     }
+  }
+
+  if (name === 'update_note') {
+    if (!isUuid(args.contact_id) || !isUuid(args.note_id)) return toolError('contact_id and note_id must be valid ids.');
+    let body: string | null = null;
+    if (args.body !== undefined && args.body !== null) {
+      if (typeof args.body !== 'string') return toolError('body must be text.');
+      body = args.body.trim();
+      if (!body) return toolError('body cannot be empty. Use delete_note to remove a note.');
+      if (body.length > MAX_NOTE_LENGTH) return toolError(`body is too long (at most ${MAX_NOTE_LENGTH} characters).`);
+    }
+    let kind: string | null = null;
+    if (args.kind !== undefined && args.kind !== null) {
+      if (!(NOTE_KINDS as readonly unknown[]).includes(args.kind)) return toolError(`kind must be one of: ${NOTE_KINDS.join(', ')}.`);
+      kind = args.kind as string;
+    }
+    if (body === null && kind === null) return toolError('Nothing to change: send body, kind or both.');
+    // The function writes body and kind only: the note's source is not writable by any role.
+    const { data, error } = await rpc('mcp_update_note', { p_note_id: args.note_id, p_contact_id: args.contact_id, p_body: body, p_kind: kind });
+    if (error) throw error;
+    const result = data as { outcome?: string } | null;
+    if (result?.outcome === 'not_found') return toolError(NO_NOTE);
+    if (result?.outcome !== 'updated') throw new Error(`mcp_update_note returned an unknown outcome: ${String(result?.outcome)}`);
+    const { outcome: _outcome, ...updated } = result;
+    return toolText({ updated });
+  }
+
+  if (name === 'delete_note') {
+    if (!isUuid(args.contact_id) || !isUuid(args.note_id)) return toolError('contact_id and note_id must be valid ids.');
+    if (args.confirmed_with_user !== true) {
+      return toolError('Not deleted. Read the note back to your user, get their go-ahead, then call again with confirmed_with_user: true.');
+    }
+    const { data, error } = await rpc('mcp_delete_note', { p_note_id: args.note_id, p_contact_id: args.contact_id });
+    if (error) throw error;
+    const result = data as { outcome?: string; id?: string } | null;
+    if (result?.outcome === 'not_found') return toolError(NO_NOTE);
+    if (result?.outcome !== 'deleted') throw new Error(`mcp_delete_note returned an unknown outcome: ${String(result?.outcome)}`);
+    return toolText({ deleted: { id: result.id } });
+  }
+
+  if (name === 'accept_quote') {
+    if (!isUuid(args.contact_id)) return toolError('contact_id must be a valid id.');
+    if (!isUuid(args.quote_id)) return toolError('quote_id must be a valid id. Get it from get_contact.');
+    // Any existing key, active or not: a quote on a service deactivated since is still the
+    // quote that was read. The function binds it to the stored row.
+    if (typeof args.service_type !== 'string' || !KEY_RE.test(args.service_type)) {
+      return toolError('service_type must be the service get_contact reported for this quote.');
+    }
+    const organization = optionalId(args.organization_id, isUuid);
+    if ('error' in organization) {
+      return toolError('organization_id must be a valid id, or left out entirely for a quote on the contact itself. An empty value is not the same as leaving it out.');
+    }
+    if (args.confirmed_with_user !== true) {
+      return toolError(
+        'Not accepted. Read the quote back to your user (the service, the amount, the cadence and whether it sits on the contact or one of their businesses), get their go-ahead, then call again with confirmed_with_user: true.',
+      );
+    }
+    // The service and business bind the accept to the quote that was read back, as for delete_quote.
+    const { data, error } = await rpc('mcp_accept_quote', {
+      p_contact_id: args.contact_id,
+      p_quote_id: args.quote_id,
+      p_organization_id: organization.id,
+      p_service_type: args.service_type,
+    });
+    if (error) {
+      if (sentinel(error, 'mcp_accept_quote: already_accepted')) return toolError('That quote is already accepted. Nothing was changed.');
+      if (sentinel(error, 'mcp_accept_quote: system_status')) {
+        return toolError('That contact was created only to sign a document, so a quote is not accepted for them here. The owner promotes them in the CRM first. Nothing was changed.');
+      }
+      if (sentinel(error, 'mcp_accept_quote: archived')) {
+        return toolError('That contact is archived. The owner restores them in the CRM first. Nothing was changed.');
+      }
+      if (sentinel(error, 'mcp_accept_quote: not_found')) {
+        return toolError(
+          'No proposed quote on that contact matches that id, service and business. Read the contact again with get_contact and use the id, service and business it reports.',
+        );
+      }
+      throw error;
+    }
+    const accepted = data as { contact_status?: string; previous_status?: string } | null;
+    return toolText({
+      accepted: data,
+      note:
+        accepted?.contact_status && accepted.contact_status !== accepted.previous_status
+          ? `Accepted. The contact moved from ${accepted.previous_status} to ${accepted.contact_status}.`
+          : 'Accepted. The contact stays at the stage it was in.',
+    });
+  }
+
+  if (name === 'change_portal_email') {
+    const refuse = (reason: string, message: string) => refused(ctx, 'mcp_change_portal_email', reason, args, message);
+    if (!isUuid(args.portal_account_id)) return toolError('portal_account_id must be a valid id. Get it from get_contact portal_accounts.');
+    const parsed = normalizeEmail(args.new_email);
+    if ('error' in parsed) return toolError(`new_${parsed.error}`);
+    const expected = args.expected_current_email;
+    if (expected === undefined) {
+      return toolError("expected_current_email is required. Read the contact with get_contact and pass the account's current invited_email, or null if it has none.");
+    }
+    if (expected !== null && typeof expected !== 'string') return toolError('expected_current_email must be a string or null.');
+    if (typeof expected === 'string' && expected.length > EMAIL_MAX_LEN) {
+      return toolError(`expected_current_email must be ${EMAIL_MAX_LEN} characters or fewer.`);
+    }
+    if (args.confirmed_with_user !== true) {
+      return toolError(
+        'Not changed. Read the change back to your user (the account, its current address and the new one), get their go-ahead, then call again with confirmed_with_user: true.',
+      );
+    }
+
+    // The check writes nothing; the database half below repeats it under locks.
+    const check = await ctx.db.rpc('portal_login_for_change', { p_account_id: args.portal_account_id, p_email: parsed.email, p_expected_email: expected });
+    if (check.error) throw check.error;
+    const ready = check.data as { outcome?: string; user_id?: string } | null;
+    switch (ready?.outcome) {
+      case 'ok':
+        break;
+      case 'not_found':
+        return toolError('No portal account with that id. Read the contact again with get_contact.');
+      case 'no_sign_in':
+        return refuse('no_sign_in', 'That account has no sign-in yet (its invitation was not accepted, or it was turned off), so there is no sign-in to move. Nothing was changed.');
+      case 'stale':
+        return refuse('stale', "expected_current_email did not match the account's address, so nothing was changed. Read the contact again with get_contact and send the account's current address.");
+      case 'unchanged':
+        return toolError('The account already signs in with that address. Nothing was changed.');
+      case 'address_in_use':
+        return refuse('address_in_use', 'Another portal account already uses that address. Nothing was changed.');
+      default:
+        throw new Error(`portal_login_for_change returned an unknown outcome: ${String(ready?.outcome)}`);
+    }
+
+    // Auth FIRST: it is the half that can refuse for a reason outside this database, and a
+    // refusal there leaves everything as it was, so a retry is safe.
+    const auth = await ctx.privileged.setSignInEmail(ready.user_id as string, parsed.email);
+    if (auth === 'refused') {
+      return refuse('auth_refused', 'The sign-in address could not be changed (most often because another sign-in already uses that address). Nothing was changed.');
+    }
+
+    const { data, error } = await rpc('mcp_change_portal_email', {
+      p_account_id: args.portal_account_id,
+      p_email: parsed.email,
+      p_expected_email: expected,
+    });
+    const outcome = error ? 'error' : ((data as { outcome?: string } | null)?.outcome ?? 'none');
+    if (outcome !== 'updated') {
+      // The sign-in moved and the record did not: the one state that needs a person. Said
+      // as it is, never as a clean refusal.
+      if (error) ctx.log.error('portal email database half failed after the sign-in moved', error);
+      const trail = await auditDelegated(ctx, 'mcp_change_portal_email_partial', { account_id: args.portal_account_id as string, outcome });
+      return toolError(
+        `The SIGN-IN address was changed, but the contact record was not (${outcome}). Send the same call again to finish it; until then invitations still go to the old address.${trail ? ` ${trail}` : ''}`,
+      );
+    }
+    const { outcome: _outcome, ...changed } = data as Record<string, unknown>;
+    return toolText({ changed, note: 'The account now signs in with the new address, and the contact record matches.' });
+  }
+
+  if (name === 'read_request_answers') {
+    if (!isUuid(args.contact_id)) return toolError('contact_id must be a valid id.');
+    const list = optionalId(args.list_id, isUuid);
+    if ('error' in list) return toolError('list_id must be a valid id, or left out for every request.');
+    // Audited inside the function before it returns: the record of the read exists before
+    // any answer is opened here.
+    const { data, error } = await rpc('mcp_read_request_answers', { p_contact_id: args.contact_id, p_list_id: list.id });
+    if (error) throw error;
+    if (!data) return toolError(NO_CONTACT);
+    type Item = Record<string, unknown> & { answer_ciphertext?: string | null };
+    const read = data as { lists: Array<Record<string, unknown> & { items: Item[] }>; truncated: boolean; contact_id: string };
+    const lists = [];
+    for (const l of read.lists) {
+      const items = [];
+      for (const { answer_ciphertext, ...item } of l.items) {
+        if (typeof answer_ciphertext !== 'string') {
+          items.push(item);
+          continue;
+        }
+        try {
+          items.push({ ...item, answer: await ctx.privileged.openAnswer(answer_ciphertext) });
+        } catch (err) {
+          ctx.log.error('a sensitive answer could not be opened', err);
+          items.push({ ...item, answer: null, answer_error: 'This answer could not be opened. The owner can reveal it in the CRM.' });
+        }
+      }
+      lists.push({ ...l, items });
+    }
+    return toolText({ contact_id: read.contact_id, count: lists.length, truncated: read.truncated, lists });
+  }
+
+  if (name === 'list_documents') {
+    if (!isUuid(args.contact_id)) return toolError('contact_id must be a valid id.');
+    if (args.limit !== undefined && args.limit !== null && (!Number.isInteger(args.limit) || (args.limit as number) < 1 || (args.limit as number) > DOCUMENT_LIST_MAX)) {
+      return toolError(`limit must be a whole number from 1 to ${DOCUMENT_LIST_MAX}.`);
+    }
+    const limit = typeof args.limit === 'number' ? args.limit : DOCUMENT_LIST_DEFAULT;
+    const { data, error } = await rpc('mcp_list_documents', { p_contact_id: args.contact_id, p_limit: limit });
+    if (error) throw error;
+    if (!data) return toolError(NO_CONTACT);
+    return toolText({
+      ...(data as Record<string, unknown>),
+      note: 'Metadata only. read_document_text returns the text of a plain text or CSV file; anything else opens in the CRM.',
+    });
+  }
+
+  if (name === 'read_document_text') {
+    if (!isUuid(args.document_id)) return toolError('document_id must be a valid id. Get it from list_documents.');
+    const { data, error } = await rpc('mcp_read_document', { p_document_id: args.document_id });
+    if (error) throw error;
+    const doc = data as {
+      outcome?: string; document_id: string; filename: string; mime_type: string;
+      storage_path: string; encryption_status: string; encryption_iv: string | null;
+    } | null;
+    if (doc?.outcome === 'not_found') return toolError('No document with that id. List them again with list_documents.');
+    if (doc?.outcome === 'not_text') {
+      return toolError(`That file is ${doc.mime_type}, so its contents are not returned here; only plain text and CSV are. It opens in the CRM's document viewer.`);
+    }
+    if (doc?.outcome !== 'ok') throw new Error(`mcp_read_document returned an unknown outcome: ${String(doc?.outcome)}`);
+    const text = new TextDecoder().decode(await ctx.privileged.readDocument(doc));
+    return toolText({
+      document_id: doc.document_id,
+      filename: doc.filename,
+      mime_type: doc.mime_type,
+      truncated: text.length > DOCUMENT_TEXT_LIMIT,
+      text: text.slice(0, DOCUMENT_TEXT_LIMIT),
+    });
   }
 
   return toolError(`Unknown tool: ${name}`);

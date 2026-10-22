@@ -29,7 +29,7 @@ import { connectorUrl, decideRequest, listGrants, mcpKeys, readRequest, revokeGr
  * grants a connection only when it equals mcp_consent_version() in 0015_mcp.sql. Bump both
  * together whenever CAN or CANNOT changes (src/__tests__/db/mcp.test.ts holds them equal).
  */
-export const CONSENT_VERSION = 2;
+export const CONSENT_VERSION = 3;
 
 /**
  * What a connected assistant can and cannot do, as the consent screen states it. Every
@@ -37,16 +37,18 @@ export const CONSENT_VERSION = 2;
  * CONSENT_VERSION so connections approved on the old wording must be approved again.
  */
 export const CAN = [
-  'Search and read contacts, their businesses, quotes and recent notes',
-  'Add contacts and businesses, and update names and phone numbers',
+  'Search and read whole contact records: their businesses, quotes, notes, email addresses and portal accounts',
+  'Add contacts and businesses, and update any contact detail but the email address',
   'Move a contact to another pipeline stage',
-  'Log call notes',
-  'Record proposed quotes, and delete a proposed quote you confirm',
+  'Log call notes, correct a note, and delete a note you confirm',
+  'Record proposed quotes, and accept or delete a proposed quote you confirm',
+  "Change a portal account's sign-in email when you confirm",
+  "Read a contact's request answers, sensitive ones included, and list their documents and read their text files",
   'Read, add, edit, move and note cards on your work board',
   'Draft requests, and send, remind, accept the answers on or close a request you confirm',
   'See every open request, and pause or resume its reminders',
 ];
-export const CANNOT = ['Accept a quote', 'Change the address of a contact with a portal account', 'Delete a contact or a note'];
+export const CANNOT = ['Delete a contact', 'Change or delete an accepted quote', 'Open a PDF, an image or a spreadsheet'];
 
 function Centered({ children }: { children: ReactNode }) {
   return <main className="flex min-h-svh items-center justify-center p-4">{children}</main>;

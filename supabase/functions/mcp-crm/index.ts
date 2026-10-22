@@ -6,6 +6,7 @@ import { createOutbound, readOutboundEnv } from '../_shared/outbound.ts';
 import { loadOwnerEmail } from '../_shared/owner.ts';
 import { createNeedsSendStore } from '../send-needs-list/store.ts';
 import { createMcpCrmHandler } from './handler.ts';
+import { createPrivilegedOps } from './privileged.ts';
 import { createRequestOutward } from './outward.ts';
 import { createReviewSigner } from './review-token.ts';
 
@@ -20,6 +21,19 @@ Deno.serve(
     supabaseUrl: config.supabaseUrl,
     siteUrl: config.siteUrl,
     db: service,
+    privileged: createPrivilegedOps({
+      piiKey: Deno.env.get('PII_ENCRYPTION_KEY')?.trim() || null,
+      documentKey: Deno.env.get('DOCUMENT_ENCRYPTION_KEY')?.trim() || null,
+      async download(path) {
+        const { data, error } = await service.storage.from('client-documents').download(path);
+        if (error) throw error;
+        return new Uint8Array(await data.arrayBuffer());
+      },
+      async updateUserEmail(userId, email) {
+        const { error } = await service.auth.admin.updateUserById(userId, { email, email_confirm: true });
+        return { error: error ? { status: error.status } : null };
+      },
+    }),
     orgName: async () => (await org.load()).displayName,
     // The review-token key derives from the service-role key, which a connector never
     // holds, so a bearer cannot mint a token for content it did not read.

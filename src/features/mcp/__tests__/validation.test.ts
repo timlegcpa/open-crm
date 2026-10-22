@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   CONTACT_CREATABLE,
+  CONTACT_TIERS,
   CONTACT_UPDATABLE,
   EMAIL_MAX_LEN,
   KEY_RE,
@@ -24,12 +25,13 @@ import {
 import { callTool, toolCatalog, TOOLS, type ToolContext } from '../../../../supabase/functions/mcp-crm/tools';
 import { createReviewSigner } from '../../../../supabase/functions/mcp-crm/review-token';
 import { isUuid } from '../../../../supabase/functions/_shared/http';
+import { CLIENT_TIERS } from '../../crm/lib/tiers';
 
 const ID = 'a3bb189e-8bf9-4888-9912-ace4e6543002';
 
 describe('pickFrom', () => {
   it('iterates the allowlist, so an unknown key never lands', () => {
-    const input = { first_name: 'Ada', status: 'client', source: 'mcp', email: 'a@example.com', __proto__: { phone: 'x' } };
+    const input = { first_name: 'Ada', status: 'client', client_since: '2020-01-01', email: 'a@example.com', __proto__: { phone: 'x' } };
     expect(pickFrom(CONTACT_UPDATABLE, input)).toEqual({ first_name: 'Ada' });
   });
 
@@ -43,6 +45,12 @@ describe('pickFrom', () => {
   });
 });
 
+describe('the tier list', () => {
+  it('is the CRM’s own tier list, in order', () => {
+    expect([...CONTACT_TIERS]).toEqual([...CLIENT_TIERS]);
+  });
+});
+
 describe('validateContactPatch', () => {
   it('refuses a value that is not a string instead of coercing it', () => {
     expect(validateContactPatch({ first_name: 42 })).toMatch(/must be a string/);
@@ -53,6 +61,13 @@ describe('validateContactPatch', () => {
     expect(validateContactPatch({ first_name: 'x'.repeat(5001) })).toMatch(/too long/);
     expect(validateContactPatch({ email: 'not-an-email' })).toMatch(/not a valid address/);
     expect(validateContactPatch({ email: 'ada@example.com', first_name: 'Ada' })).toBeNull();
+  });
+
+  it('holds the spouse address and the tier to a shape, and lets an empty one clear', () => {
+    expect(validateContactPatch({ spouse_email: 'nope' })).toMatch(/spouse_email is not a valid address/);
+    expect(validateContactPatch({ tier: 'F' })).toMatch(/tier must be one of: S, A, B, C, D, E/);
+    expect(validateContactPatch({ spouse_email: '', tier: '' })).toBeNull();
+    for (const tier of CONTACT_TIERS) expect(validateContactPatch({ tier })).toBeNull();
   });
 });
 
@@ -158,6 +173,7 @@ describe('the tool handlers refuse bad input before any database call', () => {
       rpc,
       outwardCalls,
       db: { rpc },
+      privileged: { openAnswer: outwardCalls, readDocument: outwardCalls, setSignInEmail: outwardCalls },
       actor: ID,
       ip: null,
       userAgent: null,
@@ -226,7 +242,29 @@ describe('the tool handlers refuse bad input before any database call', () => {
     ['create_contact', { email: 'a@example.com', first_name: 7 }],
     ['update_contact', { contact_id: ID }],
     ['update_contact', { contact_id: ID, phone: '1', email: 'a@example.com' }],
-    ['update_contact', { contact_id: ID, phone: '1', spouse_email: 'a@example.com' }],
+    ['update_contact', { contact_id: ID, phone: '1', spouse_email: 'not-an-address' }],
+    ['update_contact', { contact_id: ID, tier: 'F' }],
+    ['update_contact', { contact_id: ID, source: null }],
+    ['update_contact', { contact_id: ID, source: 'made_up' }],
+    ['update_contact', { contact_id: ID, first_name: 7 }],
+    ['update_note', { contact_id: ID, note_id: ID }],
+    ['update_note', { contact_id: ID, note_id: ID, body: '   ' }],
+    ['update_note', { contact_id: ID, note_id: ID, kind: 'sms' }],
+    ['update_note', { contact_id: ID, note_id: ID, body: 'x'.repeat(10_001) }],
+    ['update_note', { contact_id: ID, note_id: 'nope', body: 'x' }],
+    ['delete_note', { contact_id: ID, note_id: ID }],
+    ['delete_note', { contact_id: ID, note_id: ID, confirmed_with_user: 'true' }],
+    ['accept_quote', { contact_id: ID, quote_id: ID, service_type: 'retainer' }],
+    ['accept_quote', { contact_id: ID, quote_id: ID, service_type: 'Retainer!', confirmed_with_user: true }],
+    ['accept_quote', { contact_id: ID, quote_id: ID, service_type: 'retainer', organization_id: '', confirmed_with_user: true }],
+    ['change_portal_email', { portal_account_id: ID, new_email: 'a@example.com', confirmed_with_user: true }],
+    ['change_portal_email', { portal_account_id: ID, new_email: 'not-an-address', expected_current_email: null, confirmed_with_user: true }],
+    ['change_portal_email', { portal_account_id: ID, new_email: 'a@example.com', expected_current_email: null, confirmed_with_user: 1 }],
+    ['change_portal_email', { portal_account_id: 'nope', new_email: 'a@example.com', expected_current_email: null, confirmed_with_user: true }],
+    ['read_request_answers', { contact_id: ID, list_id: '' }],
+    ['list_documents', { contact_id: ID, limit: 0 }],
+    ['list_documents', { contact_id: ID, limit: 501 }],
+    ['read_document_text', { document_id: 'nope' }],
     ['correct_contact_email', { contact_id: ID, email: 'a@example.com' }],
     ['correct_contact_email', { contact_id: ID, email: 'a@example.com', expected_current_email: 5 }],
     ['correct_contact_email', { contact_id: ID, email: 'a@example.com', expected_current_email: null }],

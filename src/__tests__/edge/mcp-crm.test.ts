@@ -16,7 +16,9 @@ import {
   type McpCrmDeps,
 } from '../../../supabase/functions/mcp-crm/handler';
 import { REFUSALS } from '../../../supabase/functions/_shared/handler';
-import { sha256Hex } from '../../../supabase/functions/_shared/crypto';
+import { encryptDocument, encryptPii, sha256Hex, toByteaHex } from '../../../supabase/functions/_shared/crypto';
+import { createPrivilegedOps } from '../../../supabase/functions/mcp-crm/privileged';
+import type { PrivilegedOps } from '../../../supabase/functions/mcp-crm/tools';
 import type { SendResult } from '../../../supabase/functions/_shared/outbound';
 import { mcpResourceUrl, protectedResourceMetadataUrl } from '../../../supabase/functions/mcp-oauth/tokens';
 import { createRequestOutward, type RequestOutward } from '../../../supabase/functions/mcp-crm/outward';
@@ -41,6 +43,18 @@ const noOutward: RequestOutward = {
   alert: async () => false,
 };
 const bytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
+/** For the contract runs: no tool there reaches the answer key, Storage or Auth. */
+const noPrivileged: PrivilegedOps = {
+  openAnswer: async () => { throw new Error('unexpected openAnswer'); },
+  readDocument: async () => { throw new Error('unexpected readDocument'); },
+  setSignInEmail: async () => { throw new Error('unexpected setSignInEmail'); },
+};
+/** Test keys: 32 bytes of base64 each, nothing like a provider secret. */
+const ANSWER_KEY = Buffer.from('answer-key-for-tests-0123456789a').toString('base64');
+const DOCUMENT_KEY = Buffer.from('document-key-for-tests-012345678').toString('base64');
+/** The fake Storage bucket and Auth the live runs see: objects by path, and every sign-in update asked for. */
+const storage = new Map<string, Uint8Array>();
+const auth: { calls: Array<{ userId: string; email: string }>; status: number | null } = { calls: [], status: null };
 
 // ---------------------------------------------------------------------------
 // The edge contract, with a fake database
@@ -62,6 +76,7 @@ function contractDeps(over: Partial<McpCrmDeps> = {}): McpCrmDeps {
     supabaseUrl: SUPABASE_URL,
     siteUrl: SITE,
     db: fakeDb(),
+    privileged: noPrivileged,
     orgName: async () => 'Example Co',
     limit: async () => 'allowed',
     review: REVIEW,
@@ -208,6 +223,19 @@ function liveDeps(over: Partial<McpCrmDeps> = {}, store: NeedsSendStore = pglite
     supabaseUrl: SUPABASE_URL,
     siteUrl: SITE,
     db: serviceClient(db),
+    privileged: createPrivilegedOps({
+      piiKey: ANSWER_KEY,
+      documentKey: DOCUMENT_KEY,
+      download: async (path) => {
+        const object = storage.get(path);
+        if (!object) throw new Error('no such object');
+        return object;
+      },
+      updateUserEmail: async (userId, email) => {
+        auth.calls.push({ userId, email });
+        return { error: auth.status === null ? null : { status: auth.status } };
+      },
+    }),
     orgName: async () => 'Example Co',
     limit: async () => 'allowed',
     review: REVIEW,
@@ -432,7 +460,15 @@ describe('the tools', () => {
       'upsert_quote', 'delete_quote', 'create_request', 'update_request', 'list_requests', 'send_request', 'remind_request', 'delete_request',
       'list_open_requests', 'close_request', 'accept_request', 'set_request_reminders', 'set_contact_status',
       'list_board', 'create_work_item', 'update_work_item', 'move_work_item', 'add_work_item_note',
-    ]);
+    ].flatMap((n) => ({
+      // 0017: each new tool sits beside the one it extends.
+      correct_contact_email: ['correct_contact_email', 'change_portal_email'],
+      log_call_note: ['log_call_note', 'update_note', 'delete_note'],
+      delete_quote: ['delete_quote', 'accept_quote'],
+      list_requests: ['list_requests', 'read_request_answers'],
+      add_work_item_note: ['add_work_item_note', 'list_documents', 'read_document_text'],
+    } as Record<string, string[]>)[n] ?? [n]));
+    expect(prop('update_contact', 'source').enum!.length).toBeGreaterThan(0);
     // The pipeline and the board are offered from the database, labels with the keys.
     expect(prop('set_contact_status', 'status').enum).toEqual(statuses.filter((s) => s !== 'esign_signer'));
     expect(prop('set_contact_status', 'expected_status').enum).toEqual(statuses);
@@ -454,7 +490,7 @@ describe('the tools', () => {
     expect(dup).toEqual({ isError: true, text: `A contact with that email already exists (id ${contactId}).` });
   });
 
-  it('update refuses an email field outright, changing nothing', async () => {
+  it('update refuses the contact\u2019s own email field outright, changing nothing', async () => {
     const res = await tool('update_contact', { contact_id: contactId, phone: '555-0100', email: 'x@example.com' });
     expect(res.isError).toBe(true);
     expect((await db.query(`SELECT phone FROM public.contacts WHERE id = $1`, [contactId])).rows[0]).toEqual({ phone: null });
@@ -1274,5 +1310,153 @@ describe('the request follow-up tools', () => {
     const audit = await db.query(`SELECT user_id FROM public.audit_logs WHERE action = 'mcp_list_open_requests'`);
     expect(audit.rows.length).toBeGreaterThan(0);
     expect(audit.rows.every((r) => (r as { user_id: string }).user_id === DB_OWNER_ID)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0017: notes, accepting a quote, the whole record, the sign-in address and what a client sent
+// ---------------------------------------------------------------------------
+
+describe('the full-access tools', () => {
+  let seq = 0;
+  const fresh = async (fields: Record<string, unknown> = {}) => {
+    seq += 1;
+    return seedContact(db, { first_name: 'Grace', last_name: `Access ${seq}`, ...fields });
+  };
+
+  it('corrects a note it logged and deletes one only on the go-ahead; the source stays the connector’s', async () => {
+    const id = await fresh();
+    expect((await tool('log_call_note', { contact_id: id, body: 'Talked trough the scope' })).isError).toBe(false);
+    const noteId = (await toolJson('get_contact', { contact_id: id })).json().recent_notes[0].id as string;
+    const fixed = await toolJson('update_note', { contact_id: id, note_id: noteId, body: 'Talked through the scope', kind: 'meeting' });
+    expect(fixed.json().updated).toMatchObject({ id: noteId, body: 'Talked through the scope', kind: 'meeting', source: 'mcp' });
+    expect((await tool('update_note', { contact_id: contactId, note_id: noteId, body: 'x' })).text).toMatch(/^No note with that id/);
+    expect((await tool('update_note', { contact_id: id, note_id: noteId })).text).toMatch(/Nothing to change/);
+
+    expect((await tool('delete_note', { contact_id: id, note_id: noteId })).isError).toBe(true);
+    expect((await db.query(`SELECT source FROM public.contact_notes WHERE id = $1`, [noteId])).rows).toEqual([{ source: 'mcp' }]);
+    expect((await toolJson('delete_note', { contact_id: id, note_id: noteId, confirmed_with_user: true })).json().deleted).toEqual({ id: noteId });
+    expect((await db.query(`SELECT 1 FROM public.contact_notes WHERE id = $1`, [noteId])).rows).toEqual([]);
+  });
+
+  it('accepts a proposed quote only on the go-ahead, and the contact becomes a client', async () => {
+    const id = await fresh({ status: 'hot' });
+    const quote = (await db.query<{ id: string }>(
+      `INSERT INTO public.contact_services (contact_id, service_type, state, cadence, amount) VALUES ($1, 'project', 'proposed', 'annual', 1200) RETURNING id`, [id])).rows[0].id;
+    expect((await tool('accept_quote', { contact_id: id, quote_id: quote, service_type: 'project' })).isError).toBe(true);
+    expect((await tool('accept_quote', { contact_id: id, quote_id: quote, service_type: 'retainer', confirmed_with_user: true })).text).toMatch(/^No proposed quote/);
+    const done = await toolJson('accept_quote', { contact_id: id, quote_id: quote, service_type: 'project', confirmed_with_user: true });
+    expect(done.json()).toMatchObject({ accepted: { state: 'accepted', contact_status: 'client' }, note: 'Accepted. The contact moved from hot to client.' });
+    expect((await tool('accept_quote', { contact_id: id, quote_id: quote, service_type: 'project', confirmed_with_user: true })).text).toMatch(/already accepted/);
+    expect((await db.query(`SELECT status FROM public.contacts WHERE id = $1`, [id])).rows).toEqual([{ status: 'client' }]);
+  });
+
+  it('updates the whole record: a spouse address normalized, a null tier cleared, a source from the vocabulary', async () => {
+    const id = await fresh({ tier: 'B' });
+    const res = await toolJson('update_contact', { contact_id: id, spouse_email: '  grace.spouse@example.com ', tier: null, mailing_city: 'Springfield', source: 'referral' });
+    expect(res.isError, res.text).toBe(false);
+    expect((await db.query(`SELECT spouse_email, tier, mailing_city, source FROM public.contacts WHERE id = $1`, [id])).rows).toEqual([
+      { spouse_email: 'grace.spouse@example.com', tier: null, mailing_city: 'Springfield', source: 'referral' },
+    ]);
+    for (const args of [{ tier: 'F' }, { source: 'made_up' }, { source: null }, { spouse_email: 'not-an-address' }]) {
+      expect([args, (await tool('update_contact', { contact_id: id, ...args })).isError]).toEqual([args, true]);
+    }
+  });
+
+  it('moves a portal sign-in: Auth first, then the record; a refusal or a stale read changes nothing', async () => {
+    const id = await fresh({ email: 'grace.login@example.com' });
+    const userId = crypto.randomUUID();
+    await db.query(`INSERT INTO auth.users (id, email) VALUES ($1, 'grace.login@example.com')`, [userId]);
+    const account = (await db.query<{ id: string }>(
+      `INSERT INTO public.client_portal_accounts (contact_id, user_id, status, invited_email) VALUES ($1, $2, 'active', 'grace.login@example.com') RETURNING id`,
+      [id, userId])).rows[0].id;
+    const args = { portal_account_id: account, new_email: 'grace.new@example.com', expected_current_email: 'grace.login@example.com', confirmed_with_user: true };
+    const stored = async () => (await db.query(`SELECT a.invited_email, c.email FROM public.client_portal_accounts a JOIN public.contacts c ON c.id = a.contact_id WHERE a.id = $1`, [account])).rows[0];
+
+    auth.calls = [];
+    expect((await tool('change_portal_email', { ...args, confirmed_with_user: undefined })).isError).toBe(true);
+    expect((await tool('change_portal_email', { ...args, expected_current_email: 'old@example.com' })).text).toMatch(/did not match/);
+    expect(auth.calls).toEqual([]);
+
+    auth.status = 422;
+    expect((await tool('change_portal_email', args)).text).toMatch(/could not be changed/);
+    expect(await stored()).toEqual({ invited_email: 'grace.login@example.com', email: 'grace.login@example.com' });
+
+    auth.status = null;
+    const changed = await toolJson('change_portal_email', args);
+    expect(changed.isError, changed.text).toBe(false);
+    expect(auth.calls.at(-1)).toEqual({ userId, email: 'grace.new@example.com' });
+    expect(await stored()).toEqual({ invited_email: 'grace.new@example.com', email: 'grace.new@example.com' });
+    const audit = await db.query<{ details: Record<string, unknown> }>(`SELECT details FROM public.audit_logs WHERE action = 'mcp_change_portal_email' AND details ->> 'account_id' = $1`, [account]);
+    expect(audit.rows.map((r) => r.details.outcome)).toEqual(['updated']);
+    expect(JSON.stringify(audit.rows)).not.toMatch(/@/);
+  });
+
+  it('a sign-in that moved while the record could not says so, and is recorded as half done', async () => {
+    const id = await fresh({ email: 'half@example.com' });
+    const userId = crypto.randomUUID();
+    await db.query(`INSERT INTO auth.users (id, email) VALUES ($1, 'half@example.com')`, [userId]);
+    const account = (await db.query<{ id: string }>(
+      `INSERT INTO public.client_portal_accounts (contact_id, user_id, status, invited_email) VALUES ($1, $2, 'active', 'half@example.com') RETURNING id`,
+      [id, userId])).rows[0].id;
+    // The address moves between the check and the database half.
+    const racing = createMcpCrmHandler(liveDeps({
+      privileged: {
+        ...noPrivileged,
+        setSignInEmail: async () => {
+          await db.query(`UPDATE public.client_portal_accounts SET invited_email = 'moved@example.com' WHERE id = $1`, [account]);
+          return 'changed';
+        },
+      },
+    }));
+    const res = await (await post({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+      name: 'change_portal_email',
+      arguments: { portal_account_id: account, new_email: 'half.new@example.com', expected_current_email: 'half@example.com', confirmed_with_user: true },
+    } }, BEARER, racing)).json() as { result: { isError?: boolean; content: Array<{ text: string }> } };
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toMatch(/^The SIGN-IN address was changed, but the contact record was not \(stale\)/);
+    const partial = await db.query(`SELECT details FROM public.audit_logs WHERE action = 'mcp_change_portal_email_partial' AND details ->> 'account_id' = $1`, [account]);
+    expect(partial.rows).toHaveLength(1);
+  });
+
+  it('reads the answers on a sent request, opening a sensitive one, and says when one cannot be opened', async () => {
+    const id = await fresh();
+    const list = (await db.query<{ id: string }>(`INSERT INTO public.needs_lists (contact_id, title, status) VALUES ($1, 'Account setup', 'sent') RETURNING id`, [id])).rows[0].id;
+    const sealed = toByteaHex(await encryptPii('ACCT-0451', ANSWER_KEY));
+    await db.query(
+      `INSERT INTO public.needs_items (list_id, kind, label, status, sensitive, answer_ciphertext, sort_order) VALUES
+         ($1, 'question', 'Account number', 'fulfilled', true, $2::text::bytea, 0),
+         ($1, 'question', 'Old number', 'fulfilled', true, '\\x0102'::bytea, 1),
+         ($1, 'question', 'Preferred day', 'fulfilled', false, NULL, 2)`,
+      [list, sealed]);
+    await db.query(`UPDATE public.needs_items SET answer_text = 'Mondays' WHERE list_id = $1 AND label = 'Preferred day'`, [list]);
+    const read = await toolJson('read_request_answers', { contact_id: id });
+    expect(read.isError, read.text).toBe(false);
+    const items = read.json().lists[0].items as Array<Record<string, unknown>>;
+    expect(items.map((i) => [i.label, i.answer])).toEqual([['Account number', 'ACCT-0451'], ['Old number', null], ['Preferred day', 'Mondays']]);
+    expect(items[1].answer_error).toMatch(/could not be opened/);
+    expect(read.text).not.toMatch(/answer_ciphertext/);
+    const audit = await db.query<{ details: Record<string, unknown> }>(`SELECT details FROM public.audit_logs WHERE action = 'mcp_read_request_answers' AND details ->> 'contact_id' = $1`, [id]);
+    expect(audit.rows.map((r) => r.details.sensitive_answers)).toEqual([2]);
+  });
+
+  it('lists the documents and reads a text one opened on the server; a PDF is refused', async () => {
+    const id = await fresh();
+    const { ciphertext, iv } = await encryptDocument(new TextEncoder().encode('name,amount\nAcme LLC,1200\n'), DOCUMENT_KEY);
+    storage.set(`${id}/sheet.csv.enc`, ciphertext);
+    const insert = (name: string, mime: string, path: string, ivValue: string | null) => db.query<{ id: string }>(
+      `INSERT INTO public.client_documents (contact_id, filename, original_filename, storage_path, file_size, mime_type, encryption_status, encryption_iv)
+       VALUES ($1, $2, $2, $3, 30, $4, $5, $6) RETURNING id`, [id, name, path, mime, ivValue ? 'encrypted' : 'none', ivValue]);
+    const csv = (await insert('sheet.csv', 'text/csv', `${id}/sheet.csv.enc`, iv)).rows[0].id;
+    const pdf = (await insert('scan.pdf', 'application/pdf', `${id}/scan.pdf`, null)).rows[0].id;
+
+    const listed = await toolJson('list_documents', { contact_id: id });
+    expect(listed.json().documents.map((d: { id: string }) => d.id).sort()).toEqual([csv, pdf].sort());
+    expect(listed.text).not.toContain('storage_path');
+    expect((await tool('list_documents', { contact_id: id, limit: 501 })).isError).toBe(true);
+
+    const read = await toolJson('read_document_text', { document_id: csv });
+    expect(read.json()).toEqual({ document_id: csv, filename: 'sheet.csv', mime_type: 'text/csv', truncated: false, text: 'name,amount\nAcme LLC,1200\n' });
+    expect((await tool('read_document_text', { document_id: pdf })).text).toMatch(/application\/pdf/);
   });
 });

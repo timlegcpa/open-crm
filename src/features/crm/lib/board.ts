@@ -318,6 +318,8 @@ export interface LeadRow extends CadenceTotals {
   unplaceable: number;
   /** Has an email or a phone (whitespace does not count). */
   reachable: boolean;
+  /** The card's note line: the newest logged note, text only (never its date). */
+  note: string | null;
   /** Sort key ONLY, never rendered: no age or day count appears anywhere. */
   addedAt: string;
 }
@@ -329,10 +331,47 @@ export interface LeadGroup extends CadenceTotals, LeadGroupDef {
 }
 
 /**
- * Every pipeline contact, grouped by stage, NEWEST FIRST (never by money). An empty group
- * still renders: "no new leads" is information.
+ * Each contact's newest note, from rows read newest first: the first row seen for a contact
+ * wins. A blank body is skipped, so an empty newest note never hides the one before it.
  */
-export function leadPipeline(contacts: readonly Contact[], { serviceLabels, organizations, statusOrder }: LabelSources): LeadGroup[] {
+export function latestNotes(rows: ReadonlyArray<{ contact_id: string; body: string }>): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const r of rows) {
+    if (!out.has(r.contact_id) && hasText(r.body)) out.set(r.contact_id, r.body.trim());
+  }
+  return out;
+}
+
+/** The board's service filter: 'all', or one service type key. */
+export type ServiceFilter = 'all' | (string & {});
+
+/**
+ * Does this contact carry a PROPOSED line for the chosen service? 'all' matches everyone.
+ * The filter says what is quoted, never what a lead might want, so a lead with no quoted
+ * service shows under All only.
+ */
+export function matchesServiceFilter(contact: Pick<Contact, 'contact_services'>, filter: ServiceFilter): boolean {
+  if (filter === 'all') return true;
+  return contact.contact_services.some((s) => s.state === 'proposed' && s.service_type === filter);
+}
+
+/** The service types quoted (proposed) to anyone in these contacts, for the filter's pills. */
+export function quotedServiceTypes(contacts: readonly Pick<Contact, 'contact_services'>[]): Set<string> {
+  const out = new Set<string>();
+  for (const c of contacts) for (const s of c.contact_services) if (s.state === 'proposed') out.add(s.service_type);
+  return out;
+}
+
+/**
+ * Every pipeline contact, grouped by stage, NEWEST FIRST (never by money). An empty group
+ * still renders: "no new leads" is information. `notes` is each person's newest note
+ * (latestNotes).
+ */
+export function leadPipeline(
+  contacts: readonly Contact[],
+  { serviceLabels, organizations, statusOrder }: LabelSources,
+  notes: ReadonlyMap<string, string> = new Map(),
+): LeadGroup[] {
   const orgNames = new Map(organizations.map((o) => [o.id, o.name]));
   const firstOrg = new Map<string, string>();
   for (const o of organizations) if (!firstOrg.has(o.contact_id)) firstOrg.set(o.contact_id, o.name);
@@ -353,6 +392,7 @@ export function leadPipeline(contacts: readonly Contact[], { serviceLabels, orga
       unpriced: 0,
       unplaceable: 0,
       reachable: hasText(c.email) || hasText(c.phone),
+      note: notes.get(c.id) ?? null,
       addedAt: addedAt(c),
     };
     for (const r of c.contact_services.filter((s) => s.state === 'proposed')) {

@@ -4,6 +4,9 @@ export const queryKeys = {
     all: ['contacts'] as const,
     list: () => ['contacts', 'list'] as const,
     detail: (id: string) => ['contacts', 'detail', id] as const,
+    // The pipeline cards' note line. Under the prefix, so a contact write refreshes it; the
+    // notes card invalidates it too, since a note write is no contact write.
+    leadNotes: () => ['contacts', 'leadNotes'] as const,
   },
   contactEmails: {
     forContact: (contactId: string) => ['contact-emails', contactId] as const,

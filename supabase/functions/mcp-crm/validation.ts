@@ -40,16 +40,35 @@ export function normalizeEmail(v: unknown): { email: string } | { error: string 
 }
 
 /**
- * The fields a model may set on a contact: the four base fields. Spouse details, addresses
- * and the client-since date are not writable by a model. A new contact may also be given a
- * stage and a lead source (create_contact checks each against the vocabulary itself), and
- * an existing one moves stage only through set_contact_status, compare-and-swapped. The
- * connector's provenance lives in the audit log either way.
+ * The fields a model may set on a contact. Creation takes the four base fields and the
+ * address (plus a stage and a lead source, which create_contact checks against the
+ * vocabulary itself). An update reaches the whole record but two things: the contact's own
+ * address, which routes invitations and sign-in and has its own tools (correct_contact_email,
+ * change_portal_email), and the stage, which moves only through set_contact_status,
+ * compare-and-swapped. The client-since date is the status trigger's. The connector's
+ * provenance lives in the audit log either way.
  */
 export const CONTACT_BASE_WRITABLE = ['first_name', 'last_name', 'phone', 'business_name'] as const;
 /** Creation may set the address. An update may not: an address is a routing control. */
 export const CONTACT_CREATABLE = [...CONTACT_BASE_WRITABLE, 'email'] as const;
-export const CONTACT_UPDATABLE = CONTACT_BASE_WRITABLE;
+export const CONTACT_UPDATABLE = [
+  ...CONTACT_BASE_WRITABLE,
+  'spouse_first_name',
+  'spouse_last_name',
+  'spouse_email',
+  'spouse_phone',
+  'mailing_street',
+  'mailing_city',
+  'mailing_state',
+  'mailing_zip',
+  'source',
+  'tier',
+] as const;
+/** The fields an update may clear. The names clear to empty; the source cannot be cleared. */
+export const CONTACT_CLEARABLE: readonly string[] = CONTACT_UPDATABLE.filter((k) => k !== 'source');
+
+/** contacts.tier's CHECK (0013). The app's twin is CLIENT_TIERS (a test holds them equal). */
+export const CONTACT_TIERS = ['S', 'A', 'B', 'C', 'D', 'E'] as const;
 
 /** Iterates the ALLOWLIST, never the input, so an unknown key cannot land. null and undefined are absent. */
 export function pickFrom(allow: readonly string[], input: Record<string, unknown>): Record<string, unknown> {
@@ -68,6 +87,11 @@ export function validateContactPatch(p: Record<string, unknown>): string | null 
   }
   const email = p.email as string | undefined;
   if (email !== undefined && !EMAIL_RE.test(email)) return 'email is not a valid address';
+  // An empty value clears a field, so only a non-empty one is held to a shape.
+  const spouseEmail = p.spouse_email as string | undefined;
+  if (spouseEmail && !EMAIL_RE.test(spouseEmail)) return 'spouse_email is not a valid address';
+  const tier = p.tier as string | undefined;
+  if (tier && !(CONTACT_TIERS as readonly string[]).includes(tier)) return `tier must be one of: ${CONTACT_TIERS.join(', ')}, or null to clear it`;
   return null;
 }
 

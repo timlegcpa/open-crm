@@ -213,3 +213,27 @@ export function resendInvite(accountId: string): Promise<InviteAnswer> {
 export async function revokeAccess(accountId: string): Promise<void> {
   await invokeEdge('revoke-portal-access', { account_id: accountId }, { parse: (v) => z.object({ success: z.literal(true) }).parse(v) });
 }
+
+const changeEmailAnswer = z.object({
+  success: z.literal(true),
+  contact_address: z.enum(['email', 'spouse_email', 'email_list']).nullable(),
+});
+
+export type ChangeSignInAnswer = z.infer<typeof changeEmailAnswer>;
+
+/**
+ * Move one account's sign-in to a new address, and the contact's matching address with it.
+ * `expected` is the address this screen showed: a change made meanwhile is refused.
+ */
+export function changeSignInEmail(accountId: string, email: string, expected: string): Promise<ChangeSignInAnswer> {
+  return invokeEdge(
+    'change-portal-email',
+    { account_id: accountId, email, expected_email: expected },
+    { parse: (v) => changeEmailAnswer.parse(v) },
+  );
+}
+
+/** The accounts that sign in (a user, not deactivated): only these have an address to move. */
+export function signInAccounts(accounts: PortalAccount[]): PortalAccount[] {
+  return accounts.filter((a) => a.user_id !== null && a.status !== 'deactivated' && a.invited_email);
+}

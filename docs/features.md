@@ -16,6 +16,8 @@ browser. The tab is part of the address, and the last one chosen is
 remembered. A search in the panel looks through everyone and also narrows the board, the
 tiers and the table. Add a contact by hand, or let one arrive through lead intake.
 
+Each pipeline card shows the contact's newest note, text only, in up to three lines; the full log stays on the record, and the board re-reads notes whenever it is shown, because the AI connector writes notes too. Pills above the board narrow it to the leads with a proposed quote for one service; a lead with nothing quoted shows under All only, and the pills list only services someone on the board is quoted for. New opens a quick add for a lead: name, email, phone, source, stage, the services they asked about (each saved as a proposed quote with no price) and one note. If a quote or the note fails to save after the contact is created, the screen says so without undoing the contact, so a retry never adds the person twice. The full Add contact page stays for everything else.
+
 **Tiers.** The owner ranks clients by hand, S at the top, then A, B, C, D and E; a contact
 starts not ranked. The Tiers tab shows one row per tier, in tier-list colours, with the active
 (recurring) clients in their rows; drag a client to another row to change their tier. A tier is
@@ -39,12 +41,22 @@ and carries the services editor on the tabs that do not. A status change and a q
 one contact wait for each other.
 
 A contact record holds emails (primary and a spouse or partner's), phone, mailing address, lead source, the businesses the contact owns,
-notes (append-only), relationships to other contacts, service quotes and upsells (further work to pitch: open, pitched, won or passed). A quote is
+notes, relationships to other contacts, service quotes and upsells (further work to pitch: open, pitched, won or passed). A quote is
 one service per business with an amount and a cadence (monthly, annual or one-time), proposed
 or accepted. Accepted monthly quotes make up monthly recurring revenue, and with accepted annual
 quotes, annual recurring revenue. A contact delete is
 claimed first, so a delete cannot race a portal sign-in, and takes everything recorded on the
 contact with it.
+
+**Notes.** A note can be corrected in place (its text and its type) or deleted behind a
+confirm. Who wrote it (the owner, the AI connector or lead intake) never changes: the database
+lets no one rewrite that.
+
+**Emails.** An address a portal account signs in with is marked Portal sign-in. Editing it
+changes the sign-in and the contact's address together (the `change-portal-email` function:
+the sign-in moves first, so a refusal there changes nothing); a change built on an address
+that changed meanwhile is refused. If the sign-in moved but the record could not, the screen
+says so and the same edit, tried again, finishes it.
 
 The record's tabs come from the other domains: Billing (quotes), Requests, Documents, Messages,
 E-sign, Portal and Activity.
@@ -133,13 +145,20 @@ the address is then never sent group email again.
 **Owner.** Leads and won clients by month and by source, monthly targets, ad spend with cost
 per lead and cost per acquisition, and recurring revenue from accepted quotes.
 
-## AI connector (`mcp`, `0007_mcp`, `0015_mcp`)
+## AI connector (`mcp`, `0007_mcp`, `0015_mcp`, `0017_crm_full_access`)
 
 **Owner.** Connect an AI assistant (any MCP client) through OAuth: the assistant asks, and the
 owner approves on a consent screen with a second-factor session. The assistant can then search
-and read contacts (by name, email, phone or business; archived contacts are left out), create
-them from an email or a phone number with a stage and lead source, update them, move them along
-the pipeline, add businesses, log call notes, and manage quotes. It works the board (list,
+and read contacts (by name, email, phone or business; archived contacts are left out) and read
+a whole record (spouse, mailing address, source, tier, every address and the portal accounts,
+never a sign-in id), create them from an email or a phone number with a stage and lead source,
+update any detail but the email (which has its own correction tool), move them along the
+pipeline, add businesses, log, correct and delete notes, manage quotes, and accept a proposed
+quote (the contact's stage follows, as in the CRM; a lost, cold or former client stays where
+they are). With the owner's go-ahead it changes a portal account's sign-in email, the same
+change the record's Emails section makes. It reads a contact's request answers (sensitive
+answers decrypted on the server), lists a contact's documents and reads a stored plain-text or
+CSV document; it cannot open a PDF, an image or a spreadsheet. It works the board (list,
 create, edit, move with a reason, and note cards), and handles requests end to end: create,
 send and remind them, see every open request by whose move it is (the same sections as the
 requests screen), accept answers (accepting the last one closes the request, as in the CRM),

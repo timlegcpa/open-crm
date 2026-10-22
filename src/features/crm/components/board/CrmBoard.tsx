@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { Link } from 'react-router-dom';
-import { useIsMutating } from '@tanstack/react-query';
+import { useIsMutating, useQuery } from '@tanstack/react-query';
 import {
   DndContext,
   DragOverlay,
@@ -15,9 +15,11 @@ import {
   type CollisionDetection,
   type DragEndEvent,
 } from '@dnd-kit/core';
-import { AlertTriangle, Archive, Building2, ChevronRight, Filter, Search, Tag, X } from 'lucide-react';
+import { AlertTriangle, Archive, ChevronRight, Filter, Plus, Search, StickyNote, X } from 'lucide-react';
+import { listNotesForStatuses } from '@/api/contactNotes';
 import type { Contact } from '@/api/contacts';
 import type { ContactStatus } from '@/api/pickLists';
+import { queryKeys } from '@/api/queryKeys';
 import { ContactEmailsManager } from '@/components/contacts/ContactEmailsManager';
 import { StatusMonogram, statusDotStyle } from '@/components/contacts/StatusBadge';
 import { Button } from '@/components/ui/button';
@@ -26,19 +28,33 @@ import { CopyValue } from '@/components/ui/copy-value';
 import { Input } from '@/components/ui/input';
 import { initialsOf } from '@/components/ui/monogram';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Segmented } from '@/components/ui/segmented';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { StatusPill } from '@/components/ui/status-pill';
 import { useLeadSources } from '@/hooks/usePickLists';
 import { links } from '@/features/links';
-import { isSystemStatus } from '@/lib/contactStatus';
+import { isSystemStatus, PIPELINE_STATUSES } from '@/lib/contactStatus';
 import { formatCurrencyShort } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { useContactFieldSave } from '../../hooks';
-import { cadenceText, leadPipeline, mrrArrText, viewLabel, type BoardOrganization, type LeadGroup, type LeadRow } from '../../lib/board';
+import {
+  cadenceText,
+  latestNotes,
+  leadPipeline,
+  matchesServiceFilter,
+  mrrArrText,
+  quotedServiceTypes,
+  viewLabel,
+  type BoardOrganization,
+  type LeadGroup,
+  type LeadRow,
+  type ServiceFilter,
+} from '../../lib/board';
 import { isTypingContext, moveForDrop } from '../../lib/interaction';
 import { quoteOpMutationKey } from '../../lib/quotes';
 import { EditableField } from '../EditableField';
 import { quickCopyItems } from '../RecordRightBar';
+import { NewLeadDialog } from './NewLeadDialog';
 
 // Loaded only when a card opens, so the board never carries the editor until it is used.
 const CompactQuoteEditor = lazy(() => import('../quotes/CompactQuoteEditor').then((m) => ({ default: m.CompactQuoteEditor })));
@@ -81,7 +97,7 @@ function rowSummary(row: LeadRow): string {
     .join(' · ');
 }
 
-function CardBody({ row, compact, sourceLabel, status }: { row: LeadRow; compact: boolean; sourceLabel: string | null; status: ContactStatus | undefined }) {
+function CardBody({ row, compact, status }: { row: LeadRow; compact: boolean; status: ContactStatus | undefined }) {
   const yearly = mrrArrText(row);
   const once = row.oneTime > 0 ? `${formatCurrencyShort(row.oneTime)} once` : '';
   const quoted = cadenceText(row);
@@ -94,7 +110,7 @@ function CardBody({ row, compact, sourceLabel, status }: { row: LeadRow; compact
       <span className={cn('mt-1.5 text-[12px] text-muted-foreground', compact ? 'line-clamp-2 [overflow-wrap:anywhere]' : 'block truncate')}>
         {rowSummary(row)}
       </span>
-      {(row.lines.length > 0 || sourceLabel || !row.reachable) && (
+      {(row.lines.length > 0 || row.note || !row.reachable) && (
         <span className="mt-2 flex flex-col gap-1 border-t border-border/60 pt-2">
           {row.lines.length > 0 && (
             <span
@@ -118,10 +134,11 @@ function CardBody({ row, compact, sourceLabel, status }: { row: LeadRow; compact
               )}
             </span>
           )}
-          {sourceLabel && (
-            <span className="flex min-w-0 items-center gap-1 text-[11.5px] text-muted-foreground">
-              <Tag className="h-3 w-3 shrink-0" aria-hidden="true" />
-              <span className="min-w-0">{sourceLabel}</span>
+          {/* The newest note, text only: its age is not shown. The full log is on the record. */}
+          {row.note && (
+            <span className="flex min-w-0 items-start gap-1 text-[11.5px] leading-4 text-muted-foreground" title={row.note}>
+              <StickyNote className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+              <span className="line-clamp-3 min-w-0 whitespace-pre-line [overflow-wrap:anywhere]">{row.note}</span>
             </span>
           )}
           {/* The one flag on the board: a lead nobody can contact. */}
@@ -142,7 +159,6 @@ function BoardCard(props: {
   selected: boolean;
   onSelect: (id: string) => void;
   compact: boolean;
-  sourceLabel: string | null;
   status: ContactStatus | undefined;
   /** Archive this person; absent hides the action. */
   onArchive?: (id: string) => void;
@@ -202,7 +218,6 @@ function BoardColumn({
   selectedId,
   onSelect,
   compact,
-  sourceLabel,
   onArchive,
   busyIds,
 }: {
@@ -214,7 +229,6 @@ function BoardColumn({
   selectedId: string | null;
   onSelect: (id: string) => void;
   compact: boolean;
-  sourceLabel: (contactId: string) => string | null;
   onArchive?: (id: string) => void;
   busyIds: ReadonlySet<string>;
 }) {
@@ -227,12 +241,12 @@ function BoardColumn({
       ref={setNodeRef}
       aria-label={`${label} column`}
       style={tone.lane}
-      className={cn(
-        // A bordered, lightly tinted lane in the stage's colour; the cards carry their own border.
-        'flex min-h-0 min-w-[150px] flex-1 basis-0 flex-col rounded-lg border border-border bg-muted/40 transition-colors',
-        isOver && 'ring-2 ring-ring ring-offset-2 ring-offset-background',
-      )}
+      // A bordered, lightly tinted lane in the stage's colour; the cards carry their own border.
+      className="relative flex min-h-0 min-w-[150px] flex-1 basis-0 flex-col rounded-lg border border-border bg-muted/40"
     >
+      {/* The drop outline is an overlay inside the lane: a ring offset outside it was clipped
+          by the board's scroller on three sides. Above the heading too, so nothing covers it. */}
+      {isOver && <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10 rounded-lg ring-2 ring-inset ring-ring" />}
       {/* The heading is the filter: it writes ?view=, so the index narrows to this column. */}
       <ClickRegion
         onClick={onToggle}
@@ -264,7 +278,6 @@ function BoardColumn({
                 selected={row.contactId === selectedId}
                 onSelect={onSelect}
                 compact={compact}
-                sourceLabel={sourceLabel(row.contactId)}
                 status={status}
                 onArchive={onArchive}
                 busy={busyIds.has(row.contactId)}
@@ -422,16 +435,38 @@ export function CrmBoard({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [movingIds, setMovingIds] = useState<ReadonlySet<string>>(new Set());
-  const [pickingOwner, setPickingOwner] = useState(false);
+  const [service, setService] = useState<ServiceFilter>('all');
+  const [newOpen, setNewOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const sources = useLeadSources();
-  const sourceLabels = useMemo(() => new Map((sources.data ?? []).map((s) => [s.key, s.label])), [sources.data]);
+  // Each card's note line. staleTime 0 overrides the app's default on purpose: the AI
+  // connector writes notes too, and nothing here would invalidate this key for those, so
+  // coming back to the board refetches.
+  const noteRows = useQuery({
+    queryKey: queryKeys.contacts.leadNotes(),
+    queryFn: () => listNotesForStatuses(PIPELINE_STATUSES),
+    staleTime: 0,
+  });
+  const notes = useMemo(() => latestNotes(noteRows.data ?? []), [noteRows.data]);
   // A drag needs 6px of travel, so a click on a card stays a click.
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }), useSensor(KeyboardSensor));
 
+  // One pill per service quoted to someone on the board, so a pill never shows an empty board.
+  const serviceOptions = useMemo(() => {
+    const quoted = quotedServiceTypes(contacts.filter((c) => (PIPELINE_STATUSES as readonly string[]).includes(c.status)));
+    const keys = [...quoted].sort((a, b) => (serviceLabels.get(a) ?? a).localeCompare(serviceLabels.get(b) ?? b));
+    return [{ value: 'all', label: 'All' }, ...keys.map((k) => ({ value: k, label: serviceLabels.get(k) ?? k }))];
+  }, [contacts, serviceLabels]);
+  // A chosen service nobody is quoted for any more falls back to All.
+  const activeService: ServiceFilter = serviceOptions.some((o) => o.value === service) ? service : 'all';
   const groups = useMemo(
-    () => leadPipeline(contacts.filter(matches), { serviceLabels, organizations, statusOrder: statusByKey }),
-    [contacts, matches, serviceLabels, organizations, statusByKey],
+    () =>
+      leadPipeline(
+        contacts.filter((c) => matches(c) && matchesServiceFilter(c, activeService)),
+        { serviceLabels, organizations, statusOrder: statusByKey },
+        notes,
+      ),
+    [contacts, matches, activeService, serviceLabels, organizations, statusByKey, notes],
   );
   const totalPeople = groups.reduce((n, g) => n + g.rows.length, 0);
   const contactById = useMemo(() => new Map(contacts.map((c) => [c.id, c])), [contacts]);
@@ -447,10 +482,6 @@ export function CrmBoard({
   const draggingRow = findRow(draggingId);
   const statusLabel = (key: string) => statusByKey.get(key)?.label ?? key;
   const activeLabel = viewLabel(view, statusLabel);
-  const sourceOf = (id: string) => {
-    const key = contactById.get(id)?.source;
-    return key ? (sourceLabels.get(key) ?? key) : null;
-  };
 
   const stageOptions = [...statusByKey.values()]
     .filter((s) => !isSystemStatus(s.key) || s.key === selectedContact?.status)
@@ -507,7 +538,7 @@ export function CrmBoard({
             aria-label="Search the pipeline"
             value={search}
             onChange={(e) => onSearch(e.target.value)}
-            placeholder={pickingOwner ? 'Find the person who owns it' : 'Search name, business, email, phone or tax ID'}
+            placeholder="Search leads"
             className="h-8 pl-8 pr-8 text-[12.5px]"
           />
           {search && (
@@ -516,53 +547,41 @@ export function CrmBoard({
             </ClickRegion>
           )}
         </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="text-muted-foreground"
-          onClick={() => {
-            setPickingOwner((p) => !p);
-            searchRef.current?.focus();
-          }}
-        >
-          {pickingOwner ? <X aria-hidden="true" /> : <Building2 aria-hidden="true" />}
-          {pickingOwner ? 'Cancel' : 'Add organization'}
-        </Button>
-        {(activeLabel || search) && (
-          <div className="flex flex-wrap items-center gap-2 text-[12px]">
-            <span className="text-muted-foreground">Showing</span>
-            {activeLabel && (
-              <StatusPill>
-                {activeLabel}
-                <ClickRegion onClick={() => onView(null)} aria-label="Clear list filter" className="inline-flex">
-                  <X className="h-3 w-3" aria-hidden="true" />
-                </ClickRegion>
-              </StatusPill>
-            )}
-            {search && (
-              <StatusPill>
-                &ldquo;{search}&rdquo;
-                <ClickRegion onClick={() => onSearch('')} aria-label="Clear search text" className="inline-flex">
-                  <X className="h-3 w-3" aria-hidden="true" />
-                </ClickRegion>
-              </StatusPill>
-            )}
-          </div>
+        {/* Narrows the board to the leads quoted for one service. */}
+        {serviceOptions.length > 1 && (
+          <Segmented label="Service" value={activeService} onValueChange={setService} options={serviceOptions} />
         )}
+        {activeLabel && (
+          <StatusPill>
+            {activeLabel}
+            <ClickRegion onClick={() => onView(null)} aria-label="Clear list filter" className="inline-flex">
+              <X className="h-3 w-3" aria-hidden="true" />
+            </ClickRegion>
+          </StatusPill>
+        )}
+        <Button type="button" size="sm" className="md:ml-auto" onClick={() => setNewOpen(true)}>
+          <Plus aria-hidden="true" />
+          New
+        </Button>
       </div>
-      {pickingOwner && (
-        <p className="mt-2 text-[12px] text-muted-foreground">
-          An organization belongs to a person. Open their record from the list, then add it on Billing.
-        </p>
-      )}
 
       <div className="mt-3 flex min-h-0 flex-1 flex-col">
         {loading ? (
           <p className="py-6 text-center text-[12px] text-muted-foreground">Loading...</p>
         ) : totalPeople === 0 ? (
           <p className="rounded-lg border border-border py-6 text-center text-[12px] text-muted-foreground">
-            {search ? `No lead matches "${search}".` : 'No leads. Add one with Add contact.'}
+            {search ? (
+              `No lead matches "${search}".`
+            ) : activeService !== 'all' ? (
+              <>
+                No lead has {serviceLabels.get(activeService) ?? activeService} quoted.{' '}
+                <ClickRegion onClick={() => setService('all')} aria-label="Clear the service filter" className="underline">
+                  Show all
+                </ClickRegion>
+              </>
+            ) : (
+              'No leads. Add one with New.'
+            )}
           </p>
         ) : (
           <div className="flex min-h-0 flex-1 gap-3 max-md:flex-col">
@@ -586,7 +605,6 @@ export function CrmBoard({
                       selectedId={selectedId}
                       onSelect={(id) => setSelectedId((cur) => (cur === id ? null : id))}
                       compact={selectedRow !== null}
-                      sourceLabel={sourceOf}
                       onArchive={archive}
                       busyIds={busyIds}
                     />
@@ -596,7 +614,7 @@ export function CrmBoard({
               <DragOverlay dropAnimation={null}>
                 {draggingRow && (
                   <div data-drag-overlay style={stageTone(statusByKey.get(draggingRow.status)).card} className={cn(CARD_CLASS, 'cursor-grabbing ring-2 ring-ring/50')}>
-                    <CardBody row={draggingRow} compact={selectedRow !== null} sourceLabel={sourceOf(draggingRow.contactId)} status={statusByKey.get(draggingRow.status)} />
+                    <CardBody row={draggingRow} compact={selectedRow !== null} status={statusByKey.get(draggingRow.status)} />
                   </div>
                 )}
               </DragOverlay>
@@ -619,6 +637,7 @@ export function CrmBoard({
           </div>
         )}
       </div>
+      <NewLeadDialog open={newOpen} onOpenChange={setNewOpen} stageLabel={statusLabel} />
     </div>
   );
 }

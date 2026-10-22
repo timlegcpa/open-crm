@@ -217,13 +217,20 @@ describe('who can write what', () => {
     expect(await errorOf(db, clientA, `INSERT INTO public.contacts (first_name) VALUES ('x')`)).toMatch(/row-level security/);
     expect(await errorOf(db, clientA, `INSERT INTO public.organizations (contact_id, name) VALUES ('${CONTACT_A}', 'x')`)).toMatch(/row-level security/);
     expect(await as(db, clientA, `UPDATE public.contacts SET first_name = 'x' RETURNING id`)).toEqual([]);
-    expect(await errorOf(db, clientA, `UPDATE public.contact_notes SET body = 'x'`)).toMatch(/permission denied/);
+    // Notes: the grant reaches a signed-in session, the policy does not reach a client.
+    expect(await as(db, clientA, `UPDATE public.contact_notes SET body = 'x' RETURNING id`)).toEqual([]);
+    expect(await as(db, clientA, `DELETE FROM public.contact_notes RETURNING id`)).toEqual([]);
+    expect(await errorOf(db, clientA, `INSERT INTO public.contact_notes (contact_id, body) VALUES ('${CONTACT_A}', 'x')`)).toMatch(/row-level security/);
   });
 
-  it('notes are append-only, for the owner and the server alike', async () => {
+  it('a note is corrected and deleted by the owner and the server, its source never rewritten (0017)', async () => {
     for (const who of [owner, service]) {
-      expect(await errorOf(db, who, `UPDATE public.contact_notes SET body = 'x'`)).toMatch(/permission denied/);
-      expect(await errorOf(db, who, `DELETE FROM public.contact_notes`)).toMatch(/permission denied/);
+      expect(await as(db, who, `UPDATE public.contact_notes SET body = 'Called back', kind = 'call' RETURNING body, kind, source`))
+        .toEqual([{ body: 'Called back', kind: 'call', source: 'owner' }]);
+      expect(await as(db, who, `DELETE FROM public.contact_notes RETURNING id`)).toHaveLength(1);
+      // Column-scoped grant: naming source is refused before any policy runs.
+      expect(await errorOf(db, who, `UPDATE public.contact_notes SET source = 'mcp'`)).toMatch(/permission denied/);
+      expect(await errorOf(db, who, `UPDATE public.contact_notes SET contact_id = '${CONTACT_B}'`)).toMatch(/permission denied/);
     }
   });
 

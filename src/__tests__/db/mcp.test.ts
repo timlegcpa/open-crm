@@ -216,6 +216,14 @@ const SERVER_FUNCTIONS = [
   'mcp_accept_request(uuid,uuid,uuid,text,text)',
   'mcp_set_request_reminders(uuid,uuid,boolean,uuid,text,text)',
   'mcp_list_open_requests(integer,uuid,text,text)',
+  // 0017_crm_full_access.
+  'mcp_update_note(uuid,uuid,text,text,uuid,text,text)',
+  'mcp_delete_note(uuid,uuid,uuid,text,text)',
+  'mcp_accept_quote(uuid,uuid,uuid,text,uuid,text,text)',
+  'mcp_change_portal_email(uuid,text,text,uuid,text,text)',
+  'mcp_read_request_answers(uuid,uuid,uuid,text,text)',
+  'mcp_list_documents(uuid,integer,uuid,text,text)',
+  'mcp_read_document(uuid,uuid,text,text)',
 ];
 const OWNER_FUNCTIONS = ['mcp_list_grants()', 'mcp_revoke_grant(uuid)'];
 
@@ -882,7 +890,7 @@ describe('mcp_search_contacts and mcp_get_contact', () => {
       .rejects.toThrow(/unknown_status/);
   });
 
-  it('get_contact returns the narrow record with businesses, quotes and the 20 newest notes, audited', async () => {
+  it('get_contact returns the whole record with businesses, quotes and the 20 newest notes, audited', async () => {
     const out = await asServerTx(async (tx) => {
       await tx.query(`INSERT INTO public.organizations (contact_id, name) VALUES ($1, 'Acme LLC')`, [contactA]);
       for (let i = 0; i < 22; i++) {
@@ -894,9 +902,11 @@ describe('mcp_search_contacts and mcp_get_contact', () => {
         rows: await auditRows(tx, 'mcp_get_contact'),
       };
     });
-    expect(Object.keys(out.got).sort()).toEqual(
-      ['business_name', 'businesses', 'email', 'first_name', 'id', 'last_name', 'phone', 'quotes', 'recent_notes', 'status'],
-    );
+    expect(Object.keys(out.got).sort()).toEqual([
+      'archived', 'business_name', 'businesses', 'client_since', 'email', 'emails', 'first_name', 'id', 'last_name',
+      'mailing_city', 'mailing_state', 'mailing_street', 'mailing_zip', 'phone', 'portal_accounts', 'quotes',
+      'recent_notes', 'source', 'spouse_email', 'spouse_first_name', 'spouse_last_name', 'spouse_phone', 'status', 'tier',
+    ]);
     const notes = out.got.recent_notes as Array<{ body: string }>;
     expect(notes).toHaveLength(20);
     expect(notes[0].body).toBe('note 0');
@@ -2166,7 +2176,7 @@ describe('the consent version', () => {
       const listed = await call<Array<{ id: string }>>(tx, 'mcp_list_grants');
       return { ...result, listed: listed.map((g) => g.id), fresh, old };
     });
-    expect(out.current).toBe(2);
+    expect(out.current).toBe(3);
     expect(out.freshVersion).toBe(out.current);
     expect(out.freshAuth).toMatchObject({ grant_id: out.fresh });
     expect(out.oldAuth).toBeNull();
@@ -2189,5 +2199,388 @@ describe('the consent version', () => {
     const drop = sql.indexOf('ALTER COLUMN consent_version DROP DEFAULT;');
     expect(add).toBeGreaterThan(0);
     expect(drop).toBeGreaterThan(add);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0017_crm_full_access: notes, accepting a quote, the whole record, the sign-in address,
+// and reading what a client sent
+// ---------------------------------------------------------------------------
+
+describe('mcp_update_note and mcp_delete_note', () => {
+  const note = async (tx: Tx, contact: string, source = 'owner') =>
+    (await asSetup(tx, `INSERT INTO public.contact_notes (contact_id, body, kind, source) VALUES ($1, 'Called about scope', 'note', $2) RETURNING id`, [contact, source]))[0].id as string;
+
+  it('corrects the text or the kind, never the source, audited with the length and not the text', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await note(tx, contactA, 'mcp');
+      const body = await call<Record<string, unknown>>(tx, 'mcp_update_note', { p_note_id: id, p_contact_id: contactA, p_body: 'Called about the new scope', p_kind: null, ...audit });
+      const kind = await call<Record<string, unknown>>(tx, 'mcp_update_note', { p_note_id: id, p_contact_id: contactA, p_body: null, p_kind: 'call', ...audit });
+      const row = (await tx.query(`SELECT body, kind, source FROM public.contact_notes WHERE id = $1`, [id])).rows[0];
+      return { id, body, kind, row, rows: await auditRows(tx, 'mcp_update_note') };
+    });
+    expect(out.body).toMatchObject({ outcome: 'updated', body: 'Called about the new scope', kind: 'note', source: 'mcp' });
+    expect(out.kind).toMatchObject({ outcome: 'updated', kind: 'call' });
+    expect(out.row).toEqual({ body: 'Called about the new scope', kind: 'call', source: 'mcp' });
+    expect(out.rows[0].details).toEqual({
+      source: 'mcp', contact_id: contactA, note_id: out.id, kind: 'note', note_source: 'mcp', body_length: 26, fields: ['body'],
+    });
+    expect(JSON.stringify(out.rows)).not.toContain('new scope');
+  });
+
+  it('one not_found for a note on another contact or no note at all, changing and auditing nothing', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await note(tx, contactA);
+      return {
+        other: await call(tx, 'mcp_update_note', { p_note_id: id, p_contact_id: contactB, p_body: 'x', p_kind: null, ...audit }),
+        none: await call(tx, 'mcp_update_note', { p_note_id: randomUUID(), p_contact_id: contactA, p_body: 'x', p_kind: null, ...audit }),
+        gone: await call(tx, 'mcp_delete_note', { p_note_id: id, p_contact_id: contactB, ...audit }),
+        row: (await tx.query(`SELECT body FROM public.contact_notes WHERE id = $1`, [id])).rows[0],
+        rows: [...(await auditRows(tx, 'mcp_update_note')), ...(await auditRows(tx, 'mcp_delete_note'))],
+      };
+    });
+    expect([out.other, out.none, out.gone]).toEqual([{ outcome: 'not_found' }, { outcome: 'not_found' }, { outcome: 'not_found' }]);
+    expect(out.row).toEqual({ body: 'Called about scope' });
+    expect(out.rows).toEqual([]);
+  });
+
+  it('deletes the note with its audit row in one transaction', async () => {
+    const out = await asServerTx(async (tx) => {
+      const id = await note(tx, contactA);
+      const deleted = await call(tx, 'mcp_delete_note', { p_note_id: id, p_contact_id: contactA, ...audit });
+      return { id, deleted, left: (await tx.query(`SELECT 1 FROM public.contact_notes WHERE id = $1`, [id])).rows, rows: await auditRows(tx, 'mcp_delete_note') };
+    });
+    expect(out.deleted).toEqual({ outcome: 'deleted', id: out.id });
+    expect(out.left).toEqual([]);
+    expect(out.rows[0].details).toEqual({ source: 'mcp', contact_id: contactA, note_id: out.id, kind: 'note', note_source: 'owner', body_length: 18 });
+  });
+
+  it('a delete whose audit row cannot be written deletes nothing', async () => {
+    // Committed, so the failed call's rollback is what keeps it.
+    const id = (await db.query<{ id: string }>(`INSERT INTO public.contact_notes (contact_id, body) VALUES ($1, 'Keep me') RETURNING id`, [contactA])).rows[0].id;
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.exec('SET LOCAL ROLE service_role');
+        // No actor: audit_logs.user_id is NOT NULL, so the audit insert fails.
+        await call(tx, 'mcp_delete_note', { p_note_id: id, p_contact_id: contactA, p_actor: null, p_ip: null, p_user_agent: null });
+      }),
+    ).rejects.toThrow(/user_id/);
+    expect((await db.query(`SELECT body FROM public.contact_notes WHERE id = $1`, [id])).rows).toEqual([{ body: 'Keep me' }]);
+    await db.query(`DELETE FROM public.contact_notes WHERE id = $1`, [id]);
+  });
+});
+
+describe('mcp_accept_quote', () => {
+  type Ids = { contact: string; quote: string; org: string | null };
+  /** A fresh contact in `status` with one proposed quote. */
+  const lead = async (tx: Tx, opts: { status?: string; cadence?: string; archived?: boolean; organization?: boolean } = {}): Promise<Ids> => {
+    const [c] = await asSetup(tx, `INSERT INTO public.contacts (first_name, status, archived_at) VALUES ('Grace', $1, CASE WHEN $2 THEN now() END) RETURNING id`, [opts.status ?? 'hot', opts.archived ?? false]);
+    const org = opts.organization ? ((await asSetup(tx, `INSERT INTO public.organizations (contact_id, name) VALUES ($1, 'Acme LLC') RETURNING id`, [c.id]))[0].id as string) : null;
+    const [q] = await asSetup(tx,
+      `INSERT INTO public.contact_services (contact_id, organization_id, service_type, state, cadence, amount) VALUES ($1, $2, 'project', 'proposed', $3, 900) RETURNING id`,
+      [c.id, org, opts.cadence ?? 'monthly']);
+    return { contact: c.id as string, quote: q.id as string, org };
+  };
+  const accept = (tx: Tx, ids: Ids, over: Record<string, unknown> = {}) =>
+    call<Record<string, unknown>>(tx, 'mcp_accept_quote', { p_contact_id: ids.contact, p_quote_id: ids.quote, p_organization_id: ids.org, p_service_type: 'project', ...audit, ...over });
+
+  it('accepts the quote and makes the contact a client through the status trigger, audited with the figures', async () => {
+    const out = await asServerTx(async (tx) => {
+      const ids = await lead(tx);
+      const accepted = await accept(tx, ids);
+      const row = (await tx.query(`SELECT c.status, c.client_since IS NOT NULL AS since, jsonb_array_length(c.status_history) AS h, s.state
+        FROM public.contacts c JOIN public.contact_services s ON s.contact_id = c.id WHERE c.id = $1`, [ids.contact])).rows[0];
+      return { ids, accepted, row, rows: await auditRows(tx, 'mcp_accept_quote') };
+    });
+    expect(out.accepted).toMatchObject({ id: out.ids.quote, state: 'accepted', contact_status: 'client', previous_status: 'hot' });
+    expect(out.accepted.client_since).not.toBeNull();
+    expect(out.row).toEqual({ status: 'client', since: true, h: 2, state: 'accepted' });
+    expect(out.rows[0].details).toMatchObject({ source: 'mcp', quote_id: out.ids.quote, service_type: 'project', cadence: 'monthly', from: 'hot', to: 'client' });
+  });
+
+  it('one-time work alone makes a one-time client; a terminal stage is sticky', async () => {
+    const out = await asServerTx(async (tx) => ({
+      once: await accept(tx, await lead(tx, { cadence: 'one_time' })),
+      lost: await accept(tx, await lead(tx, { status: 'lost' })),
+      cold: await accept(tx, await lead(tx, { status: 'cold' })),
+    }));
+    expect(out.once.contact_status).toBe('one_time');
+    expect(out.lost.contact_status).toBe('lost');
+    expect(out.cold.contact_status).toBe('cold');
+  });
+
+  it('binds the quote to its contact, service and business: one not_found for every mismatch', async () => {
+    const out = await asServerTx(async (tx) => {
+      const ids = await lead(tx, { organization: true });
+      const errors: Array<string | null> = [];
+      for (const over of [{ p_contact_id: contactB }, { p_service_type: 'retainer' }, { p_organization_id: null }, { p_quote_id: randomUUID() }]) {
+        errors.push(await attempt(tx, () => accept(tx, ids, over)));
+      }
+      return { errors, state: (await tx.query(`SELECT state FROM public.contact_services WHERE id = $1`, [ids.quote])).rows[0] };
+    });
+    for (const e of out.errors) expect(e).toMatch(/mcp_accept_quote: not_found/);
+    expect(out.state).toEqual({ state: 'proposed' });
+  });
+
+  it('refuses an accepted quote, a system contact and an archived one, changing nothing', async () => {
+    const out = await asServerTx(async (tx) => {
+      const ids = await lead(tx);
+      await accept(tx, ids);
+      const signer = await lead(tx, { status: 'esign_signer' });
+      const archived = await lead(tx, { archived: true });
+      return {
+        again: await attempt(tx, () => accept(tx, ids)),
+        signer: await attempt(tx, () => accept(tx, signer)),
+        archived: await attempt(tx, () => accept(tx, archived)),
+        states: (await tx.query(`SELECT c.status, s.state FROM public.contact_services s JOIN public.contacts c ON c.id = s.contact_id WHERE s.id = ANY($1) ORDER BY c.status`, [[signer.quote, archived.quote]])).rows,
+      };
+    });
+    expect(out.again).toMatch(/already_accepted/);
+    expect(out.signer).toMatch(/system_status/);
+    expect(out.archived).toMatch(/archived/);
+    expect(out.states).toEqual([{ status: 'esign_signer', state: 'proposed' }, { status: 'hot', state: 'proposed' }]);
+  });
+});
+
+describe('mcp_update_contact: the whole record', () => {
+  it('a present key writes (empty or null clears), an absent key keeps; names clear to empty; never the address or the stage', async () => {
+    const out = await asServerTx(async (tx) => {
+      await asSetup(tx, `UPDATE public.contacts SET phone = '555-0100', tier = 'A', mailing_city = 'Springfield' WHERE id = $1`, [contactA]);
+      const updated = await call<Record<string, unknown>>(tx, 'mcp_update_contact', {
+        p_contact_id: contactA,
+        p_patch: { phone: '', tier: null, last_name: '', spouse_first_name: 'Grace', spouse_email: 'grace@example.com', mailing_zip: '12345', source: 'referral', email: 'evil@example.com', status: 'client' },
+        ...audit,
+      });
+      const row = (await tx.query(`SELECT first_name, last_name, phone, tier, mailing_city, mailing_zip, spouse_first_name, spouse_email, source, email, status FROM public.contacts WHERE id = $1`, [contactA])).rows[0];
+      return { updated, row, rows: await auditRows(tx, 'mcp_update_contact') };
+    });
+    expect(out.row).toEqual({
+      first_name: 'Ada', last_name: '', phone: null, tier: null, mailing_city: 'Springfield', mailing_zip: '12345',
+      spouse_first_name: 'Grace', spouse_email: 'grace@example.com', source: 'referral', email: 'ada@example.com', status: 'new_lead',
+    });
+    expect(out.updated).toMatchObject({ id: contactA, tier: null, spouse_email: 'grace@example.com' });
+    expect(out.rows[0].details.fields).toEqual(['email', 'last_name', 'mailing_zip', 'phone', 'source', 'spouse_email', 'spouse_first_name', 'status', 'tier']);
+  });
+
+  it('refuses a retired or system source, and a spouse address a portal account signs in with', async () => {
+    const out = await asServerTx(async (tx) => {
+      await asSetup(tx, `UPDATE public.lead_sources SET is_active = false WHERE key = 'referral'`);
+      const retired = await attempt(tx, () => call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { source: 'referral' }, ...audit }));
+      const system = await attempt(tx, () => call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { source: 'lead_intake' }, ...audit }));
+      const login = (await tx.query<{ e: string }>(`SELECT invited_email AS e FROM public.client_portal_accounts WHERE contact_id = $1`, [contactA])).rows[0].e;
+      await asSetup(tx, `UPDATE public.contacts SET spouse_email = upper($2) WHERE id = $1`, [contactA, login]);
+      const spouse = await attempt(tx, () => call(tx, 'mcp_update_contact', { p_contact_id: contactA, p_patch: { spouse_email: 'other@example.com' }, ...audit }));
+      const kept = (await tx.query<{ e: string }>(`SELECT spouse_email AS e FROM public.contacts WHERE id = $1`, [contactA])).rows[0].e;
+      return { retired, system, spouse, kept, login };
+    });
+    expect(out.retired).toMatch(/inactive_source/);
+    expect(out.system).toMatch(/inactive_source/);
+    expect(out.spouse).toMatch(/spouse_address_signs_in/);
+    expect(out.kept).toBe(out.login.toUpperCase());
+  });
+
+  it('get_contact carries the email list and the portal accounts, never a sign-in user id', async () => {
+    const got = await asServerTx(async (tx) => call<Record<string, any>>(tx, 'mcp_get_contact', { p_contact_id: contactA, ...audit }));
+    expect(got.emails).toEqual([{ kind: 'primary', email: 'ada@example.com', label: 'other', is_default: true }]);
+    expect(got.portal_accounts).toHaveLength(1);
+    expect(Object.keys(got.portal_accounts[0]).sort()).toEqual(['activated_at', 'has_sign_in', 'id', 'invited_email', 'last_login_at', 'role', 'status']);
+    expect(got.portal_accounts[0].has_sign_in).toBe(true);
+    expect(JSON.stringify(got)).not.toContain(clientAUser);
+  });
+});
+
+describe('portal sign-in address: portal_login_for_change, portal_set_login_email, mcp_change_portal_email', () => {
+  const accountOf = async (tx: Tx, contact: string) =>
+    (await tx.query<{ id: string; e: string }>(`SELECT id, invited_email AS e FROM public.client_portal_accounts WHERE contact_id = $1 AND user_id IS NOT NULL`, [contact])).rows[0];
+
+  it('checks without writing: no sign-in, stale, unchanged, an address another open account holds, then ok with the user', async () => {
+    const out = await asServerTx(async (tx) => {
+      const a = await accountOf(tx, contactA);
+      const b = await accountOf(tx, contactB);
+      const [invited] = await asSetup(tx, `INSERT INTO public.client_portal_accounts (contact_id, status, invited_email) VALUES ($1, 'invited', 'pending@example.com') RETURNING id`, [contactB]);
+      const check = (id: string, email: string, expected: string | null) =>
+        call<Record<string, unknown>>(tx, 'portal_login_for_change', { p_account_id: id, p_email: email, p_expected_email: expected });
+      return {
+        none: await check(randomUUID(), 'x@example.com', null),
+        noSignIn: await check(invited.id as string, 'x@example.com', 'pending@example.com'),
+        stale: await check(a.id, 'x@example.com', 'someone@example.com'),
+        unchanged: await check(a.id, ` ${a.e.toUpperCase()} `, a.e),
+        inUse: await check(a.id, b.e.toUpperCase(), ` ${a.e.toUpperCase()}`),
+        ok: await check(a.id, 'ada.new@example.com', a.e),
+      };
+    });
+    expect(out.none).toEqual({ outcome: 'not_found' });
+    expect(out.noSignIn).toMatchObject({ outcome: 'no_sign_in' });
+    expect(out.stale).toMatchObject({ outcome: 'stale' });
+    expect(out.unchanged).toMatchObject({ outcome: 'unchanged' });
+    expect(out.inUse).toMatchObject({ outcome: 'address_in_use' });
+    expect(out.ok).toEqual({ outcome: 'ok', contact_id: contactA, user_id: clientAUser });
+  });
+
+  it('moves the account and the contact address it signed in with; the old one stays on the email list', async () => {
+    const out = await asServerTx(async (tx) => {
+      const a = await accountOf(tx, contactA);
+      await asSetup(tx, `UPDATE public.contacts SET email = $2 WHERE id = $1`, [contactA, a.e]);
+      const set = await call<Record<string, unknown>>(tx, 'portal_set_login_email', { p_account_id: a.id, p_email: ' ada.login@example.com ', p_expected_email: a.e });
+      return {
+        old: a.e,
+        set,
+        account: await accountOf(tx, contactA),
+        email: (await tx.query(`SELECT email FROM public.contacts WHERE id = $1`, [contactA])).rows[0],
+        list: (await tx.query<{ email: string; is_default: boolean }>(`SELECT email, is_default FROM public.contact_emails WHERE contact_id = $1 AND kind = 'primary' ORDER BY is_default DESC, email`, [contactA])).rows,
+      };
+    });
+    expect(out.set).toEqual({ outcome: 'updated', contact_id: contactA, account_id: out.account.id, contact_address: 'email' });
+    expect(out.account.e).toBe('ada.login@example.com');
+    expect(out.email).toEqual({ email: 'ada.login@example.com' });
+    expect(out.list).toContainEqual({ email: 'ada.login@example.com', is_default: true });
+    expect(out.list.map((r) => r.email)).toContain(out.old);
+  });
+
+  it('an account on a listed address renames that row in place, label kept', async () => {
+    const out = await asServerTx(async (tx) => {
+      const a = await accountOf(tx, contactA);
+      await asSetup(tx, `INSERT INTO public.contact_emails (contact_id, kind, email, label, is_default) VALUES ($1, 'primary', $2, 'business', false) ON CONFLICT DO NOTHING`, [contactA, a.e]);
+      const set = await call<Record<string, unknown>>(tx, 'portal_set_login_email', { p_account_id: a.id, p_email: 'ada.renamed@example.com', p_expected_email: a.e });
+      return {
+        set, old: a.e,
+        rows: (await tx.query<{ email: string; label: string }>(`SELECT email, label FROM public.contact_emails WHERE contact_id = $1 AND lower(email) IN (lower($2), 'ada.renamed@example.com') ORDER BY email`, [contactA, a.e])).rows,
+      };
+    });
+    expect(out.set).toMatchObject({ outcome: 'updated', contact_address: 'email_list' });
+    expect(out.rows).toEqual([{ email: 'ada.renamed@example.com', label: 'business' }]);
+  });
+
+  it('an account on another address of the contact adds the new one to the email list; a stale read writes nothing', async () => {
+    const out = await asServerTx(async (tx) => {
+      const a = await accountOf(tx, contactA);
+      const stale = await call(tx, 'portal_set_login_email', { p_account_id: a.id, p_email: 'x@example.com', p_expected_email: 'nobody@example.com' });
+      const afterStale = await accountOf(tx, contactA);
+      const set = await call<Record<string, unknown>>(tx, 'portal_set_login_email', { p_account_id: a.id, p_email: 'ada.portal@example.com', p_expected_email: a.e });
+      return {
+        stale, afterStale, before: a, set,
+        email: (await tx.query(`SELECT email FROM public.contacts WHERE id = $1`, [contactA])).rows[0],
+        listed: (await tx.query(`SELECT is_default FROM public.contact_emails WHERE contact_id = $1 AND email = 'ada.portal@example.com'`, [contactA])).rows,
+      };
+    });
+    expect(out.stale).toMatchObject({ outcome: 'stale' });
+    expect(out.afterStale.e).toBe(out.before.e);
+    expect(out.set).toMatchObject({ outcome: 'updated', contact_address: 'email_list' });
+    expect(out.email).toEqual({ email: 'ada@example.com' });
+    expect(out.listed).toEqual([{ is_default: false }]);
+  });
+
+  it('the connector door audits ids and the outcome, never an address', async () => {
+    const out = await asServerTx(async (tx) => {
+      const a = await accountOf(tx, contactA);
+      await call(tx, 'mcp_change_portal_email', { p_account_id: a.id, p_email: 'stale@example.com', p_expected_email: 'nope@example.com', ...audit });
+      await call(tx, 'mcp_change_portal_email', { p_account_id: a.id, p_email: 'ada.mcp@example.com', p_expected_email: a.e, ...audit });
+      await call(tx, 'mcp_change_portal_email', { p_account_id: randomUUID(), p_email: 'x@example.com', p_expected_email: null, ...audit });
+      return { id: a.id, rows: await auditRows(tx, 'mcp_change_portal_email') };
+    });
+    expect(out.rows.map((r) => r.details)).toEqual([
+      { source: 'mcp', contact_id: contactA, account_id: out.id, outcome: 'stale' },
+      { source: 'mcp', contact_id: contactA, account_id: out.id, outcome: 'updated' },
+    ]);
+    expect(JSON.stringify(out.rows)).not.toMatch(/@/);
+  });
+});
+
+describe('mcp_read_request_answers, mcp_list_documents and mcp_read_document', () => {
+  const doc = async (tx: Tx, contact: string, mime: string, name: string) =>
+    (await asSetup(tx,
+      `INSERT INTO public.client_documents (contact_id, filename, original_filename, storage_path, file_size, mime_type, encryption_status, encryption_iv)
+       VALUES ($1, $2, $2, $3, 10, $4, 'encrypted', 'aXYtMDEyMzQ1Njc4') RETURNING id`, [contact, name, `${contact}/${name}.enc`, mime]))[0].id as string;
+
+  it('returns each sent request with its typed answers, a sensitive answer as ciphertext and its files; never a draft', async () => {
+    const out = await asServerTx(async (tx) => {
+      const mk = async (title: string) => (await call<{ id: string }>(tx, 'mcp_create_request', { p_contact_id: contactA, p_title: title, p_intro: null, p_items: ITEMS, ...audit })).id;
+      const draft = await mk('Draft one');
+      const sent = await mk('Sent one');
+      await publish(tx, sent, await versionOf(tx, sent));
+      await tx.query(`UPDATE public.needs_items SET answer_ciphertext = decode('0102', 'hex'), status = 'fulfilled' WHERE list_id = $1 AND kind = 'question'`, [sent]);
+      await tx.query(`UPDATE public.needs_items SET answer_text = 'Booked for Monday', status = 'fulfilled' WHERE list_id = $1 AND kind = 'todo'`, [sent]);
+      const file = await doc(tx, contactA, 'application/pdf', 'contract.pdf');
+      await tx.query(`INSERT INTO public.needs_item_documents (item_id, document_id) SELECT id, $2 FROM public.needs_items WHERE list_id = $1 AND kind = 'document'`, [sent, file]);
+      return {
+        draft, sent, file,
+        read: await call<Record<string, any>>(tx, 'mcp_read_request_answers', { p_contact_id: contactA, p_list_id: null, ...audit }),
+        other: await call<Record<string, any>>(tx, 'mcp_read_request_answers', { p_contact_id: contactB, p_list_id: sent, ...audit }),
+        missing: await call(tx, 'mcp_read_request_answers', { p_contact_id: randomUUID(), p_list_id: null, ...audit }),
+        rows: await auditRows(tx, 'mcp_read_request_answers'),
+      };
+    });
+    expect(out.read.lists.map((l: { list_id: string }) => l.list_id)).toEqual([out.sent]);
+    expect(out.read.truncated).toBe(false);
+    const items = out.read.lists[0].items;
+    expect(items.map((i: { kind: string }) => i.kind)).toEqual(['document', 'question', 'todo']);
+    expect(items[0].files).toEqual([expect.objectContaining({ document_id: out.file, filename: 'contract.pdf', mime_type: 'application/pdf' })]);
+    expect(items[1]).toMatchObject({ sensitive: true, answer: null, answer_ciphertext: '\\x0102' });
+    expect(items[2]).toMatchObject({ answer: 'Booked for Monday', answer_ciphertext: null });
+    expect(out.other.lists).toEqual([]);
+    expect(out.missing).toBeNull();
+    expect(out.rows.map((r) => r.details)).toEqual([
+      { source: 'mcp', contact_id: contactA, list_id: null, lists: 1, items: 3, sensitive_answers: 1 },
+      { source: 'mcp', contact_id: contactB, list_id: out.sent, lists: 0, items: 0, sensitive_answers: 0 },
+    ]);
+    expect(JSON.stringify(out.rows)).not.toContain('Monday');
+  });
+
+  it('lists a contact’s documents newest first within the limit, saying when there are more, audited with the count', async () => {
+    const out = await asServerTx(async (tx) => {
+      const first = await doc(tx, contactB, 'text/plain', 'a.txt');
+      await asSetup(tx, `UPDATE public.client_documents SET created_at = now() - interval '1 minute' WHERE id = $1`, [first]);
+      const second = await doc(tx, contactB, 'text/csv', 'b.csv');
+      return {
+        first, second,
+        one: await call<Record<string, any>>(tx, 'mcp_list_documents', { p_contact_id: contactB, p_limit: 1, ...audit }),
+        clamped: await call<Record<string, any>>(tx, 'mcp_list_documents', { p_contact_id: contactB, p_limit: 0, ...audit }),
+        missing: await call(tx, 'mcp_list_documents', { p_contact_id: randomUUID(), p_limit: 10, ...audit }),
+        rows: await auditRows(tx, 'mcp_list_documents'),
+      };
+    });
+    expect(out.one.documents.map((d: { id: string }) => d.id)).toEqual([out.second]);
+    expect(out.one.truncated).toBe(true);
+    // A limit below 1 is clamped to 1, never "everything".
+    expect(out.clamped.count).toBe(1);
+    expect(Object.keys(out.one.documents[0]).sort()).toEqual(['category', 'created_at', 'file_size', 'filename', 'folder_path', 'held_by', 'id', 'mime_type', 'reviewed']);
+    expect(out.missing).toBeNull();
+    expect(out.rows.map((r) => r.details)).toEqual([
+      { source: 'mcp', contact_id: contactB, returned: 1 }, { source: 'mcp', contact_id: contactB, returned: 1 },
+    ]);
+  });
+
+  it('hands the server a text document’s location, refuses any other type, and audits both', async () => {
+    const out = await asServerTx(async (tx) => {
+      const text = await doc(tx, contactB, 'text/plain', 'notes.txt');
+      const pdf = await doc(tx, contactB, 'application/pdf', 'scan.pdf');
+      return {
+        text, pdf,
+        ok: await call<Record<string, unknown>>(tx, 'mcp_read_document', { p_document_id: text, ...audit }),
+        refused: await call(tx, 'mcp_read_document', { p_document_id: pdf, ...audit }),
+        missing: await call(tx, 'mcp_read_document', { p_document_id: randomUUID(), ...audit }),
+        rows: await auditRows(tx, 'mcp_read_document_text'),
+      };
+    });
+    expect(out.ok).toEqual({
+      outcome: 'ok', document_id: out.text, contact_id: contactB, filename: 'notes.txt', mime_type: 'text/plain',
+      storage_path: `${contactB}/notes.txt.enc`, encryption_status: 'encrypted', encryption_iv: 'aXYtMDEyMzQ1Njc4',
+    });
+    expect(out.refused).toEqual({ outcome: 'not_text', mime_type: 'application/pdf' });
+    expect(out.missing).toEqual({ outcome: 'not_found' });
+    expect(out.rows.map((r) => r.details)).toEqual([
+      { source: 'mcp', contact_id: contactB, document_id: out.text },
+      { source: 'mcp', contact_id: contactB, document_id: out.pdf, outcome: 'not_text' },
+    ]);
+  });
+
+  it('a signed-in session, the owner included, can call none of them', async () => {
+    for (const who of [asOwner, clientA]) {
+      await expectDenied(as(db, who, `SELECT public.mcp_read_request_answers($1, NULL, $2, NULL, NULL)`, [contactA, OWNER_ID]));
+      await expectDenied(as(db, who, `SELECT public.mcp_read_document($1, $2, NULL, NULL)`, [randomUUID(), OWNER_ID]));
+      await expectDenied(as(db, who, `SELECT public.portal_set_login_email($1, 'x@example.com', NULL)`, [randomUUID()]));
+      await expectDenied(as(db, who, `SELECT public.portal_login_for_change($1, 'x@example.com', NULL)`, [randomUUID()]));
+    }
+    await expectDenied(as(db, asAnon, `SELECT public.mcp_accept_quote($1, $2, NULL, 'project', $3, NULL, NULL)`, [contactA, randomUUID(), OWNER_ID]));
   });
 });

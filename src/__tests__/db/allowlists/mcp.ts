@@ -1,6 +1,6 @@
 import type { DomainAllowlist } from './types';
 
-/** 0007_mcp and 0015_mcp. */
+/** 0007_mcp, 0015_mcp and 0017_crm_full_access. */
 export const allowlist: DomainAllowlist = {
   // The owner's view of connected assistants, in Settings. Each refuses anyone but the owner.
   authenticatedCallable: ['mcp_list_grants()', 'mcp_revoke_grant(uuid)'],
@@ -48,6 +48,14 @@ export const allowlist: DomainAllowlist = {
     'mcp_accept_request(uuid,uuid,uuid,text,text)',
     'mcp_set_request_reminders(uuid,uuid,boolean,uuid,text,text)',
     'mcp_list_open_requests(integer,uuid,text,text)',
+    // 0017_crm_full_access: notes, accepting a quote, the sign-in address, reading what a client sent.
+    'mcp_update_note(uuid,uuid,text,text,uuid,text,text)',
+    'mcp_delete_note(uuid,uuid,uuid,text,text)',
+    'mcp_accept_quote(uuid,uuid,uuid,text,uuid,text,text)',
+    'mcp_change_portal_email(uuid,text,text,uuid,text,text)',
+    'mcp_read_request_answers(uuid,uuid,uuid,text,text)',
+    'mcp_list_documents(uuid,integer,uuid,text,text)',
+    'mcp_read_document(uuid,uuid,text,text)',
   ],
   definerWriteExempt: {
     'mcp_revoke_grant(uuid)':
