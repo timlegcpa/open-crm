@@ -183,7 +183,7 @@ Every migration states the schema's rules in its header, and
 `src/__tests__/db/invariants.test.ts` checks the migrated catalog against them (row-level
 security and an MFA gate on every table, explicit grants, `search_path` pinned on every
 function, per-bucket storage policies, the View as client trigger on client-writable tables).
-[CONTRIBUTING.md](../CONTRIBUTING.md#migration-rules) lists them.
+[CONTRIBUTING.md](https://github.com/timlegcpa/open-crm/blob/main/CONTRIBUTING.md#migration-rules) lists them.
 
 ## Tests
 

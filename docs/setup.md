@@ -183,4 +183,4 @@ dev outbox standing in for email and text messages. Finally:
 - set up custom SMTP for Supabase Auth (Authentication, Emails in the dashboard): password
   resets and password-change codes go through it, and the built-in sender allows only a few
   emails an hour;
-- decide how you back up the database and the storage buckets (see [SECURITY.md](../SECURITY.md)).
+- decide how you back up the database and the storage buckets (see [SECURITY.md](https://github.com/timlegcpa/open-crm/blob/main/SECURITY.md)).
