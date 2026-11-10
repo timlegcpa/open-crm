@@ -1,0 +1,6 @@
+title: Open CRM
+description: A self-hosted CRM and client-workflow suite for a single business, built on React and Supabase.
+theme: jekyll-theme-cayman
+url: https://timlegcpa.github.io
+baseurl: /open-crm
+author: Timothy LeGendre
