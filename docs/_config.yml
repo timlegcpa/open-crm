@@ -4,3 +4,20 @@ theme: jekyll-theme-cayman
 url: https://timlegcpa.github.io
 baseurl: /open-crm
 author: Timothy LeGendre
+image: /screenshots/owner-dashboard.png
+twitter:
+  card: summary_large_image
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+nav:
+  - title: Home
+    url: /
+  - title: Setup
+    url: /setup.html
+  - title: Configuration
+    url: /configuration.html
+  - title: Features
+    url: /features.html
+  - title: Architecture
+    url: /architecture.html
